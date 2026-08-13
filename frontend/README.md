@@ -27,7 +27,7 @@ investigation graph, a world map, and PDF/HTML/CSV export.
 
 ## Getting Started
 
-Requires Node.js 20+.
+Requires [Node.js 20+](https://nodejs.org/en/download).
 
 ```bash
 cd frontend

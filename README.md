@@ -24,7 +24,7 @@ PacketLens turns a network capture (PCAP/PCAPNG) into a **22-section security re
 
 | Requirement | Version / Size |
 | --- | --- |
-| Node.js | **20+** |
+| Node.js | **20+** — [Download Node.js](https://nodejs.org/en/download) (pick the LTS version) |
 | RAM | ~1.5–2.5 GB (uploads buffer in memory, 500 MB cap) |
 | Disk | ~130 MB (app + one-time GeoIP database download) |
 | Browser | Any modern browser (Chrome, Edge, Firefox) |
