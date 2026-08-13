@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth } from "@/lib/report"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
 import type { AdvancedMetrics, AlertEntry, Flow, Packet, Session } from "@/stores/analysis"
@@ -720,6 +720,48 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
   it("mdInline renders **bold** and `code` links from raw text", () => {
     expect(mdInline("**Final verdict:** **LOW** \u2014 risk 12/100")).toBe("<strong>Final verdict:</strong> <strong>LOW</strong> \u2014 risk 12/100")
     expect(mdInline("Analysis ID `abc-123` done")).toBe("Analysis ID <code>abc-123</code> done")
+  })
+
+  it("mdInline renders *italic* — no literal asterisks in the HTML export", () => {
+    // A bare *…* footnote used to leak the asterisks into the exported
+    // report.html: "*(+3 more services — top 8 shown)*" (QA: export check).
+    expect(mdInline("*(+3 more services — top 8 shown)*")).toBe("<em>(+3 more services — top 8 shown)</em>")
+    expect(mdInline("**bold** then *italic*")).toBe("<strong>bold</strong> then <em>italic</em>")
+  })
+
+  it("talkerServicesOf labels BOTH talker cards with a conversation's service", () => {
+    // The STUN flow 101.2.27.162:3478 → 192.168.1.20:65242 put the server on
+    // the flow's source side only; its destination card row read "Services —"
+    // next to 350 packets. The service is canonical per conversation and
+    // belongs to both participants on both cards (QA: top-talkers services).
+    const flows = [
+      { srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP" },
+      { srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 51729, dstPort: 53, protocol: "UDP" },
+    ]
+    const { src, dst } = talkerServicesOf(flows, new Map(), new Set())
+    const sorted = (m: Map<string, Set<string>>, ip: string) => [...(m.get(ip) ?? [])].sort()
+    expect(sorted(src, "101.2.27.162")).toEqual(["STUN"])
+    expect(sorted(dst, "101.2.27.162")).toEqual(["STUN"])
+    expect(sorted(src, "192.168.1.20")).toEqual(["DNS", "STUN"])
+    expect(sorted(dst, "192.168.1.20")).toEqual(["DNS", "STUN"])
+    expect(sorted(src, "8.8.8.8")).toEqual(["DNS"])
+  })
+
+  it("talkerServicesOf keeps the phantom-HTTP gate and drops junk labels", () => {
+    const flows = [
+      { srcIp: "10.0.0.1", dstIp: "10.0.0.2", srcPort: 80, dstPort: 51234, protocol: "TCP" },
+      { srcIp: "10.0.0.1", dstIp: "10.0.0.2", srcPort: 49152, dstPort: 49153, protocol: "UDP" },
+    ]
+    const { src } = talkerServicesOf(flows, new Map(), new Set())
+    expect(src.get("10.0.0.1")).toBeUndefined()
+    expect(src.get("10.0.0.2")).toBeUndefined()
+    const httpSeen = talkerServicesOf(
+      [{ srcIp: "10.0.0.1", dstIp: "10.0.0.2", srcPort: 80, dstPort: 51234, protocol: "TCP" }],
+      new Map(),
+      new Set(["10.0.0.2"]),
+    )
+    expect([...httpSeen.src.get("10.0.0.1")!]).toEqual(["HTTP"])
+    expect([...httpSeen.dst.get("10.0.0.2")!]).toEqual(["HTTP"])
   })
 
   it("mdInline escapes code content and attribute-breaking quotes", () => {

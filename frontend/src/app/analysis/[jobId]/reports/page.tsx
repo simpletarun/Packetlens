@@ -7,7 +7,7 @@ import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass } from "@/lib/risk"
-import { SOURCE_LABELS, buildReportAnalysis, portServiceName, flowServiceName, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf } from "@/lib/report"
+import { SOURCE_LABELS, buildReportAnalysis, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_STAMP } from "@/lib/build-stamp"
@@ -162,17 +162,12 @@ export default function ReportsPage() {
 
   // Merged device identity (same rule as stats.ts): every address of a device
   // whose primary IP is private is INTERNAL, even when the address itself is a
-  // public-looking IPv6 (the MAC-merged 2401:4900:…:308f alias of the local
-  // .20 host must never read "External · IN" in Top Talkers).
-  const localOwned = useMemo(() => {
-    const s = new Set<string>()
-    for (const d of devices) {
-      if (!isPrivateIP(d.ip)) continue
-      s.add(d.ip)
-      for (const a of d.addresses ?? []) s.add(a)
-    }
-    return s
-  }, [devices])
+  // Full local-ownership closure (B-72) — the same set the map uses. The old
+  // rule-1-only set missed the router's public global 2401:…::1 (MAC-merged
+  // with its private fe80::1), so its 9 ICMPv6 packets to the host's alias
+  // were credited to "IN" India in Top Countries — pure LAN chatter, never
+  // external traffic (QA: country attribution audit).
+  const localOwned = useMemo(() => localOwnedAddresses(devices), [devices])
 
   const { totalBytes, avgPacketBytes, topProto, uniqueSrcIps, uniqueDstIps, topSrcIps, topDstIps, srcConns, dstConns, srcProtos, dstProtos } = useMemo(() => {
     const totalBytes = packets.reduce((s, p) => s + p.length, 0)
@@ -337,41 +332,11 @@ export default function ReportsPage() {
   // up with the folded Top Talkers row. (Connection counts and protocol mixes
   // come from the packet-direction pass in the top-talkers memo above.)
   const talkerFlows = useMemo(() => {
-    const src = new Map<string, { svcs: Set<string> }>()
-    const dst = new Map<string, { svcs: Set<string> }>()
-    // "Unknown service"/"Dynamic/Ephemeral"/"N/A" are not real labels; empty
-    // is a phantom-HTTP gate result (port :80 but no HTTP decoded) — dropping
-    // it here is what keeps the joined list clean ("services: , HTTPS" QA).
-    const named = (svc: string | undefined | null) => !!svc && svc !== "Unknown service" && svc !== "Dynamic/Ephemeral" && svc !== "N/A"
     // Port-derived "HTTP" is only a service if the decoder actually saw HTTP
-    // on that endpoint — a 3-packet TCP flow to :80 is not HTTP traffic
-    // (QA: talker showed "HTTP" while the report said 0 HTTP requests).
+    // on that endpoint (talkerServicesOf applies the same gate).
     const httpIps = new Set<string>()
     for (const h of http) { if (h.srcIp) httpIps.add(h.srcIp); if (h.dstIp) httpIps.add(h.dstIp) }
-    for (const f of flows) {
-      const sIp = ownerOf.get(f.srcIp) ?? f.srcIp
-      const dIp = ownerOf.get(f.dstIp) ?? f.dstIp
-      const s = src.get(sIp) || { svcs: new Set() }
-      src.set(sIp, s)
-      const d = dst.get(dIp) || { svcs: new Set() }
-      dst.set(dIp, d)
-      // A conversation's service is canonical (known service port wins on
-      // either side — flowServiceName) and is the SAME service for both
-      // endpoints. The old per-side rule read the remote port and landed the
-      // label on the wrong talker: a 622-packet STUN flow 101.2.27.162:3478 →
-      // 192.168.1.20:65242 left the STUN server's row with "Services —" while
-      // the client's row claimed STUN (QA: top-talkers services audit).
-      const svc = flowServiceName(f.srcPort, f.dstPort, f.protocol)
-      // Port-derived "HTTP" is only a service if the decoder actually saw HTTP
-      // on that endpoint — a 3-packet TCP flow to :80 is not HTTP traffic
-      // (QA: talker showed "HTTP" while the report said 0 HTTP requests).
-      const namedSvc = svc === "HTTP" && !(httpIps.has(sIp) || httpIps.has(dIp)) ? "" : svc
-      if (named(namedSvc)) {
-        s.svcs.add(namedSvc)
-        d.svcs.add(namedSvc)
-      }
-    }
-    return { src, dst }
+    return talkerServicesOf(flows, ownerOf, httpIps)
   }, [flows, ownerOf, http])
 
   // Talker service list for the report row: truncated at 4 WITH an overflow
@@ -511,7 +476,7 @@ export default function ReportsPage() {
     ]
   // Top service names seen for a talker's conversations (flow-derived).
     const svcStr = (ip: string, side: "src" | "dst") => {
-      const s = (side === "src" ? talkerFlows.src.get(ip)?.svcs : talkerFlows.dst.get(ip)?.svcs)
+      const s = side === "src" ? talkerFlows.src.get(ip) : talkerFlows.dst.get(ip)
       return svcList(s)
     }
     const talkerRow = (ip: string, count: number, bytes: number, side: "src" | "dst") =>
@@ -1480,7 +1445,7 @@ export default function ReportsPage() {
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.svcs.size > 0 && ` · services: ${svcList(detail.svcs)}`}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.size > 0 && ` · services: ${svcList(detail)}`}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
@@ -1505,7 +1470,7 @@ export default function ReportsPage() {
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.svcs.size > 0 && ` · services: ${svcList(detail.svcs)}`}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.size > 0 && ` · services: ${svcList(detail)}`}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}

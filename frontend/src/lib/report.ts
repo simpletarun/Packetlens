@@ -925,11 +925,17 @@ export function escHtml(s: string): string {
 // versions escaped first and left backticks literal, so `key-test` rendered
 // as plain text instead of a <code> link (QA: real-artifact export check).
 export function mdInline(s: string): string {
-  const render = (part: string, strong: boolean) => {
+  const render = (part: string, strong: boolean, italic: boolean) => {
     const seg = part.split("`").map((c, j) => (j % 2 === 1 ? `<code>${escHtml(c)}</code>` : escHtml(c))).join("")
-    return strong ? `<strong>${seg}</strong>` : seg
+    return strong ? `<strong>${seg}</strong>` : italic ? `<em>${seg}</em>` : seg
   }
-  return s.split("**").map((part, i) => render(part, i % 2 === 1)).join("")
+  // **bold** first, then *italic* inside the non-bold spans — a bare *…*
+  // footnote used to leak literal asterisks into the HTML export (QA:
+  // "(+3 more services…)" rendered as *(+3 more services…)*).
+  return s.split("**").map((part, i) => {
+    if (i % 2 === 1) return render(part, true, false)
+    return part.split("*").map((seg, j) => render(seg, false, j % 2 === 1)).join("")
+  }).join("")
 }
 
 // Flow cell → CSV. Cells are left unquoted when plain (Excel-friendly), but
@@ -956,6 +962,43 @@ export function flowServiceName(srcPort: number, dstPort: number, protocol?: str
   const port = servicePortOf(Math.min(srcPort, dstPort), Math.max(srcPort, dstPort))
   if (port === undefined) return "Dynamic/Ephemeral"
   return portServiceName(port, protocol)
+}
+
+// Per-talker service sets for the Top Talkers cards. A conversation's service
+// is canonical (known service port wins on either side — flowServiceName) and
+// is the SAME service for both participants, on BOTH cards: the old rule only
+// labeled the flow-row sides, so the STUN server 101.2.27.162:3478 →
+// 192.168.1.20:65242 sat on the flow's source side and its destination card
+// row read "Services —" next to 350 packets (QA: top-talkers services audit).
+// "Unknown service"/"Dynamic/Ephemeral"/"N/A" are not real labels; empty is a
+// phantom-HTTP gate result (port :80 but no HTTP decoded).
+export function talkerServicesOf(
+  flows: { srcIp: string; dstIp: string; srcPort: number; dstPort: number; protocol?: string }[],
+  ownerOf: ReadonlyMap<string, string>,
+  httpIps: ReadonlySet<string>,
+): { src: Map<string, Set<string>>; dst: Map<string, Set<string>> } {
+  const src = new Map<string, Set<string>>()
+  const dst = new Map<string, Set<string>>()
+  const named = (svc: string | undefined | null) => !!svc && svc !== "Unknown service" && svc !== "Dynamic/Ephemeral" && svc !== "N/A"
+  for (const f of flows) {
+    const sIp = ownerOf.get(f.srcIp) ?? f.srcIp
+    const dIp = ownerOf.get(f.dstIp) ?? f.dstIp
+    const svc = flowServiceName(f.srcPort, f.dstPort, f.protocol)
+    // Port-derived "HTTP" is only a service if the decoder actually saw HTTP
+    // on that endpoint — a 3-packet TCP flow to :80 is not HTTP traffic
+    // (QA: talker showed "HTTP" while the report said 0 HTTP requests).
+    const namedSvc = svc === "HTTP" && !(httpIps.has(sIp) || httpIps.has(dIp)) ? "" : svc
+    if (named(namedSvc)) {
+      for (const map of [src, dst]) {
+        for (const ip of [sIp, dIp]) {
+          const set = map.get(ip) ?? new Set<string>()
+          set.add(namedSvc)
+          map.set(ip, set)
+        }
+      }
+    }
+  }
+  return { src, dst }
 }
 
 // Evidence for a flow's service label: "payload" when every packet of the
