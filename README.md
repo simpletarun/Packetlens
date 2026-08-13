@@ -1,69 +1,97 @@
-# PacketLens
+<p align="center">
+  <h1 align="center">PacketLens</h1>
+  <p align="center"><b>Drop a PCAP. Get a full security report — entirely on your machine.</b></p>
+  <p align="center">
+    <a href="https://github.com/simpletarun/Packetlens/releases/tag/v3.2.0"><img src="https://img.shields.io/badge/release-v3.2.0-blue" alt="Release v3.2.0"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+    <a href="frontend/tests"><img src="https://img.shields.io/badge/tests-353%20passed-brightgreen" alt="353 tests passing"></a>
+    <a href="#faq"><img src="https://img.shields.io/badge/privacy-100%25%20local-lightgrey" alt="100% local"></a>
+  </p>
+</p>
 
-> Drop a PCAP. Get a full security report — **entirely on your machine**.
+---
 
-[![Release](https://img.shields.io/badge/release-v3.2.0-blue)](https://github.com/simpletarun/Packetlens/releases/tag/v3.2.0)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-353%20passed-brightgreen)](frontend/tests)
+PacketLens turns a network capture (PCAP/PCAPNG) into a **22-section security report**, an **investigation graph**, a **world map**, and **PDF / HTML / CSV exports** — with no cloud, no account, and no telemetry.
 
-PacketLens turns a network capture (PCAP/PCAPNG) into a **22-section security report**, an **investigation graph**, a **world map**, and **PDF / HTML / CSV exports**. Everything runs locally — no cloud, no account, no telemetry.
+---
 
-## Quick start
+## 🚀 Quick start
 
 Requires **Node.js 20+**.
 
 ```bash
 cd frontend
 npm install
-npm run dev        # → http://localhost:3456
+npm run dev          # → http://localhost:3456
 ```
 
-Production: `npm run build && npm start`
+**Production:** `npm run build && npm start`
 
-> No capture file? Open `/analysis/mock-demo` to try the built-in demo dataset.
-> On Windows, double-click `start-dev.bat` instead.
+> **No capture file?** Open `/analysis/mock-demo` to explore the built-in demo dataset.
+> **Windows?** Double-click `start-dev.bat` at the repo root.
 
-## Features
+---
 
-- **Analysis** — PCAP/PCAPNG up to 500 MB; flows, sessions, DNS, HTTP, TLS, files, credentials, certificates, endpoints, timeline, top talkers
-- **VoIP** — SIP (5060/5061), RTP/RTCP with SSRC tracking, call dialogs by Call-ID
-- **Risk score** — transparent 0–100 from signature rules (scanning, DNS tunneling, C2 beaconing, exfiltration…) + behavioral metrics; undecodable captures report UNKNOWN, never a false "clean"
-- **IOCs & MITRE ATT&CK** — every detection mapped to the framework
-- **Investigation graph** — search, filters, 7 layouts, minimap, PNG/SVG export
-- **World map** — offline (Natural Earth data): pins, cluster badges, animated arcs
-- **GeoIP** — offline DB-IP MMDB by default (auto-install or upload); online lookups opt-in
-- **Exports** — print-ready PDF, standalone HTML, SIEM-friendly CSV (UTF-8 BOM, IPv6-safe)
-- **Privacy** — beginner mode masks IPs; no analytics, no telemetry
+## ✨ Features
 
-## Tech stack
+| Area | What you get |
+| --- | --- |
+| **Analysis** | PCAP/PCAPNG up to 500 MB — flows, sessions, DNS, HTTP, TLS, files, credentials, certificates, endpoints, timeline, top talkers |
+| **VoIP** | SIP (5060/5061), RTP/RTCP with SSRC tracking, call dialogs by Call-ID |
+| **Risk score** | Transparent 0–100 from signature rules (scanning, DNS tunneling, C2 beaconing, exfiltration…) + behavioral metrics. Undecodable captures report **UNKNOWN** — never a false "clean" |
+| **Detection** | IOCs and MITRE ATT&CK mappings for every finding |
+| **Investigation graph** | Search, type filters, 7 layouts, minimap, context menu, PNG/SVG export |
+| **World map** | Fully offline (bundled Natural Earth data) — pins, cluster badges, animated arcs |
+| **GeoIP** | Offline DB-IP MMDB by default (auto-install or upload your own); online lookups opt-in |
+| **Exports** | Print-ready PDF, standalone HTML, SIEM-friendly CSV (UTF-8 BOM, IPv6-safe) |
+| **Privacy** | Beginner mode masks IPs · no analytics · no telemetry |
+
+---
+
+## 🛠️ Tech stack
 
 | Layer | Choice |
 | --- | --- |
 | Framework | Next.js (App Router) + TypeScript |
-| Graph | cytoscape |
-| Map | d3-geo (Natural Earth, bundled) |
+| Graph | cytoscape + cytoscape-svg |
+| Map | d3-geo (Natural Earth, bundled — no tile servers) |
 | GeoIP | mmdb-lib (DB-IP City Lite) |
+| State | zustand |
 | Tests | vitest — **353 tests / 29 files** |
 
-## Development
+---
 
-```bash
-npm run lint && npx tsc --noEmit && npx vitest run && npm run build
-```
+## 📖 FAQ
 
-## FAQ
+<details>
+<summary><b>Is my capture sent anywhere?</b></summary>
+No. Parsing, analysis, and GeoIP all run locally. The only network touches are an opt-in online lookup and a one-time GeoIP database download.
+</details>
 
-**Is my capture sent anywhere?** No — parsing, analysis, and GeoIP all run locally.
+<details>
+<summary><b>Does it need internet to run?</b></summary>
+Only once: `npm install` and the one-time GeoIP database download. After that, everything — including the world map — works fully offline.
+</details>
 
-**Does it need internet?** Only once: `npm install` and the one-time GeoIP database download. The map is fully offline.
+<details>
+<summary><b>Is this a Wireshark replacement?</b></summary>
+Not exactly. Wireshark is for deep packet inspection; PacketLens is for <i>report generation</i> — drop a capture, get a structured security report and risk score.
+</details>
 
-**A Wireshark replacement?** Wireshark is for deep inspection; PacketLens is for reports — drop a capture, get analysis and a risk score.
+<details>
+<summary><b>Does it need Docker or a database?</b></summary>
+No. A single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`, last 20 jobs).
+</details>
 
-**Docker / database needed?** No. Single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`, last 20 jobs).
+---
 
-## Docs & status
+## 📚 Docs & status
 
-- [User Guide](docs/PacketLens-User-Guide.html) · [Privacy Policy](frontend/src/app/privacy/page.tsx) · [Workboard](docs/TODO.md)
+- [User Guide](docs/PacketLens-User-Guide.html) (HTML + PDF) · [Privacy Policy](frontend/src/app/privacy/page.tsx) · [Workboard](docs/TODO.md)
 - Analyzer **3.2.0** · report schema **1.0** · risk spec **1.3** · [Release v3.2.0](https://github.com/simpletarun/Packetlens/releases/tag/v3.2.0)
+
+---
+
+## License
 
 [MIT](LICENSE) © 2026 Tarun
