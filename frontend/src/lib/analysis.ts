@@ -663,23 +663,113 @@ function deriveVoip(packets: ParsedPacket[]): AnalysisCall[] {
   return calls
 }
 
+function percentDecode(value: string): string {
+  // application/x-www-form-urlencoded: '+' means space, '%XX' is a byte.
+  // Malformed sequences (e.g. "%zz") return the raw value — never throw.
+  try {
+    return decodeURIComponent(value.replace(/\+/g, ' '))
+  } catch {
+    return value
+  }
+}
+
+function decodeBasicAuth(token: string): string {
+  // atob + TextDecoder stay browser-safe: analysis.ts is imported by client
+  // pages, so node-only Buffer is not available here.
+  const bytes = Uint8Array.from(atob(token), (c) => c.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+function hexToAsciiKeep(hex: string, max = 2048): string {
+  // Like hexToAscii but keeps \r and \n so the HTTP message structure
+  // (header/body split on \r\n\r\n, request line) survives the printable
+  // filter; everything else non-printable is dropped.
+  const len = Math.min(hex.length, max * 2)
+  let out = ''
+  for (let i = 0; i < len; i += 2) {
+    const c = parseInt(hex.substring(i, i + 2), 16)
+    if (c === 13 || c === 10 || (c >= 32 && c < 127)) out += String.fromCharCode(c)
+  }
+  return out
+}
+
+function parseFormPairs(text: string): [string, string][] {
+  // key=value pairs split on '&' BEFORE decoding, so an encoded '%26' inside
+  // a value stays intact; values end at whitespace.
+  const out: [string, string][] = []
+  for (const pair of text.split('&')) {
+    const eq = pair.indexOf('=')
+    if (eq < 0) continue
+    const key = pair.slice(0, eq).trim()
+    if (!key) continue
+    out.push([key, percentDecode(pair.slice(eq + 1).split(/\s/)[0])])
+  }
+  return out
+}
+
 function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
   const creds: AnalysisCredential[] = []
   let idx = 0
   for (const p of packets) {
     if (!p.httpMethod) continue
-    const ascii = hexToAscii(p.payload)
-    const user = ascii.match(/[Uu]ser(?:name)?[=:]\s*(\S+)/)
-    const pass = ascii.match(/[Pp]ass(?:word)?[=:]\s*(\S+)/)
+    const raw = hexToAsciiKeep(p.payload)
+
+    // Real HTTP Basic auth: Authorization: Basic base64(user:pass)
+    const basic = raw.match(/Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i)
+    if (basic) {
+      const decoded = decodeBasicAuth(basic[1])
+      const colon = decoded.indexOf(':')
+      if (colon < 0) continue
+      creds.push({
+        id: `cred-${++idx}`,
+        timestamp: new Date(p.timestamp * 1000).toISOString(),
+        srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+        protocol: p.protocol || 'HTTP',
+        username: decoded.slice(0, colon),
+        password: decoded.slice(colon + 1),
+        service: 'HTTP Basic',
+      })
+      continue
+    }
+
+    // Form-encoded login — parsed on the HTTP message structure, NEVER on the
+    // raw payload blob. Header lines merge into one string once CR/LF are
+    // filtered, so a header like "Accept: ...;q=0.1" or "Cache-Control:
+    // max-age=0" would swallow the first '=' and yield garbage keys (a real
+    // capture produced a "0.1Sec-GPC:" username this way).
+    const sep = raw.indexOf('\r\n\r\n')
+    const head = sep >= 0 ? raw.slice(0, sep) : raw
+    // Body-only segment (headers were in a previous packet): treat the whole
+    // payload as the body when it is not itself an HTTP request line.
+    const isRequest = /^[A-Z]+\s+\S+\s+HTTP\//i.test(raw)
+    const body = sep >= 0 ? raw.slice(sep + 4) : isRequest ? '' : raw
+    // Query string comes from the request line only: "METHOD /path?query HTTP/x"
+    const requestLine = head.split(/\r?\n/)[0] ?? ''
+    const target = requestLine.split(' ')[1] ?? ''
+    const qmark = target.indexOf('?')
+    const query = qmark >= 0 ? target.slice(qmark + 1) : ''
+
+    const pairs: [string, string][] = []
+    if (query) pairs.push(...parseFormPairs(query))
+    // multipart bodies use boundary markers, not '&' pairs.
+    if (body && !/multipart\/form-data/i.test(head)) pairs.push(...parseFormPairs(body))
+
+    // 'bypass'/'compass'/'surpass' keys contain "pass" but are not passwords.
+    let user: string | undefined
+    let pass: string | undefined
+    for (const [key, value] of pairs) {
+      if (/user|login|email/i.test(key)) user = value
+      else if (/pass/i.test(key) && !/bypass|compass|surpass/i.test(key)) pass = value
+    }
     if (!user && !pass) continue
     creds.push({
       id: `cred-${++idx}`,
       timestamp: new Date(p.timestamp * 1000).toISOString(),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
       protocol: p.protocol || 'HTTP',
-      username: user ? user[1] : '\u2014',
-      password: pass ? pass[1] : '\u2014',
-      service: 'HTTP Basic',
+      username: user ?? '\u2014',
+      password: pass ?? '\u2014',
+      service: 'HTTP Form',
     })
   }
   return creds

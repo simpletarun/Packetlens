@@ -66,7 +66,7 @@ export default function TimelinePage() {
   return (
     <div className="flex h-screen">
       <Sidebar open={sidebarOpen} onToggle={toggleSidebar} />
-      <div className={cn("flex-1 flex flex-col transition-all duration-300", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
+      <div className={cn("flex-1 flex flex-col transition-all duration-300 min-w-0", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
         <Header />
         <main className="flex-1 overflow-y-auto p-6 space-y-6">
           <div>

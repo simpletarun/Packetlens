@@ -8,7 +8,7 @@ import {
   Shield, FolderOpen, Key, Verified, Monitor, AlertTriangle, History,
   BarChart3, FileText, Settings, ChevronLeft, X,
 } from "lucide-react"
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 import { useIsClient, useIsMobile } from "@/lib/use-client"
 
 const navGroups = [
@@ -56,12 +56,17 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
   const jobId = params?.jobId as string
   const isMobile = useIsMobile()
   const mounted = useIsClient()
+  const prevPath = useRef<string | null>(null)
 
   useEffect(() => {
     // Close-on-navigation, never open: with back/forward the pathname changes
     // while the sidebar is already closed, and an unconditional toggle would
     // flip it open over the content on every other navigation (QA).
-    if (mounted && isMobile && open) onToggle()
+    // Only react to actual pathname changes: 'open' flips on the header toggle
+    // click too, and firing here would close the drawer the instant it opens.
+    if (!mounted || !isMobile || prevPath.current === pathname) return
+    prevPath.current = pathname
+    if (open) onToggle()
   }, [pathname, isMobile, mounted, onToggle, open])
 
   return (

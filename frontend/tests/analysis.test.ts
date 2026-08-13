@@ -827,6 +827,129 @@ describe("Analysis engine", () => {
   })
 })
 
+describe("Credential extraction (deriveCredentials)", () => {
+  const mkResult = (packets: ParsedPacket[]): PCAPResult => ({
+    packets,
+    stats: {
+      totalPackets: packets.length,
+      totalBytes: packets.reduce((s, p) => s + p.length, 0),
+      duration: 10,
+      startTime: 1000000,
+      endTime: 1000010,
+      protocols: { TCP: packets.length },
+    },
+  })
+
+  const hex = (s: string): string => Buffer.from(s, "utf8").toString("hex")
+
+  const httpPacket = (payload: string, overrides: Partial<ParsedPacket> = {}): ParsedPacket =>
+    makePacket({
+      num: 1,
+      srcIp: "192.168.1.5",
+      dstIp: "100.101.45.41",
+      srcPort: 52000,
+      dstPort: 80,
+      protocol: "TCP",
+      tcpFlags: "PSH ACK",
+      httpMethod: "GET",
+      payload: hex(payload),
+      ...overrides,
+    })
+
+  it("form-encoded credentials are split on & and percent-decoded", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('GET /login?username=qudufero&txtPassword=Pa%24%24w0rd%21 HTTP/1.1\r\nHost: example.com\r\n'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].username).toBe("qudufero")
+    expect(analysis.credentials[0].password).toBe("Pa$$w0rd!")
+    expect(analysis.credentials[0].service).toBe("HTTP Form")
+  })
+
+  it("real HTTP Basic auth is decoded from the Authorization header", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].username).toBe("user")
+    expect(analysis.credentials[0].password).toBe("s3cret")
+    expect(analysis.credentials[0].service).toBe("HTTP Basic")
+  })
+
+  it("malformed percent-encoding falls back to the raw value without crashing", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('GET /login?username=x%zz HTTP/1.1\r\nHost: example.com\r\n'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].username).toBe("x%zz")
+  })
+
+  it("a plus sign in form data decodes to a space", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('GET /login?password=a+b HTTP/1.1\r\nHost: example.com\r\n'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].password).toBe("a b")
+  })
+
+  it("does not treat bypass/compass/surpass keys as passwords", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('GET /login?bypass=1&username=admin&password=letmein HTTP/1.1\r\nHost: example.com\r\n'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].username).toBe("admin")
+    expect(analysis.credentials[0].password).toBe("letmein")
+  })
+
+  it("keeps one row per request carrying credentials (duplicates are real events)", () => {
+    const payload = 'POST /login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nusername=jane&password=secret1'
+    const analysis = analyzePcap(mkResult([
+      httpPacket(payload, { num: 1, timestamp: 1000 }),
+      httpPacket(payload, { num: 2, timestamp: 4000 }),
+    ]))
+    expect(analysis.credentials).toHaveLength(2)
+    expect(analysis.credentials[0].password).toBe("secret1")
+    expect(analysis.credentials[1].password).toBe("secret1")
+  })
+
+  it("does NOT read credentials from headers (Accept q=0.1 false positive, real capture)", () => {
+    // login.pcapng regression: "Accept: text/css,*/*;q=0.1" after User-Agent
+    // used to produce a bogus "0.1Sec-GPC:" username row.
+    const analysis = analyzePcap(mkResult([
+      httpPacket('GET /style.css HTTP/1.1\r\nHost: http-login.badssl.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: text/css,*/*;q=0.1\r\nDNT: 1\r\n'),
+    ]))
+    expect(analysis.credentials).toHaveLength(0)
+  })
+
+  it("reads txtUsername from the body past a header containing '=' (real capture)", () => {
+    // login.pcapng regression: "Cache-Control: max-age=0" used to swallow the
+    // first '=' and the username was lost.
+    const analysis = analyzePcap(mkResult([
+      httpPacket('POST /login/login_results.asp HTTP/1.1\r\nHost: vbsca.ca\r\nCache-Control: max-age=0\r\nContent-Type: application/x-www-form-urlencoded\r\nUser-Agent: Mozilla/5.0\r\n\r\ntxtUsername=qudufero&txtPassword=Pa%24%24w0rd%21'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].username).toBe("qudufero")
+    expect(analysis.credentials[0].password).toBe("Pa$$w0rd!")
+    expect(analysis.credentials[0].service).toBe("HTTP Form")
+  })
+
+  it("parses a body-only segment (headers arrived in a previous packet)", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('txtUsername=qudufero&txtPassword=secret1'),
+    ]))
+    expect(analysis.credentials).toHaveLength(1)
+    expect(analysis.credentials[0].username).toBe("qudufero")
+    expect(analysis.credentials[0].password).toBe("secret1")
+  })
+
+  it("ignores multipart/form-data bodies (boundary markers, not & pairs)", () => {
+    const analysis = analyzePcap(mkResult([
+      httpPacket('POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Type: multipart/form-data; boundary=xyz\r\n\r\n--xyz\r\nContent-Disposition: form-data; name="username"\r\n\r\nqudufero\r\n--xyz--'),
+    ]))
+    expect(analysis.credentials).toHaveLength(0)
+  })
+})
+
 describe("v3.2 QA regression fixes", () => {
   const mkResult = (packets: ParsedPacket[]): PCAPResult => ({
     packets,

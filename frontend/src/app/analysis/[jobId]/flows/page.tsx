@@ -11,7 +11,7 @@ import { Search, ArrowRight, Inbox } from "lucide-react"
 import { formatBytes, formatEndpoint } from "@/lib/map-data"
 
 // One shared template so header and rows can never drift out of sync.
-const GRID = "grid-cols-[1fr_auto_1fr_70px_70px_70px_70px_70px_70px]"
+const GRID = "grid-cols-[1fr_auto_1fr_70px_70px_70px_70px_70px_70px] min-w-[880px]"
 export default function FlowsPage() {
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const sidebarOpen = useAnalysisStore((s) => s.sidebarOpen)
@@ -73,7 +73,7 @@ export default function FlowsPage() {
   return (
     <div className="flex h-screen">
       <Sidebar open={sidebarOpen} onToggle={toggleSidebar} />
-      <div className={cn("flex-1 flex flex-col transition-all duration-300", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
+      <div className={cn("flex-1 flex flex-col transition-all duration-300 min-w-0", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
         <Header />
         <main className="flex-1 flex flex-col overflow-hidden">
           <div className="p-4 border-b">

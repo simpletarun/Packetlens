@@ -30,7 +30,7 @@ export default function FilesPage() {
   return (
     <div className="flex h-screen">
       <Sidebar open={sidebarOpen} onToggle={toggleSidebar} />
-      <div className={cn("flex-1 flex flex-col transition-all duration-300", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
+      <div className={cn("flex-1 flex flex-col transition-all duration-300 min-w-0", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
         <Header />
         <main className="flex-1 flex flex-col overflow-hidden">
           <div className="p-4 border-b">
@@ -50,7 +50,7 @@ export default function FilesPage() {
           </div>
           <div className="px-4 pb-4"><DecodeBanner /></div>
           <div className="flex-1 overflow-auto px-4">
-            <div className="grid grid-cols-[100px_1fr_1fr_90px_70px_1fr] gap-3 px-4 py-2 text-xs font-medium text-muted-foreground border-b bg-background shadow-sm sticky top-0">
+            <div className="grid grid-cols-[100px_1fr_1fr_90px_70px_1fr] gap-3 min-w-[600px] px-4 py-2 text-xs font-medium text-muted-foreground border-b bg-background shadow-sm sticky top-0">
               <span>Time</span>
               <span>{beginnerMode ? "Filename" : "File"}</span>
               <span>MIME Type</span>
@@ -64,7 +64,7 @@ export default function FilesPage() {
               </p>
             )}
             {filtered.slice(0, 500).map((f) => (
-              <div key={f.id} className="grid grid-cols-[100px_1fr_1fr_90px_70px_1fr] gap-3 px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
+              <div key={f.id} className="grid grid-cols-[100px_1fr_1fr_90px_70px_1fr] gap-3 min-w-[600px] px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
                 <span className="font-mono text-muted-foreground hl-time">{formatTime(f.timestamp)}</span>
                 <span className="truncate"><FileIcon className="h-3 w-3 inline mr-1 text-muted-foreground" />{f.filename}</span>
                 <span className="truncate text-muted-foreground">{f.mimeType}</span>

@@ -1,4 +1,4 @@
-"use client"
+﻿"use client"
 
 import { useState, useMemo } from "react"
 import { Sidebar } from "@/components/layout/sidebar"
@@ -31,7 +31,7 @@ export default function SessionsPage() {
   return (
     <div className="flex h-screen">
       <Sidebar open={sidebarOpen} onToggle={toggleSidebar} />
-      <div className={cn("flex-1 flex flex-col transition-all duration-300", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
+      <div className={cn("flex-1 flex flex-col transition-all duration-300 min-w-0", sidebarOpen ? "lg:ml-56" : "lg:ml-16")}>
         <Header />
         <main className="flex-1 flex flex-col overflow-hidden">
           <div className="p-4 border-b">
@@ -43,7 +43,7 @@ export default function SessionsPage() {
             <p className="text-xs text-muted-foreground mt-1">{filtered.length} sessions</p>
           </div>
           <div className="flex-1 overflow-auto">
-            <div className="grid grid-cols-[1fr_1fr_70px_60px_80px_80px_70px_90px] gap-3 px-4 py-2 text-xs font-medium text-muted-foreground border-b bg-background shadow-sm sticky top-0">
+            <div className="grid grid-cols-[1fr_1fr_70px_60px_80px_80px_70px_90px] gap-3 min-w-[880px] px-4 py-2 text-xs font-medium text-muted-foreground border-b bg-background shadow-sm sticky top-0">
               <span>Src IP</span>
               <span>Dst IP</span>
               <span>Proto</span>
@@ -54,7 +54,7 @@ export default function SessionsPage() {
               <span>State</span>
             </div>
             {filtered.map((s) => (
-              <div key={s.id} className="grid grid-cols-[1fr_1fr_70px_60px_80px_80px_70px_90px] gap-3 px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
+              <div key={s.id} className="grid grid-cols-[1fr_1fr_70px_60px_80px_80px_70px_90px] gap-3 min-w-[880px] px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
                 <span className="font-mono hl-src">{formatEndpoint(s.srcIp, s.srcPort)}</span>
                 <span className="font-mono">{formatEndpoint(s.dstIp, s.dstPort)}</span>
                 <Badge variant="outline" className="text-[10px] px-1 py-0 font-mono">{s.protocol}</Badge>
