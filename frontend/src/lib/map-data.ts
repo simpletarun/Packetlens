@@ -28,7 +28,7 @@ export interface MapNode {
   localConns?: number
 }
 
-export interface MapArc {
+interface MapArc {
   srcIp: string; dstIp: string; protocol: string
   packets: number; bytes: number
   timestamps: number[]
@@ -52,7 +52,7 @@ export function clampLon(v: number): number {
 }
 
 // ponytail: great-circle arcs for public IPs on world map
-export function greatCirclePoints(lat1: number, lon1: number, lat2: number, lon2: number, steps = 60): [number, number][] {
+function greatCirclePoints(lat1: number, lon1: number, lat2: number, lon2: number, steps = 60): [number, number][] {
   const φ1 = lat1 * Math.PI / 180; const λ1 = lon1 * Math.PI / 180
   const φ2 = lat2 * Math.PI / 180; const λ2 = lon2 * Math.PI / 180
   const d = Math.acos(Math.max(-1, Math.min(1, Math.sin(φ1) * Math.sin(φ2) + Math.cos(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1))))
@@ -106,7 +106,7 @@ export interface MapPanels {
   localHosts: number
 }
 
-export interface CountryRow {
+interface CountryRow {
   name: string
   code: string
   bytes: number
@@ -286,7 +286,7 @@ export function clusterByCity(
   }))
 }
 
-export interface LocalPublicFlow {
+interface LocalPublicFlow {
   peerIp: string
   bytes: number
   packets: number
@@ -324,7 +324,7 @@ type GeoResolved = GeoLocationLike & { country: string; countryCode: string; lat
 
 // Drawable iff the geo row carries a real country — a miss, an "Unknown"
 // fallback, or a bare coordinate must never reach the globe.
-export function isGeocoded(loc: GeoLocationLike | undefined): loc is GeoResolved {
+function isGeocoded(loc: GeoLocationLike | undefined): loc is GeoResolved {
   if (!loc) return false
   if (!loc.country || loc.country === "Unknown") return false
   if (!loc.countryCode || loc.countryCode === "??") return false

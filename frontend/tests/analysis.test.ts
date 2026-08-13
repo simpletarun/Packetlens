@@ -1031,6 +1031,18 @@ describe("v3.2 QA regression fixes", () => {
     expect(analysis.devices.find((d) => d.ip === "93.184.216.34")?.hostname).toBe("www.wireshark.org")
   })
 
+  it("negotiated legacy suite forces TLSv1.2 despite a 1.3-capable ClientHello (QA: qwen handshake offered TLS_AES_128_GCM_SHA256, ServerHello answered ECDHE-RSA-AES128-GCM-SHA256)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: t0, srcIp: "192.168.1.10", dstIp: "8.208.41.88", srcPort: 50000, dstPort: 443, tlsSni: "qwen-webui-prod.oss-accelerate.aliyuncs.com", tlsVersion: 0x0304 }),
+      makePacket({ num: 2, timestamp: t0 + 1, srcIp: "8.208.41.88", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000, tcpFlags: "ACK", tlsCipherSuite: 0xc02f }),
+    ]
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.tls.length).toBe(1)
+    expect(analysis.tls[0].version).toBe("TLSv1.2")
+    expect(analysis.tls[0].cipherSuite).toBe("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+  })
+
   it("beaconing: regular talk to a WNS/Skype push endpoint is not C2 (QA: keepalive FP)", () => {
     const t0 = 1_700_000_000
     const packets: ParsedPacket[] = []

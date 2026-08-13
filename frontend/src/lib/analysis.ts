@@ -74,7 +74,7 @@ export interface AnalysisFile {
 // A VoIP/SIP call: one INVITE dialog unified with its RTP media stream. RTP
 // packets are matched back to the call by the SDP `m=audio` port plus the
 // caller/callee peer pair; a call with no matching RTP shows null media.
-export interface AnalysisCall {
+interface AnalysisCall {
   id: string
   callId: string
   from: string
@@ -130,7 +130,7 @@ export interface AnalysisBandwidthPoint {
   time: string; in: number; out: number
 }
 
-export interface AnalysisJob {
+interface AnalysisJob {
   id: string; filename: string; fileSize: number
   status: string; progress: number; stage: string
   totalPackets: number; totalFlows: number; conversations: number
@@ -143,7 +143,7 @@ export interface AnalysisJob {
   md5?: string
 }
 
-export interface FileInfo {
+interface FileInfo {
   sha256: string
   sha1: string
   md5: string
@@ -524,13 +524,17 @@ function deriveTls(packets: ParsedPacket[]): AnalysisTlsEntry[] {
   }
   return packets.filter(p => p.tlsSni).map((p, i) => {
     const negotiated = p.dstIp && serverSuite.has(p.dstIp) ? serverSuite.get(p.dstIp)! : undefined
-    // A 0x13xx suite can only be NEGOTIATED by TLS 1.3 (RFC 8446) — when the
-    // server agreed one, the handshake is 1.3 even if this ClientHello's
-    // legacy_version field reads 0x0303 (RFC 8446 §4.1.2 keeps it there by
-    // spec, and the suite-scan can miss on truncated CH payloads) (QA: row
-    // showed TLSv1.2 with TLS_AES_256_GCM_SHA384).
-    const version = negotiated !== undefined && negotiated >= 0x1301 && negotiated <= 0x1305
-      ? 'TLSv1.3'
+    // The negotiated suite decides the version. A 0x13xx suite can only be
+    // NEGOTIATED by TLS 1.3 (RFC 8446) — when the server agreed one, the
+    // handshake is 1.3 even if this ClientHello's legacy_version field reads
+    // 0x0303 (RFC 8446 §4.1.2 keeps it there by spec, and the suite-scan can
+    // miss on truncated CH payloads) (QA: row showed TLSv1.2 with
+    // TLS_AES_256_GCM_SHA384). A legacy suite means the server chose a
+    // pre-1.3 handshake, so the row must not inherit the ClientHello's 1.3
+    // capability offer (QA: qwen handshake offered TLS_AES_128_GCM_SHA256
+    // but the ServerHello answered ECDHE-RSA-AES128-GCM-SHA256 → TLSv1.2).
+    const version = negotiated !== undefined
+      ? (negotiated >= 0x1301 && negotiated <= 0x1305 ? 'TLSv1.3' : 'TLSv1.2')
       : tlsVersionName(p.tlsVersion)
     return {
       id: `tls-${i + 1}`,

@@ -762,6 +762,7 @@ describe("tlsCipherSuiteName", () => {
     expect(tlsCipherSuiteName(0x1301)).toBe("TLS_AES_128_GCM_SHA256")
     expect(tlsCipherSuiteName(0x1302)).toBe("TLS_AES_256_GCM_SHA384")
     expect(tlsCipherSuiteName(0xc02f)).toBe("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+    expect(tlsCipherSuiteName(0xc02c)).toBe("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384")
     expect(tlsCipherSuiteName(0x9999)).toBe("0x9999")
   })
 })

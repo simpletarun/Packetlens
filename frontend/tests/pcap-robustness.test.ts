@@ -10,8 +10,8 @@ function tcpPcap(payload: Uint8Array, keep?: number): Buffer {
   buf.writeUInt32LE(0xa1b2c3d4, 0)
   buf.writeUInt32LE(65535, 16) // snaplen
   buf.writeUInt32LE(1, 20) // LINKTYPE_ETHERNET
-  buf.writeUInt32LE(total - 24, 32) // incl_len
-  buf.writeUInt32LE(total - 24, 36) // orig_len
+  buf.writeUInt32LE(total - 40, 32) // incl_len (frame bytes only)
+  buf.writeUInt32LE(total - 40, 36) // orig_len
   let o = FRAME
   buf.fill(0xff, o, o + 6); o += 6 // dstMac
   buf.fill(0, o, o + 6); o += 6 // srcMac
@@ -33,6 +33,40 @@ function tcpPcap(payload: Uint8Array, keep?: number): Buffer {
   o += 6 // win + csum + urg
   buf.set(payload, o)
   return keep === undefined ? buf : buf.subarray(0, Math.min(keep, total))
+}
+
+// Same as tcpPcap but with an explicit TCP sequence number — used to build
+// multi-segment flows (each returned buffer is one complete pcap frame).
+function tcpSeg(payload: Uint8Array, seq: number): Buffer {
+  const total = 24 + 16 + 14 + 20 + 20 + payload.length
+  const buf = Buffer.alloc(total)
+  buf.writeUInt32LE(0xa1b2c3d4, 0)
+  buf.writeUInt32LE(65535, 16)
+  buf.writeUInt32LE(1, 20)
+  buf.writeUInt32LE(total - 40, 32)
+  buf.writeUInt32LE(total - 40, 36)
+  let o = 24 + 16
+  buf.fill(0xff, o, o + 6); o += 6
+  buf.fill(0, o, o + 6); o += 6
+  buf.writeUInt16BE(0x0800, o); o += 2
+  buf[o] = 0x45; o += 1
+  o += 1
+  buf.writeUInt16BE(20 + 20 + payload.length, o); o += 2
+  o += 4
+  buf[o] = 64; o += 1
+  buf[o] = 6; o += 1
+  o += 2
+  buf[o] = 192; buf[o + 1] = 168; buf[o + 2] = 1; buf[o + 3] = 1; o += 4
+  buf[o] = 93; buf[o + 1] = 184; buf[o + 2] = 216; buf[o + 3] = 34; o += 4
+  buf.writeUInt16BE(443, o); o += 2
+  buf.writeUInt16BE(443, o); o += 2
+  buf.writeUInt32BE(seq, o); o += 4
+  o += 4 // ack
+  buf[o] = 0x50; o += 1
+  buf[o] = 0x18; o += 1
+  o += 6
+  buf.set(payload, o)
+  return buf
 }
 
 // Same frame but UDP (proto 17) with an 8-byte UDP header — QUIC runs on UDP.
@@ -153,5 +187,63 @@ describe("parsePcap robustness", () => {
     rec.writeUInt16BE(hs.length, 3)
     const r = await parsePcap(tcpPcap(rec))
     expect(r.packets[0].tlsVersion).toBe(0x0303)
+  })
+
+  it("fragmented ServerHello still yields the cipher suite from its first segment", async () => {
+    // TLS 1.3 ServerHello: legacy_version(2) random(32) sid_len(1) sid(0)
+    // cipher(2) ext_len(2) — 39-byte body, 48-byte record in total. The
+    // record spans two TCP segments; the first segment carries only the
+    // record+handshake headers plus the cipher (46 of 48 bytes).
+    const body = Buffer.concat([
+      Buffer.from([0x03, 0x03]),
+      Buffer.alloc(32, 0xcd),
+      Buffer.from([0x00]), // empty session id (RFC 8446)
+      Buffer.from([0x13, 0x02]), // TLS_AES_256_GCM_SHA384
+      Buffer.from([0x00, 0x00]), // no extensions
+    ])
+    const hs = Buffer.concat([Buffer.from([0x02, 0x00, 0x00, body.length]), body])
+    const rec = Buffer.concat([Buffer.from([0x16, 0x03, 0x03]), Buffer.from([0x00, 0x00]), hs])
+    rec.writeUInt16BE(hs.length, 3)
+    const r = await parsePcap(tcpPcap(rec, 24 + 16 + 14 + 20 + 20 + 46))
+    const p = r.packets[0]
+    expect(p.tlsCipherSuite).toBe(0x1302)
+    expect(p.tlsVersion).toBe(0x0304)
+  })
+
+  it("ServerHello record head shorter than the cipher offset never throws", async () => {
+    const body = Buffer.concat([
+      Buffer.from([0x03, 0x03]),
+      Buffer.alloc(32, 0xcd),
+      Buffer.from([0x10]), // 16-byte session id
+      Buffer.alloc(16, 0x11),
+    ])
+    const hs = Buffer.concat([Buffer.from([0x02, 0x00, 0x00, body.length]), body])
+    const rec = Buffer.concat([Buffer.from([0x16, 0x03, 0x03]), Buffer.from([0x00, 0x00]), hs])
+    rec.writeUInt16BE(hs.length, 3)
+    const r = await parsePcap(tcpPcap(rec, 24 + 16 + 14 + 20 + 20 + 40))
+    expect(r.packets[0].tlsCipherSuite).toBeUndefined()
+  })
+
+  it("fragmented ClientHello SNI is recovered by reassembling the record across segments", async () => {
+    // A key_share extension (400 filler bytes) before the SNI pushes the SNI
+    // beyond the first segment, so the per-packet scan can't see it — exactly
+    // the real-capture shape (big key_share at the start of extensions).
+    const base = chBody(0x0303, "fragmented.example")
+    const sniExt = base.subarray(43) // the SNI extension: [type][len][list]
+    const ksData = Buffer.alloc(400, 0xaa)
+    const ks = Buffer.concat([Buffer.from([0x00, 0x33]), Buffer.from([ksData.length >> 8, ksData.length & 0xff]), ksData])
+    const extList = Buffer.concat([ks, sniExt])
+    const body2 = Buffer.concat([base.subarray(0, 41), Buffer.from([extList.length >> 8, extList.length & 0xff]), extList])
+    const hs = Buffer.concat([Buffer.from([0x01, body2.length >> 16, (body2.length >> 8) & 0xff, body2.length & 0xff]), body2])
+    const rec = Buffer.concat([Buffer.from([0x16, 0x03, 0x03]), Buffer.from([0x00, 0x00]), hs])
+    rec.writeUInt16BE(hs.length, 3)
+    const seg1 = rec.subarray(0, 200)
+    const seg2 = rec.subarray(200)
+    const r = await parsePcap(Buffer.concat([tcpSeg(seg1, 0), tcpSeg(seg2, 200).subarray(24)]))
+    expect(r.packets.length).toBe(2)
+    expect(r.packets[0].tlsSni).toBe("fragmented.example")
+    expect(r.packets[0].appProtocol).toBe("TLS")
+    expect(r.packets[0].tlsVersion).toBe(0x0304)
+    expect(r.packets[1].tlsSni).toBeUndefined()
   })
 })

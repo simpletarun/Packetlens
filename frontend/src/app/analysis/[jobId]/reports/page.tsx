@@ -174,7 +174,7 @@ export default function ReportsPage() {
     return s
   }, [devices])
 
-  const { totalBytes, avgPacketBytes, topProto, uniqueSrcIps, uniqueDstIps, topSrcIps, topDstIps } = useMemo(() => {
+  const { totalBytes, avgPacketBytes, topProto, uniqueSrcIps, uniqueDstIps, topSrcIps, topDstIps, srcConns, dstConns, srcProtos, dstProtos } = useMemo(() => {
     const totalBytes = packets.reduce((s, p) => s + p.length, 0)
     // Wire-size average: origLength is the on-wire size when the capture
     // truncated frames (snaplen), so the raw length would understate real
@@ -185,6 +185,14 @@ export default function ReportsPage() {
     const dstIps = new Set<string>()
     const srcCount: Record<string, { count: number; bytes: number }> = {}
     const dstCount: Record<string, { count: number; bytes: number }> = {}
+    // Connection/protocol details are PACKET-direction counts (same pass as
+    // the row's packet totals), not flow-level ones: the old flow key read
+    // the local side as dst only for DNS flows, so the internal host showed
+    // "1 conns · DNS" next to 13,865 destination packets (QA: top talkers).
+    const srcConns: Record<string, Set<string>> = {}
+    const dstConns: Record<string, Set<string>> = {}
+    const srcProtos: Record<string, Set<string>> = {}
+    const dstProtos: Record<string, Set<string>> = {}
     for (const p of packets) {
       protoCount[p.protocol] = (protoCount[p.protocol] || 0) + 1
       // Undecodable packets carry the "—" placeholder, never a real address;
@@ -195,6 +203,8 @@ export default function ReportsPage() {
         const s = (srcCount[src] ||= { count: 0, bytes: 0 })
         s.count += 1
         s.bytes += p.length
+        if (p.dstIp && p.dstIp !== "\u2014") (srcConns[src] ??= new Set()).add(p.dstPort !== undefined ? `${p.dstIp}:${p.dstPort}` : p.dstIp)
+        if (p.protocol) (srcProtos[src] ??= new Set()).add(p.protocol)
       }
       if (p.dstIp && p.dstIp !== "\u2014") {
         const dst = ownerOf.get(p.dstIp) ?? p.dstIp
@@ -202,6 +212,8 @@ export default function ReportsPage() {
         const d = (dstCount[dst] ||= { count: 0, bytes: 0 })
         d.count += 1
         d.bytes += p.length
+        if (p.srcIp && p.srcIp !== "\u2014") (dstConns[dst] ??= new Set()).add(p.srcPort !== undefined ? `${p.srcIp}:${p.srcPort}` : p.srcIp)
+        if (p.protocol) (dstProtos[dst] ??= new Set()).add(p.protocol)
       }
     }
     return {
@@ -212,6 +224,7 @@ export default function ReportsPage() {
       uniqueDstIps: dstIps.size,
       topSrcIps: Object.entries(srcCount).map(([ip, v]) => ({ ip, ...v })).sort((a, b) => b.count - a.count),
       topDstIps: Object.entries(dstCount).map(([ip, v]) => ({ ip, ...v })).sort((a, b) => b.count - a.count),
+      srcConns, dstConns, srcProtos, dstProtos,
     }
   }, [packets, ownerOf])
 
@@ -319,12 +332,13 @@ export default function ReportsPage() {
   // and come back from the resolver, so they are packets, not queries.
   const dnsQueries = dns.filter((d) => !d.isResponse).length
 
-  // Per-talker extras (connections, protocols, remote services) derive from
-  // flows, which carry both directions per conversation. Aliases fold into
-  // their owner so the detail line lines up with the folded Top Talkers row.
+  // Per-talker remote services derive from flows, which carry both directions
+  // per conversation. Aliases fold into their owner so the detail line lines
+  // up with the folded Top Talkers row. (Connection counts and protocol mixes
+  // come from the packet-direction pass in the top-talkers memo above.)
   const talkerFlows = useMemo(() => {
-    const src = new Map<string, { conns: Set<string>; protos: Set<string>; svcs: Set<string> }>()
-    const dst = new Map<string, { conns: Set<string>; protos: Set<string>; svcs: Set<string> }>()
+    const src = new Map<string, { svcs: Set<string> }>()
+    const dst = new Map<string, { svcs: Set<string> }>()
     // "Unknown service"/"Dynamic/Ephemeral"/"N/A" are not real labels; empty
     // is a phantom-HTTP gate result (port :80 but no HTTP decoded) — dropping
     // it here is what keeps the joined list clean ("services: , HTTPS" QA).
@@ -337,13 +351,9 @@ export default function ReportsPage() {
     for (const f of flows) {
       const sIp = ownerOf.get(f.srcIp) ?? f.srcIp
       const dIp = ownerOf.get(f.dstIp) ?? f.dstIp
-      const s = src.get(sIp) || { conns: new Set(), protos: new Set(), svcs: new Set() }
-      s.conns.add(`${dIp}:${f.dstPort}`)
-      s.protos.add(f.protocol)
+      const s = src.get(sIp) || { svcs: new Set() }
       src.set(sIp, s)
-      const d = dst.get(dIp) || { conns: new Set(), protos: new Set(), svcs: new Set() }
-      d.conns.add(`${sIp}:${f.srcPort}`)
-      d.protos.add(f.protocol)
+      const d = dst.get(dIp) || { svcs: new Set() }
       dst.set(dIp, d)
       // A conversation's service is canonical (known service port wins on
       // either side — flowServiceName) and is the SAME service for both
@@ -363,6 +373,15 @@ export default function ReportsPage() {
     }
     return { src, dst }
   }, [flows, ownerOf, http])
+
+  // Talker service list for the report row: truncated at 4 WITH an overflow
+  // count — a silent slice read as "these are all the services" (QA: local
+  // host's XMPP vanished behind the cut).
+  const svcList = (svcs?: Set<string>): string => {
+    if (!svcs || svcs.size === 0) return "—"
+    const all = [...svcs].sort()
+    return all.length <= 4 ? all.join(", ") : `${all.slice(0, 4).join(", ")} +${all.length - 4} more`
+  }
 
   const hostLabel = (ip: string) => {
     // 224.0.0.0/4, ff00::/8 etc. are multicast, not private LAN hosts —
@@ -490,10 +509,10 @@ export default function ReportsPage() {
       `| ${header.map(() => "---").join(" | ")} |`,
       ...rows.map((r) => `| ${r.join(" | ")} |`),
     ]
-    // Top service names seen for a talker's conversations (flow-derived).
+  // Top service names seen for a talker's conversations (flow-derived).
     const svcStr = (ip: string, side: "src" | "dst") => {
       const s = (side === "src" ? talkerFlows.src.get(ip)?.svcs : talkerFlows.dst.get(ip)?.svcs)
-      return s && s.size ? [...s].sort().slice(0, 4).join(", ") : "—"
+      return svcList(s)
     }
     const talkerRow = (ip: string, count: number, bytes: number, side: "src" | "dst") =>
       `| ${ip} | ${isNonUnicast(ip) ? "Multicast" : isPrivateIP(ip) || localOwned.has(ip) ? "Internal Host" : "External"} | ${count.toLocaleString()} | ${formatBytes(bytes)} | ${svcStr(ip, side)} |`
@@ -659,7 +678,7 @@ export default function ReportsPage() {
           </div>
 
           <div className="print-only">
-            <div style={{ textAlign: "center", padding: "120pt 0 60pt", pageBreakAfter: "always" }}>
+            <div style={{ textAlign: "center", padding: "80pt 0 24pt", pageBreakAfter: "always" }}>
               <div style={{ fontSize: "36pt", fontWeight: 800, color: "#1a1a2e", letterSpacing: "-0.02em", marginBottom: "8pt" }}>PacketLens</div>
               <div style={{ fontSize: "18pt", color: "#2563eb", fontWeight: 600, marginBottom: "32pt" }}>PCAP Analysis Report</div>
               <hr style={{ width: "80pt", border: "none", borderTop: "3px solid #2563eb", margin: "0 auto 32pt" }} />
@@ -679,7 +698,7 @@ export default function ReportsPage() {
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Build</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{BUILD_STAMP}</td></tr>
                 </tbody>
               </table>
-              <div style={{ marginTop: "60pt", fontSize: "8pt", color: "#aaa" }}>PacketLens Report &middot; Detection Engine: Behavioral &middot; Analyzer: {report.metadata.analyzerVersion || ANALYZER_VERSION} &middot; Generated By: PacketLens &middot; Generated {new Date().toISOString().slice(0, 10)} &middot; Build {BUILD_STAMP}</div>
+              <div style={{ marginTop: "40pt", fontSize: "8pt", color: "#aaa" }}>PacketLens Report &middot; Detection Engine: Behavioral &middot; Analyzer: {report.metadata.analyzerVersion || ANALYZER_VERSION} &middot; Generated By: PacketLens &middot; Generated {new Date().toISOString().slice(0, 10)} &middot; Build {BUILD_STAMP}</div>
             </div>
           </div>
 
@@ -855,6 +874,7 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
+                  {flows.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest flows of {flows.length.toLocaleString()} — the CSV export lists all flows.</div>}
                   {/* TCP health mirrors the CSV export: per-flow RTT, retrans,
                       loss, OoO, zero-window and RST. Shows the worst flows —
                       a summary without rows reads as "nothing measured". */}
@@ -934,6 +954,7 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
+                  {sessions.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest sessions of {sessions.length.toLocaleString()} — the Analysis page lists all sessions.</div>}
                   <p className="text-xs text-muted-foreground mt-3">Sessions mirror flows one-to-one (one session per direction-normalized conversation; TCP flows are marked ESTABLISHED, others STATELESS). Higher-level, multi-flow session reconstruction is not implemented.</p>
                 </CardContent>
               </Card>
@@ -951,7 +972,7 @@ export default function ReportsPage() {
                       { label: "Failed (NXDOMAIN)", value: dns.filter((d) => d.responseCode === "NXDOMAIN").length.toLocaleString() },
                     ]} />
                   </div>
-                  <p className="text-[10px] text-muted-foreground">Distinct Lookups counts each name+type once for the capturing client — a LAN router relaying a query upstream is not counted as a second querier (the table below still lists every DNS message: queries and responses).</p>
+                  <p className="text-[10px] text-muted-foreground">Distinct Lookups counts each name+type once for the capturing client — a LAN router relaying a query upstream is not counted as a second querier{dns.length <= 15 ? " (the table below still lists every DNS message: queries and responses)" : ""}.</p>
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
@@ -976,6 +997,7 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
+                  {dns.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the first 15 of {dns.length.toLocaleString()} DNS messages in capture order — the Analysis page lists all {dns.length.toLocaleString()}.</div>}
                 </CardContent>
               </Card>
             </section>
@@ -1069,6 +1091,7 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
+                  {tls.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the first 15 of {tls.length.toLocaleString()} TLS handshakes in capture order — the Analysis page lists all {tls.length.toLocaleString()}.</div>}
                 </CardContent>
               </Card>
             </section>
@@ -1227,7 +1250,7 @@ export default function ReportsPage() {
                         <tr className="border-b text-muted-foreground">
                           <th className="text-left py-2 pr-2">Subject</th>
                           <th className="text-left py-2 pr-2">Issuer</th>
-                          <th className="text-left py-2 pr-2">Fingerprint</th>
+                          <th className="text-left py-2 pr-2">Serial</th>
                           <th className="text-left py-2">Status</th>
                         </tr>
                       </thead>
@@ -1236,7 +1259,7 @@ export default function ReportsPage() {
                           <tr key={c.id} className="border-b border-border/30">
                             <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{c.subject}</td>
                             <td className="py-1.5 pr-2 text-muted-foreground truncate max-w-[200px]">{c.issuer}</td>
-                            <td className="py-1.5 pr-2 font-mono text-[10px] text-muted-foreground truncate max-w-[160px]">{c.fingerprint || "-"}</td>
+                            <td className="py-1.5 pr-2 font-mono text-[10px] text-muted-foreground truncate max-w-[160px]">{c.serial || "-"}</td>
                             <td className="py-1.5"><Badge variant={c.notAfter === null ? "outline" : new Date(c.notAfter) >= new Date(certRef) ? "success" : "destructive"} className="text-[10px]">{c.notAfter === null ? "Unknown" : new Date(c.notAfter) >= new Date(certRef) ? "Valid" : "Expired"}</Badge></td>
                           </tr>
                         ))}
@@ -1375,7 +1398,7 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="text-[10px] text-muted-foreground mt-1">Confidence is a per-rule constant (spec v1.3); behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;.</div>
+                  <div className="text-[10px] text-muted-foreground mt-1">Confidence here is the rule&rsquo;s base value (spec v1.3); C2-beacon, exfil and DNS-tunnel rules that fire during a detected traffic burst get a bonus in the Risk Breakdown (e.g. 70% base can appear there as 85%), and behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;. Pkts/Bytes read N/A when an alert spans multiple flows &mdash; the Evidence column then carries the measured numbers.</div>
                 </CardContent>
               </Card>
             </section>
@@ -1450,12 +1473,14 @@ export default function ReportsPage() {
                     {topSrcIps.length === 0 && <p className="text-xs text-muted-foreground">No decodable addresses — capture encapsulation unsupported ({linkTypes.length > 0 ? dltName(linkTypes) : "unknown"}).</p>}
                     {topSrcIps.slice(0, 5).map(({ ip, count, bytes }) => {
                       const detail = talkerFlows.src.get(ip)
+                      const conns = srcConns[ip]?.size ?? 0
+                      const protos = srcProtos[ip] ? [...srcProtos[ip]!].sort().join(", ") : ""
                       return (
                         <div key={ip} className="flex justify-between gap-2 text-xs py-1 border-b border-border/30 last:border-0">
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {detail && <div className="text-[10px] text-muted-foreground">{detail.conns.size} conns · {[...detail.protos].sort().join(", ")}{detail.svcs.size > 0 && ` · services: ${[...detail.svcs].sort().slice(0, 4).join(", ")}`}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.svcs.size > 0 && ` · services: ${svcList(detail.svcs)}`}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
@@ -1473,12 +1498,14 @@ export default function ReportsPage() {
                     {topDstIps.length === 0 && <p className="text-xs text-muted-foreground">No decodable addresses — capture encapsulation unsupported ({linkTypes.length > 0 ? dltName(linkTypes) : "unknown"}).</p>}
                     {topDstIps.slice(0, 5).map(({ ip, count, bytes }) => {
                       const detail = talkerFlows.dst.get(ip)
+                      const conns = dstConns[ip]?.size ?? 0
+                      const protos = dstProtos[ip] ? [...dstProtos[ip]!].sort().join(", ") : ""
                       return (
                         <div key={ip} className="flex justify-between gap-2 text-xs py-1 border-b border-border/30 last:border-0">
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {detail && <div className="text-[10px] text-muted-foreground">{detail.conns.size} conns · {[...detail.protos].sort().join(", ")}{detail.svcs.size > 0 && ` · services: ${[...detail.svcs].sort().slice(0, 4).join(", ")}`}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.svcs.size > 0 && ` · services: ${svcList(detail.svcs)}`}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}

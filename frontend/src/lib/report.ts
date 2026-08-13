@@ -107,7 +107,7 @@ export function endpointRowsOf<T extends { ip: string }>(devices: T[]): T[] {
   return devices.filter((d) => !isNonUnicast(d.ip))
 }
 
-export const REPORT_SCHEMA_VERSION = "1.0"
+const REPORT_SCHEMA_VERSION = "1.0"
 
 // The risk spec (shared/risk-spec.json) has no embedded version key; the app's
 // canonical spec revision is 1.3. Used when jobInfo.riskSpecVersion is absent
@@ -195,7 +195,7 @@ const TECHNIQUE_NAMES: Record<string, { name: string; desc: string }> = {
 
 // Alert finding aggregated per signature so reports never repeat near-identical
 // rows ("DNS Tunneling ×3" becomes one row with occurrences/hosts/time span).
-export interface AlertGroup {
+interface AlertGroup {
   signature: string
   ruleId: string
   category: string
@@ -215,7 +215,7 @@ export interface AlertGroup {
   packetRange: [number, number] | null
 }
 
-export function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
+function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
   const groups = new Map<string, AlertEntry[]>()
   for (const a of alerts) {
     const key = `${a.ruleId}::${a.signature}`
@@ -261,7 +261,7 @@ function sameTuple(alert: AlertEntry, srcPort: number, dstPort: number): boolean
 
 // Flow/session/packet references for an alert: matches the alert's host pair
 // (either direction) plus ports when the alert carries them.
-export function alertReferences(
+function alertReferences(
   alert: AlertEntry,
   flows: Flow[],
   sessions: Session[],
@@ -297,7 +297,7 @@ export interface ReportRisk {
   burstApplied: boolean
 }
 
-export interface IocFinding {
+interface IocFinding {
   type: string
   value: string
   description: string
@@ -310,7 +310,7 @@ export interface IocFinding {
   lastSeen?: string
 }
 
-export interface MitreFinding {
+interface MitreFinding {
   technique: string
   id: string
   description: string
@@ -318,7 +318,7 @@ export interface MitreFinding {
   source: FindingSource
 }
 
-export interface Recommendation {
+interface Recommendation {
   text: string
   severity: number
   source: FindingSource
@@ -399,7 +399,7 @@ export function iocSource(type: string, alerts: AlertEntry[]): FindingSource {
   return ruleId && alerts.some((a) => a.ruleId === ruleId) ? "CONFIRMED_ALERT" : "BEHAVIORAL_METRIC"
 }
 
-export function iocSeverity(ioc: { type: string; severity: number }, alerts: AlertEntry[]): number {
+function iocSeverity(ioc: { type: string; severity: number }, alerts: AlertEntry[]): number {
   if (ioc.type === "threat") return ioc.severity
   const ruleId = IOC_TO_RULE[ioc.type]
   return ruleId ? maxSeverityForAlerts(alerts, [ruleId]) ?? ioc.severity : ioc.severity
@@ -411,7 +411,7 @@ export function mitreSource(mapping: { id: string }, alerts: AlertEntry[]): Find
     : "BEHAVIORAL_METRIC"
 }
 
-export function mitreSeverity(mapping: { id: string; severity: number }, alerts: AlertEntry[]): number {
+function mitreSeverity(mapping: { id: string; severity: number }, alerts: AlertEntry[]): number {
   return maxSeverityForAlerts(alerts, ruleIdsForTechnique(mapping.id)) ?? mapping.severity
 }
 
@@ -458,7 +458,7 @@ function recTopic(text: string): string {
   return lower.slice(0, 40)
 }
 
-export function buildRecommendations(
+function buildRecommendations(
   advancedMetrics: AdvancedMetrics | null,
   mitre: MitreFinding[],
   alerts: AlertEntry[]
@@ -533,7 +533,7 @@ function packetSpanSec(packets: Array<{ timestamp: string | number }>): [number,
   return [min, max]
 }
 
-export function timelineLabel(secFromStart: number): string {
+function timelineLabel(secFromStart: number): string {
   const s = Math.max(0, Math.floor(secFromStart))
   const h = Math.floor(s / 3600)
   const m = Math.floor((s % 3600) / 60)
@@ -606,7 +606,7 @@ export function binWidthSec(durationSec: number, maxBins = 120): number {
 // 10 minutes they are coarser than the packet rebin (an 88s capture collapses
 // to 2 coarse bins), so only short captures rebin from packets — long
 // captures keep the store (fewer points, exact SQL counts).
-export function buildTimeline(
+function buildTimeline(
   packets: Packet[],
   storeTimeline: TimelineEntry[],
   durationSec: number

@@ -86,8 +86,8 @@ export default function HomePage() {
                 Network Traffic
               </h1>
               <p className="text-lg md:text-xl text-muted-foreground max-w-2xl mx-auto leading-relaxed">
-                Drop a PCAP file and instantly get deep protocol analysis, threat detection,
-                flow visualizations, and exportable reports.
+                Free, 100% local PCAP analyzer: flows, sessions, DNS, TCP health, VoIP (SIP/RTP),
+                threat detection, and exportable security reports — nothing leaves your machine.
               </p>
             </div>
           </FadeIn>

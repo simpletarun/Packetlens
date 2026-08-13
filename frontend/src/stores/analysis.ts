@@ -89,18 +89,18 @@ export interface TlsEntry {
   ja3: string; issuer: string; validityDays: number
 }
 
-export interface FileEntry {
+interface FileEntry {
   id: string; timestamp: string; srcIp: string; dstIp: string
   filename: string; mimeType: string; size: number
   protocol: string; md5: string
 }
 
-export interface CredentialEntry {
+interface CredentialEntry {
   id: string; timestamp: string; srcIp: string; dstIp: string
   protocol: string; username: string; password: string; service: string
 }
 
-export interface CallEntry {
+interface CallEntry {
   id: string; callId: string; from: string; to: string
   viaIp: string; startTime: string; endTime: string | null
   durationSec: number | null; userAgent: string; status: string
@@ -108,7 +108,7 @@ export interface CallEntry {
   rtpPackets: number; rtpBytes: number
 }
 
-export interface CertificateEntry {
+interface CertificateEntry {
   id: string; serial: string; subject: string; issuer: string
   // null = no valid validity time in the capture (a -1 used to render as a
   // fabricated "1969-12-31" date).
@@ -198,7 +198,7 @@ function loadPersistedPrefs(): { beginnerMode?: boolean; dltOverride?: number | 
   }
 }
 
-export interface AnalysisViewData {
+interface AnalysisViewData {
   job: JobSummary
   packets: Packet[]
   flows: Flow[]

@@ -10,13 +10,13 @@ import { ReactNode } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { PROTOCOL_COLORS, formatBytes } from "@/lib/map-data"
 
-export interface CountryRow {
+interface CountryRow {
   name: string
   code: string
   bytes: number
 }
 
-export interface UnresolvedRow {
+interface UnresolvedRow {
   ip: string
   bytes: number
 }
@@ -51,7 +51,7 @@ interface MapChromeProps {
 }
 
 // Country code -> regional-indicator flag emoji ("" for non-2-letter codes).
-export function flagEmoji(cc: string): string {
+function flagEmoji(cc: string): string {
   if (!/^[A-Z]{2}$/.test(cc)) return ""
   return String.fromCodePoint(...[...cc].map(c => 0x1f1a5 + c.charCodeAt(0)))
 }

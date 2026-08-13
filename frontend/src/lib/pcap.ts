@@ -269,6 +269,7 @@ function parsePCAP(buf: Buffer, linkTypeOverride?: number): PCAPResult {
     off += inclLen
   }
 
+  reassembleTlsSni(r.packets)
   finalize(r)
   return r
 }
@@ -340,6 +341,7 @@ function parsePCAPNG(buf: Buffer, linkTypeOverride?: number): PCAPResult {
     off += blockLen
   }
 
+  reassembleTlsSni(r.packets)
   finalize(r)
   return r
 }
@@ -811,11 +813,14 @@ function parseTLS(dv: DataView, off: number, len: number, p: ParsedPacket): void
   if (contentType !== 0x16) return
   const recordLen = dv.getUint16(off + 3)
   if (process.env.DEBUG_QUIC) console.error("DBG tls", { contentType, recordLen, len })
-  if (recordLen < 4 || 5 + recordLen > len) return
+  // The record may span several TCP segments; only the record+handshake
+  // header (9 bytes) must be present here. hsEnd is clamped to the segment
+  // below, so each branch's own bounds checks keep reads in-bounds.
+  if (recordLen < 4 || len < 9) return
   const handshakeType = dv.getUint8(off + 5)
   const hsLen = (dv.getUint8(off + 6) << 16) | (dv.getUint8(off + 7) << 8) | dv.getUint8(off + 8)
   if (process.env.DEBUG_QUIC) console.error("DBG tls hs", handshakeType.toString(16), hsLen, "payload", [0, 1, 2, 3, 4, 5, 6, 7, 8].map((k) => dv.getUint8(off + k).toString(16)).join(","))
-  const hsEnd = off + 9 + Math.min(hsLen, recordLen - 4)
+  const hsEnd = off + 9 + Math.min(hsLen, recordLen - 4, len - 9)
 
   if (handshakeType === 0x01 && hsLen >= 39) {
     // ClientHello: SNI + version (shared with QUIC's CRYPTO frame body).
@@ -849,6 +854,72 @@ function parseTLS(dv: DataView, off: number, len: number, p: ParsedPacket): void
   }
 }
 
+// TCP reassembly-lite: a ClientHello record larger than the MSS spans several
+// segments and its SNI extension (after the key_share ext) lands in a later
+// segment, so the per-packet pass above can't see it. Per 4-tuple, walk
+// seq-ordered app payloads, buffer any handshake record that doesn't fit one
+// segment, then re-run parseTLS on the assembled record so SNI/version/cipher
+// are attributed to its first segment. Retransmits (repeated seqs) are skipped;
+// a seq gap discards the partial buffer (a corrupted reassembly would be worse
+// than a missed SNI).
+// ponytail: reassembles only 0x16 handshake records; encrypted record bodies
+// yield nothing for the report anyway, and per-connection state beyond a single
+// partial record is never needed.
+function reassembleTlsSni(packets: ParsedPacket[]): void {
+  const flows = new Map<string, ParsedPacket[]>()
+  for (const p of packets) {
+    if (p.protocol !== 'TCP' || typeof p.tcpPayloadLen !== 'number' || p.tcpSeq === undefined) continue
+    const k = `${p.srcIp}|${p.srcPort}|${p.dstIp}|${p.dstPort}`
+    let list = flows.get(k)
+    if (!list) { list = []; flows.set(k, list) }
+    list.push(p)
+  }
+  for (const list of flows.values()) {
+    if (list.length < 2) continue
+    list.sort((a, b) => (a.tcpSeq ?? 0) - (b.tcpSeq ?? 0))
+    let buf = ''
+    let recLen = 0
+    let recStart: ParsedPacket | null = null
+    let lastSeq = 0
+    let lastAppLen = 0
+    for (const p of list) {
+      const seq = p.tcpSeq ?? 0
+      if (seq < lastSeq + lastAppLen) continue
+      if (recStart && seq > lastSeq + lastAppLen) { buf = ''; recStart = null }
+      lastSeq = seq
+      const appLen = p.tcpPayloadLen ?? 0
+      lastAppLen = appLen
+      const app = p.payload.slice((p.length - appLen) * 2)
+      let i = 0
+      while (i < app.length) {
+        if (recStart) {
+          // The record header's length excludes its own 5 bytes, so a full
+          // record is 5 + recLen bytes — buffering only recLen would drop the
+          // final 5 bytes (the SNI name ends exactly at the record boundary).
+          const need = (5 + recLen) * 2 - buf.length
+          const take = Math.min(need, app.length - i)
+          buf += app.slice(i, i + take)
+          i += take
+          if (buf.length >= (5 + recLen) * 2) {
+            const rec = Buffer.from(buf.slice(0, (5 + recLen) * 2), 'hex')
+            parseTLS(new DataView(rec.buffer, rec.byteOffset, rec.length), 0, rec.length, recStart)
+            buf = ''
+            recStart = null
+          } else break
+        } else if (app.length - i >= 10 && app.slice(i, i + 2) === '16') {
+          const len = parseInt(app.slice(i + 6, i + 10), 16)
+          if (len < 4) break
+          if (i + (5 + len) * 2 <= app.length) { i += (5 + len) * 2; continue }
+          buf = app.slice(i)
+          recLen = len
+          recStart = p
+          break
+        } else break
+      }
+    }
+  }
+}
+
 // IANA cipher suite names — common TLS 1.3 (0x13xx) + legacy 1.2 suites.
 // Unknown suites render as their hex id, never a wrong name.
 export function tlsCipherSuiteName(suite: number): string {
@@ -859,6 +930,7 @@ export function tlsCipherSuiteName(suite: number): string {
     0x1304: 'TLS_AES_128_CCM_SHA256',
     0x1305: 'TLS_AES_128_CCM_8_SHA256',
     0xc02b: 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+    0xc02c: 'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384',
     0xc02f: 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
     0xc030: 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
     0xcca8: 'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',

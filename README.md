@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">PacketLens</h1>
-  <p align="center"><b>Drop a PCAP. Get a full security report — entirely on your machine.</b></p>
+  <p align="center"><b>Free, 100% local PCAP analyzer. Drop a PCAP. Get a full security report — entirely on your machine.</b></p>
   <p align="center">
     <a href="https://github.com/simpletarun/Packetlens/releases/tag/v3.2.0"><img src="https://img.shields.io/badge/release-v3.2.0-blue" alt="Release v3.2.0"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
@@ -14,7 +14,7 @@
 
 ---
 
-PacketLens turns a network capture (PCAP/PCAPNG) into a **22-section security report**, an **investigation graph**, a **world map**, and **PDF / HTML / CSV exports** — with no cloud, no account, and no telemetry.
+PacketLens is a **free, 100% local PCAP analyzer** for network forensics and security reporting. Upload a capture and nothing leaves your machine: parsing, flows, sessions, DNS, TCP health, risk scoring (spec 1.3), VoIP (SIP/RTP), offline GeoIP via DB-IP MMDB, investigation graph, world map, and **PDF / HTML / CSV exports** — with no cloud, no account, and no telemetry. Built with Next.js + TypeScript, backed by 350+ tests.
 
 ---
 

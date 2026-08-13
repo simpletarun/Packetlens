@@ -8,7 +8,7 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 
 export const metadata: Metadata = {
   title: "PacketLens — Free PCAP Analysis",
-  description: "Free, unlimited, privacy-first PCAP analysis platform",
+  description: "Free PCAP analyzer: inspect network flows, sessions, DNS, TCP health and VoIP (SIP/RTP), and get a full security risk report. 100% local, no uploads.",
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

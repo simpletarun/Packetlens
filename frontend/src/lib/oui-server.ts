@@ -9,7 +9,7 @@ import type { AnalysisDevice } from "./analysis"
 
 let table: Map<string, string> | null = null
 
-export function loadOuiTable(): Map<string, string> {
+function loadOuiTable(): Map<string, string> {
   if (table) return table
   table = new Map()
   try {

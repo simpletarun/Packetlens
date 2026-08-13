@@ -18,7 +18,7 @@ export interface OfflineGeo {
 let loaded: { reader: Reader<CityResponse>; name: string } | null = null
 let loading: Promise<{ reader: Reader<CityResponse>; name: string } | null> | null = null
 
-export async function loadOfflineDb(): Promise<{ reader: Reader<CityResponse>; name: string } | null> {
+async function loadOfflineDb(): Promise<{ reader: Reader<CityResponse>; name: string } | null> {
   if (loaded) return loaded
   if (loading) return loading
   loading = (async () => {

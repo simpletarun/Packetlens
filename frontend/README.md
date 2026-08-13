@@ -1,11 +1,12 @@
 # PacketLens
 
-PCAP network analysis report tool. Upload a PCAP/PCAPNG capture and PacketLens
-parses it on the server and produces a 22-section security report: traffic
-summary, packets, flows, sessions, DNS, HTTP, TLS, extracted files, VoIP calls,
-credentials, certificates, endpoints, timeline, top talkers, alerts, IOCs,
-MITRE ATT&CK mappings, a numerical risk score, and recommendations — plus an
-investigation graph, a world map, and PDF/HTML/CSV export.
+**Free, 100% local PCAP analyzer** for network forensics and security reporting.
+Upload a PCAP/PCAPNG capture and PacketLens parses it on your machine, producing
+a 22-section security report: traffic summary, packets, flows, sessions, DNS,
+HTTP, TLS, extracted files, VoIP calls, credentials, certificates, endpoints,
+timeline, top talkers, alerts, IOCs, MITRE ATT&CK mappings, a numerical risk
+score, and recommendations — plus an investigation graph, a world map, and
+PDF/HTML/CSV export. No cloud, no account, no telemetry.
 
 ## Features
 

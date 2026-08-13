@@ -35,7 +35,7 @@ const STATIC_GEO: Record<string, { country: string; cc: string; city: string; la
   '204.79.197.200': { country: 'United States', cc: 'US', city: 'Redmond', lat: 47.678, lon: -122.131, asn: 'AS8068', org: 'Microsoft Corporation' },
 }
 
-export async function resolveGeo(ip: string): Promise<GeoLocation> {
+async function resolveGeo(ip: string): Promise<GeoLocation> {
   if (GEO_CACHE.has(ip)) return GEO_CACHE.get(ip)!
 
   // Private + non-routable (RFC1918, link-local, multicast, CGNAT, ...)
