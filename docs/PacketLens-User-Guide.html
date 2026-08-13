@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PacketLens User Guide</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #1a1a2e; line-height: 1.55; font-size: 10.5pt; margin: 0; }
+  h1 { color: #2563eb; font-size: 24pt; margin: 0 0 2pt; }
+  h2 { color: #1e3a8a; font-size: 15pt; border-bottom: 2px solid #2563eb; padding-bottom: 4pt; margin: 22pt 0 8pt; page-break-after: avoid; }
+  h3 { color: #2563eb; font-size: 12pt; margin: 14pt 0 4pt; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 4pt 0 8pt; padding-left: 18pt; }
+  li { margin: 2.5pt 0; }
+  code { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 3px; padding: 0 3pt; font-family: Consolas, monospace; font-size: 9pt; }
+  pre { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 5px; padding: 8pt 10pt; font-family: Consolas, monospace; font-size: 9pt; overflow-x: auto; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; margin: 8pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #d1d5db; padding: 4pt 7pt; text-align: left; vertical-align: top; }
+  th { background: #f3f4f6; font-weight: 600; }
+  .cover { text-align: center; padding: 90pt 0 40pt; page-break-after: always; }
+  .cover .logo { font-size: 40pt; font-weight: 800; color: #1a1a2e; letter-spacing: -0.02em; }
+  .cover .logo span { color: #2563eb; }
+  .cover .sub { font-size: 15pt; color: #2563eb; font-weight: 600; margin: 10pt 0 30pt; }
+  .cover hr { width: 90pt; border: none; border-top: 3px solid #2563eb; margin: 0 auto 26pt; }
+  .cover .meta { font-size: 9.5pt; color: #6b7280; }
+  .badge { display: inline-block; background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; border-radius: 10px; padding: 0 8pt; font-size: 8.5pt; font-weight: 600; }
+  .note { background: #fffbeb; border: 1px solid #fde68a; border-radius: 5px; padding: 6pt 9pt; font-size: 9.5pt; margin: 8pt 0; }
+  .toc { page-break-after: always; }
+  .toc ol { font-size: 11pt; }
+  .toc li { margin: 4pt 0; }
+  section { page-break-inside: auto; }
+  .col2 { column-count: 2; column-gap: 20pt; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <div class="logo">Packet<span>Lens</span></div>
+  <div class="sub">PCAP Network Analysis Report Tool — User Guide</div>
+  <hr>
+  <div class="meta">
+    Version 3.2.0 &middot; Report schema 1.0 &middot; Risk specification 1.3<br>
+    Web application (self-hosted Next.js server)
+  </div>
+</div>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li>What is PacketLens?</li>
+    <li>Quick Start</li>
+    <li>Analyzing a Capture</li>
+    <li>The Analysis Report</li>
+    <li>Exporting Results (PDF / HTML / CSV)</li>
+    <li>Interactive Tools (Graph, World Map)</li>
+    <li>Detection &amp; Risk Model</li>
+    <li>GeoIP &amp; Vendor Attribution</li>
+    <li>Settings</li>
+    <li>Self-Hosting &amp; Deployment</li>
+    <li>Security Notes</li>
+    <li>Requirements</li>
+  </ol>
+</div>
+
+<section>
+  <h2>1. What is PacketLens?</h2>
+  <p>PacketLens is a network security analysis tool that turns a raw packet capture
+  (PCAP / PCAPNG) into a professional, exportable security report. Upload a capture
+  file — or open the built-in demo dataset — and PacketLens parses the traffic on
+  the server, then produces a 22-section report covering traffic summary, packets,
+  flows, sessions, DNS, HTTP, TLS, VoIP calls, extracted files, credentials,
+  certificates, endpoints, timeline, top talkers, alerts, indicators of compromise
+  (IOCs), MITRE ATT&amp;CK mappings, a numerical risk score, and prioritized
+  recommendations.</p>
+  <p>PacketLens is a single web application: one Next.js server that serves the
+  interface, accepts uploads, runs the analysis, and serves the results back to
+  your browser. There is no separate desktop app and no separate analysis engine
+  to deploy — the capture file is processed entirely by the server you run.</p>
+</section>
+
+<section>
+  <h2>2. Quick Start</h2>
+  <h3>2.1 Running the app</h3>
+  <ol>
+    <li>Install Node.js 20 or newer.</li>
+    <li>Run <code>npm install</code> inside the <code>frontend/</code> directory.</li>
+    <li>Development: run <code>start-dev.bat</code> (or <code>npx next dev --port 3456</code>) and open <a href="http://localhost:3456">http://localhost:3456</a>.</li>
+    <li>Production: <code>npm run build</code>, then <code>npm start</code> (see section 10).</li>
+  </ol>
+
+  <h3>2.2 First steps</h3>
+  <ol>
+    <li>Click <strong>Live Demo</strong> on the landing page to explore every feature with a realistic pre-loaded dataset — no capture file needed.</li>
+    <li>Or drop a PCAP / PCAPNG file onto the upload zone.</li>
+    <li>The analysis opens automatically when parsing finishes. Bookmark the job URL to return to the same analysis later.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>3. Analyzing a Capture</h2>
+  <ul>
+    <li><strong>Upload a file</strong> — PCAP and PCAPNG formats, up to 500 MB. Uploads are rate-limited (5 per minute per address) and rejected from other origins. While analysis runs, a progress screen shows the decode rate and current stage.</li>
+    <li><strong>Demo dataset</strong> — a realistic capture with benign + malicious traffic, pre-loaded with analysis, so every feature can be explored without a capture file. Demo analyses are labelled as such in the report.</li>
+    <li><strong>Encapsulation</strong> — Ethernet is fully supported. Unsupported link types (e.g. raw IP) still produce packet lengths and timestamps; the report clearly states the decode rate and withholds a verdict when too little traffic was decodable (it reads UNKNOWN / INSUFFICIENT DATA rather than a false "clean" score). An explicit link-layer override can be set before uploading for captures whose headers were not auto-detected.</li>
+    <li><strong>History</strong> — completed analyses are stored on the server in <code>~/.packetlens/jobs.json</code>; the 20 most recent are kept, with the oldest evicted automatically. A bookmark to the job URL reloads the full analysis.</li>
+  </ul>
+  <div class="note">The capture file is processed on the server hosting this deployment, never in your browser. It is held in memory during the request and is not written to disk; only the finished analysis result is persisted (see the Privacy Policy).</div>
+</section>
+
+<section>
+  <h2>4. The Analysis Report</h2>
+  <p>Every analysis produces one canonical report with 22 numbered sections:</p>
+  <div class="col2">
+    <ol style="font-size: 9.5pt;">
+      <li>Executive Summary</li>
+      <li>Traffic Summary</li>
+      <li>Packets</li>
+      <li>Flows</li>
+      <li>Sessions</li>
+      <li>DNS Analysis</li>
+      <li>HTTP Analysis</li>
+      <li>TLS Analysis</li>
+      <li>Extracted Files</li>
+      <li>VoIP / SIP Calls</li>
+      <li>Credentials</li>
+      <li>Certificates</li>
+      <li>Endpoints</li>
+      <li>Threats &amp; Alerts</li>
+      <li>Timeline</li>
+      <li>Top Talkers</li>
+      <li>Risk Score</li>
+      <li>Indicators of Compromise (IOCs)</li>
+      <li>MITRE ATT&amp;CK Mapping</li>
+      <li>Recommendations</li>
+      <li>Appendix</li>
+      <li>Analyst Conclusion</li>
+    </ol>
+  </div>
+  <p>Sections cover packet counts, flows, sessions, local devices, DNS lookups
+  (deduplicated through the LAN resolver), plaintext HTTP requests, TLS handshakes
+  and certificate chains, files reconstructed from HTTP traffic, per-destination
+  country distribution via the installed GeoIP database, credentials spotted in
+  cleartext auth traffic (masked by default, revealable per entry), VoIP calls with
+  RTP statistics, TCP health (handshake RTT, retransmissions, out-of-order,
+  zero-window, RST, loss), and a per-interval activity timeline.</p>
+  <p>A <strong>Beginner / Expert</strong> toggle adjusts how much detail the report shows.</p>
+</section>
+
+<section>
+  <h2>5. Exporting Results</h2>
+  <p>From the report page, three export formats are available:</p>
+  <table>
+    <tr><th style="width:90pt">Format</th><th>What you get</th><th>Best for</th></tr>
+    <tr><td><strong>PDF</strong></td><td>The full report via your browser's print dialog: cover page with file metadata and a demo/live marker, all 22 sections, print-optimized tables that avoid page-break splitting.</td><td>Sharing with stakeholders, evidence files.</td></tr>
+    <tr><td><strong>HTML</strong></td><td>A standalone, self-contained HTML file with the full summary, tables, and a deep link back to the live report in PacketLens. Works offline, styled for reading.</td><td>Email attachments, archiving, viewing in any browser.</td></tr>
+    <tr><td><strong>CSV</strong></td><td>One row per network flow: IPs and ports as separate columns (IPv6-safe), sent/recv bytes, timing, duration, geo country/ASN per endpoint, service name, RTT, retransmissions, loss. UTF-8 BOM included so Excel/Sheets decode vendor names correctly.</td><td>SIEM ingestion, pandas/Excel pivot analysis.</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>6. Interactive Tools</h2>
+  <h3>6.1 Investigation Graph</h3>
+  <p>A cytoscape-based graph of the capture's communication: local devices and remote endpoints as nodes, conversations as edges. Click a node to see its traffic, drag to rearrange, zoom, and filter. Useful for spotting star-pattern C2 or broadcast storms at a glance. Layout and display preferences persist in your browser.</p>
+  <h3>6.2 World Map</h3>
+  <p>A geographic view plotting every remote endpoint by country with arcs representing traffic flows, animated to show conversation volume, and alert markers for flagged hosts. Pins are sized by traffic volume; nearby endpoints cluster into city-level bubbles. Works without the GeoIP database — it simply degrades to "no location data" notes. Without a home location the map anchors arcs at a synthetic point; set Home in Settings for exact lines.</p>
+</section>
+
+<section>
+  <h2>7. Detection &amp; Risk Model</h2>
+  <ul>
+    <li><strong>Signature rules</strong> — port scanning, SYN floods, DNS tunneling, credential leaks, malware downloads, C2 beaconing, data exfiltration, suspicious TLS, and cleartext HTTP credentials. Each alert carries severity, confidence, source/destination, and evidence.</li>
+    <li><strong>Behavioral metrics</strong> — beaconing periodicity, DNS tunneling volume, data exfiltration egress, port-scan breadth, JA3 TLS fingerprint anomalies, and traffic bursts. These feed risk contributions and, when proven, also fire as real signature alerts.</li>
+    <li><strong>Risk score</strong> — a single 0–100 score computed from a transparent formula (100 × (1 − e^(−raw/80))): each alert contributes (severity weight + rule weight) × a confidence multiplier, with burst detection able to boost eligible rules. The report shows the full breakdown per rule, and always states the spec version used.</li>
+    <li><strong>IOCs &amp; MITRE</strong> — every finding is classified (IP, domain, URL, certificate…) and mapped to MITRE ATT&amp;CK techniques (T1046, T1048, T1071, T1552, etc.) with the source labeled as confirmed alert or behavioral indicator.</li>
+    <li><strong>Honest verdicts</strong> — if a capture's encapsulation prevented header decoding, the verdict reads UNKNOWN / INSUFFICIENT DATA instead of a false "clean" score.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>8. GeoIP &amp; Vendor Attribution</h2>
+  <ul>
+    <li><strong>GeoIP database</strong> — the first time a capture needs country attribution, the server downloads the free DB-IP City Lite database (≈125 MB, CC BY 4.0) once and stores it in <code>~/.packetlens/geo/</code>. The install is single-flight: concurrent requests share one download.</li>
+    <li><strong>Custom database</strong> — you can instead upload your own MaxMind-format MMDB file via Settings → GeoIP Database; the uploaded file replaces the auto-installed one. Remove it anytime with the Remove button (auto-install resumes on the next analysis).</li>
+    <li><strong>Online lookups (optional)</strong> — Online GeoIP Lookups is disabled by default. When enabled, only IP addresses missing from the local database are resolved via the ipwho.is service; nothing else is sent.</li>
+    <li><strong>Vendor lookup</strong> — MAC-address vendors come from the bundled OUI registry (<code>oui.json</code>) and never require a network call. Raw-IP captures without Ethernet headers have no MACs, so vendor lookup reports "no MAC addresses" instead of a fake 0.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>9. Settings</h2>
+  <table>
+    <tr><th style="width:170pt">Setting</th><th>What it does</th></tr>
+    <tr><td>Beginner Mode</td><td>Simplifies labels and masks IP addresses in the graph view.</td></tr>
+    <tr><td>Link-layer override</td><td>Forces a DLT (e.g. Ethernet, Raw IP, Linux SLL) when the capture's encapsulation is not auto-detected.</td></tr>
+    <tr><td>Manual Home Location</td><td>Lat/lon used to anchor the world map's local arcs. Stored in your browser only.</td></tr>
+    <tr><td>Online GeoIP Lookups</td><td>Opt-in ipwho.is resolution for IPs missing from the local database (off by default).</td></tr>
+    <tr><td>GeoIP Database</td><td>Shows install status, installs/removes the DB-IP database, and accepts an uploaded MMDB file.</td></tr>
+    <tr><td>Danger Zone → Clear Analysis</td><td>Discards the currently loaded analysis from the session. Server-side job retention is bounded by the 20-job cap described in section 3.</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>10. Self-Hosting &amp; Deployment</h2>
+  <p>PacketLens is a standard Next.js application (<code>output: "standalone"</code>):</p>
+  <ol>
+    <li><code>npm run build</code> inside <code>frontend/</code>, then <code>npm start</code> — the server listens on the configured port.</li>
+    <li>Persistent data lives in <code>~/.packetlens/</code> (analysis history <code>jobs.json</code>, GeoIP database <code>geo/</code>). Mount a persistent volume there (or set <code>HOME</code>) so jobs and the database survive restarts.</li>
+    <li>Memory: an upload is fully buffered and analyzed in-process (500 MB cap), so concurrent uploads need roughly 1.5–2.5 GB each. Size the instance accordingly (4 GB RAM is comfortable).</li>
+    <li>Behind a reverse proxy, forward the client address (e.g. <code>X-Real-IP</code>) so the upload rate limit keys on real clients. TLS terminates at the proxy; the app already emits HSTS and CSP headers.</li>
+  </ol>
+  <div class="note">PacketLens is designed as a single instance: analysis history and rate limiting live in one process. Horizontal scaling would require externalizing the job store and rate limiter.</div>
+</section>
+
+<section>
+  <h2>11. Security Notes</h2>
+  <ul>
+    <li>Uploads are restricted to .pcap/.pcapng, capped at 500 MB (checked against Content-Length before the body is buffered), rate-limited per client address, and rejected from cross-origin callers.</li>
+    <li>File names are sanitized before storage; analysis jobs are kept under a 0700 directory with 0600 file permissions.</li>
+    <li>The app emits a restrictive Content-Security-Policy, HSTS, X-Frame-Options DENY, and nosniff headers. No third-party analytics or telemetry are embedded.</li>
+    <li>Captures are a privacy-sensitive artifact: they are processed only on the server you run and are never written to disk. Report data (credentials, certificates, extracted files) is displayed in the app; exporting it deliberately is your choice as the analyst.</li>
+    <li>GeoIP and OUI vendor data are open-data (DB-IP Lite CC BY 4.0 / OUI registry) and are only used for attribution labels.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>12. Requirements</h2>
+  <table>
+    <tr><th style="width:180pt">Item</th><th>Requirement</th></tr>
+    <tr><td>Server</td><td>Node.js 20+, ~2 GB free memory (4 GB recommended for concurrent uploads), disk for <code>~/.packetlens</code> (GeoIP database ≈125 MB)</td></tr>
+    <tr><td>Browsers</td><td>Chrome, Edge, Firefox, Safari (recent versions)</td></tr>
+    <tr><td>Network (server)</td><td>Outbound HTTPS for the optional one-time GeoIP database download and the opt-in ipwho.is lookups</td></tr>
+  </table>
+  <p>&nbsp;</p>
+  <p style="font-size:9pt;color:#6b7280">PacketLens 3.2.0 &middot; Report schema 1.0 &middot; Risk spec 1.3 &middot; Detection engine: signature rules + behavioral metrics &middot; Open-data GeoIP: DB-IP City Lite (CC BY 4.0)</p>
+</section>
+
+</body>
+</html>

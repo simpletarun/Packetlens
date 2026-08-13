@@ -1,0 +1,767 @@
+import { describe, it, expect } from "vitest"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth } from "@/lib/report"
+import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown } from "@/lib/risk"
+import { tlsCipherSuiteName } from "@/lib/pcap"
+import type { AdvancedMetrics, AlertEntry, Flow, Packet, Session } from "@/stores/analysis"
+import type { GeoLocation } from "@/lib/geo"
+
+const T0 = 1_700_000_000
+
+function packet(sec: number, srcIp = "10.0.0.5", dstIp = "203.0.113.9", length = 128): Packet {
+  return { num: sec + 1, timestamp: new Date((T0 + sec) * 1000).toISOString(), srcIp, dstIp, srcPort: 1234, dstPort: 80, protocol: "TCP", length, flags: "", ttl: 64, info: "" }
+}
+
+const portScanAlert: AlertEntry = {
+  id: "a1", timestamp: new Date(T0 * 1000).toISOString(), signature: "TCP Port Scan Detected",
+  category: "Reconnaissance", severity: 3, confidence: 70, ruleId: "PORT-SCAN-001",
+  srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "28 unique ports scanned",
+}
+
+const beaconAlert: AlertEntry = {
+  id: "a2", timestamp: new Date(T0 * 1000).toISOString(), signature: "Regular Beaconing Detected",
+  category: "Command and Control", severity: 5, confidence: 65, ruleId: "C2-BEACON-001",
+  srcIp: "multiple", dstIp: "external", srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "Periodic communication pattern detected",
+}
+
+const dnsTunnelAlert: AlertEntry = {
+  id: "a3", timestamp: new Date(T0 * 1000).toISOString(), signature: "Possible DNS Tunneling",
+  category: "Exfiltration", severity: 4, confidence: 80, ruleId: "DNS-TUNNEL-001",
+  srcIp: "multiple", dstIp: "external", srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "Long or high-frequency DNS queries detected",
+}
+
+const advancedMetrics: AdvancedMetrics = {
+  throughputAvg: 1000, throughputPeak: 5000,
+  burst: { detected: true, peakThroughput: 5000, averageThroughput: 1000, ratio: 5, start: 1, end: 3, duration: 2 },
+  beaconDetected: true, dnsTunnelingSuspected: true, dataExfiltrationSuspected: false,
+  torVpnProxyDetected: false, portScanEnhanced: true, ja3Suspicious: false,
+  topTalkers: [],
+  iocs: [
+    { type: "threat", value: "TCP Port Scan Detected", description: "28 unique ports scanned", severity: 3 },
+    { type: "dns-tunneling", value: "Suspicious DNS patterns", description: "Long or high-frequency DNS queries detected", severity: 3 },
+    { type: "beaconing", value: "Periodic communication detected", description: "Regular beaconing pattern identified", severity: 3 },
+  ],
+  mitreMappings: [
+    { technique: "Port Scan", id: "T1046", description: "Network scanning for open ports", severity: 3 },
+    { technique: "DNS Tunneling", id: "T1071.004", description: "Data encoded in DNS queries/responses", severity: 4 },
+    { technique: "Application Layer Protocol", id: "T1071", description: "Periodic C2 beaconing detected", severity: 3 },
+  ],
+}
+
+const state = {
+  job: { id: "j1", filename: "x.pcap", fileSize: 1000, status: "done" as const, progress: 100, stage: "complete", totalPackets: 90, totalFlows: 1, conversations: 1, devices: 2, externalIps: 1, countries: 0, domains: 1, protocols: ["TCP"], alerts: 1, riskScore: 30, captureDuration: 88, createdAt: new Date(T0 * 1000).toISOString(), completedAt: new Date((T0 + 12) * 1000).toISOString() },
+  jobInfo: { mode: "local" as const, analyzerVersion: "v3.0.0", riskSpecVersion: "1.2" },
+  alerts: [portScanAlert],
+  packets: Array.from({ length: 88 }, (_, i) => packet(i)),
+  flows: [{ id: "f1", srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1234, dstPort: 80, protocol: "TCP", packets: 42, bytesTotal: 6000, bytesSent: 4000, bytesRecv: 2000, duration: 10, startTime: "", endTime: "" }] as Flow[],
+  sessions: [] as Session[],
+  tls: [],
+  http: [],
+  timeline: [{ time: "22:25", packets: 88, bytes: 11264, tcp: 88, udp: 0, dns: 0, tls: 0 }],
+  bandwidth: [{ time: "22:25", in: 5000, out: 6264 }],
+  advancedMetrics,
+}
+
+describe("report consistency \u2014 single canonical analysis", () => {
+  it("risk header value equals the breakdown value (one computation, one object)", () => {
+    const r = buildReportAnalysis(state)
+    expect(r.risk).not.toBeNull()
+    const header = `${r.risk!.normalizedScore}/100 ${r.risk!.levelLabel}`
+    expect(header).toContain(`${r.risk!.normalizedScore}`)
+    expect(r.risk!.normalizedScore).toBe(r.risk!.items.length ? r.risk!.normalizedScore : r.risk!.normalizedScore)
+    expect(r.risk!.normalizedScore).toBe(computeRisk(buildRiskInputs(state.alerts), burstDetected(state.advancedMetrics)))
+  })
+
+  it("no advanced metrics â†’ risk null (page falls back to job score, no breakdown shown)", () => {
+    const r = buildReportAnalysis({ ...state, advancedMetrics: null })
+    expect(r.risk).toBeNull()
+  })
+
+  it("alerts array is the single source (no copy/filter anywhere)", () => {
+    const r = buildReportAnalysis(state)
+    expect(r.alerts).toBe(state.alerts)
+  })
+
+  it("IOC sources: signature-backed type is CONFIRMED_ALERT; flag types are CONFIRMED when the backing alert fired, else BEHAVIORAL", () => {
+    const r = buildReportAnalysis(state)
+    const iocs = new Map(r.iocs.map((i) => [i.type, i.source]))
+    expect(iocs.get("threat")).toBe("CONFIRMED_ALERT")
+    expect(iocs.get("dns-tunneling")).toBe("BEHAVIORAL_METRIC")
+    expect(iocSource("beaconing", [beaconAlert])).toBe("CONFIRMED_ALERT")
+    expect(iocSource("beaconing", [portScanAlert])).toBe("BEHAVIORAL_METRIC")
+  })
+
+  it("IOC, MITRE and alert severities agree for the same finding (alert severity is canonical)", () => {
+    const withBeacon = buildReportAnalysis({ ...state, alerts: [...state.alerts, beaconAlert] })
+    const ioc = withBeacon.iocs.find((i) => i.type === "beaconing")
+    const mitre = withBeacon.mitre.find((m) => m.id === "T1071")
+    expect(ioc).toBeDefined()
+    expect(ioc!.severity).toBe(beaconAlert.severity)
+    expect(mitre).toBeDefined()
+    expect(mitre!.severity).toBe(beaconAlert.severity)
+    expect(ioc!.source).toBe(mitre!.source)
+  })
+
+  it("MITRE sources: alert-backed technique is CONFIRMED, flag-only technique is BEHAVIORAL", () => {
+    const r = buildReportAnalysis(state)
+    const mitre = new Map(r.mitre.map((m) => [m.id, m.source]))
+    expect(mitre.get("T1046")).toBe("CONFIRMED_ALERT")
+    expect(mitre.get("T1071.004")).toBe("BEHAVIORAL_METRIC")
+    expect(mitreSource({ id: "T1046" }, [portScanAlert])).toBe("CONFIRMED_ALERT")
+    expect(mitreSource({ id: "T1071.004" }, [portScanAlert])).toBe("BEHAVIORAL_METRIC")
+    expect(mitreSource({ id: "T1071" }, [beaconAlert])).toBe("CONFIRMED_ALERT")
+  })
+
+  it("DNS MITRE technique (T1071.004) resolves CONFIRMED when the DNS-TUNNEL-001 alert fired, regardless of label drift", () => {
+    const r = buildReportAnalysis({ ...state, alerts: [...state.alerts, dnsTunnelAlert] })
+    const mitre = new Map(r.mitre.map((m) => [m.id, m.source]))
+    const sev = new Map(r.mitre.map((m) => [m.id, m.severity]))
+    expect(mitre.get("T1071.004")).toBe("CONFIRMED_ALERT")
+    expect(sev.get("T1071.004")).toBe(dnsTunnelAlert.severity)
+    expect(mitre.get("T1071")).toBe("BEHAVIORAL_METRIC")
+    expect(mitreSource({ id: "T1071.004" }, [dnsTunnelAlert])).toBe("CONFIRMED_ALERT")
+  })
+
+  it("flag-backed recommendations carry CONFIRMED_ALERT when the rule fired, BEHAVIORAL_METRIC otherwise", () => {
+    const withAlerts = buildReportAnalysis({ ...state, alerts: [...state.alerts, beaconAlert, dnsTunnelAlert] })
+    const beaconRec = withAlerts.recommendations.find((r) => r.text.includes("Periodic communication"))
+    const dnsRec = withAlerts.recommendations.find((r) => r.text.includes("Unusual DNS query"))
+    expect(beaconRec!.source).toBe("CONFIRMED_ALERT")
+    expect(beaconRec!.severity).toBe(beaconAlert.severity)
+    expect(dnsRec!.source).toBe("CONFIRMED_ALERT")
+    expect(dnsRec!.severity).toBe(dnsTunnelAlert.severity)
+    const flagsOnly = buildReportAnalysis(state)
+    expect(flagsOnly.recommendations.find((r) => r.text.includes("Unusual DNS query"))!.source).toBe("BEHAVIORAL_METRIC")
+  })
+
+  it("dashboard and report count alerts from the same store array (canonical identity)", () => {
+    const r = buildReportAnalysis(state)
+    const dashboardAlerts = state.alerts
+    expect(r.alerts).toBe(dashboardAlerts)
+    expect(r.alerts.length).toBe(dashboardAlerts.length)
+  })
+
+  it("every recommendation carries a source", () => {
+    const r = buildReportAnalysis(state)
+    expect(r.recommendations.length).toBeGreaterThan(0)
+    for (const rec of r.recommendations) {
+      expect(Object.keys(SOURCE_LABELS)).toContain(rec.source)
+    }
+  })
+})
+
+describe("threat traffic \u2014 never fake zeros", () => {
+  it("returns real flow counts when a matching flow exists", () => {
+    const t = alertTrafficFor(portScanAlert, state.flows)
+    expect(t.packets).toBe(42)
+    expect(t.bytes).toBe(6000)
+  })
+
+  it("returns null (N/A) when no flow covers the alert's pair", () => {
+    const t = alertTrafficFor({ ...portScanAlert, srcIp: "10.99.99.99" }, state.flows)
+    expect(t.packets).toBeNull()
+    expect(t.bytes).toBeNull()
+  })
+
+it("matches flows regardless of direction (deriveFlows normalizes src/dst by IP order)", () => {
+    const reversed = alertTrafficFor({ ...portScanAlert, srcIp: "203.0.113.9", dstIp: "10.0.0.5" }, state.flows)
+    expect(reversed.packets).toBe(42)
+    expect(reversed.bytes).toBe(6000)
+  })
+
+  it("does not attribute a same-host flow on a different tuple (port gate)", () => {
+    const flows: Flow[] = [
+      { id: "dns", srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 12345, dstPort: 53, protocol: "UDP", packets: 200, bytesTotal: 10000, bytesSent: 5000, bytesRecv: 5000, duration: 10, startTime: "", endTime: "" },
+      { id: "https", srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 12345, dstPort: 443, protocol: "TCP", packets: 500, bytesTotal: 30000, bytesSent: 0, bytesRecv: 0, duration: 10, startTime: "", endTime: "" },
+    ]
+    const t = alertTrafficFor({ ...portScanAlert, srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 12345, dstPort: 53 }, flows)
+    expect(t.packets).toBe(200)
+    expect(t.bytes).toBe(10000)
+  })
+
+  it("group traffic is summed once per unique tuple, not once per alert (Nx double count)", () => {
+    const alerts = [1, 2, 3].map((i) => ({
+      ...portScanAlert,
+      id: `scan-${i}`,
+      timestamp: new Date((T0 + i) * 1000).toISOString(),
+      srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 0, dstPort: 0,
+    }))
+    const r = buildReportAnalysis({ ...state, alerts })
+    const g = r.groups.find((x) => x.alertIds.length === 3)
+    expect(g).toBeDefined()
+    expect(g!.packets).toBe(42)
+    expect(g!.bytes).toBe(6000)
+  })
+})
+
+describe("math fixes (2026-08 audit)", () => {
+  it("packetEpochSec treats numeric timestamps >= 1e12 as milliseconds", () => {
+    const ms = { num: 1, timestamp: 1_700_000_000_000, srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1, dstPort: 2, protocol: "TCP", length: 60, flags: "", ttl: 64, info: "" }
+    const s = { ...ms, num: 2, timestamp: 1_700_000_000 }
+    expect(packetEpochSec(ms)).toBe(1_700_000_000)
+    expect(packetEpochSec(s)).toBe(1_700_000_000)
+  })
+
+  it("bucketOverlapSec divides partial edge 5-min buckets by their real capture overlap", () => {
+    // Capture 10:03:00 → 10:07:00 (local): first bucket 10:00–10:05 holds 120 s.
+    const start = new Date(2026, 7, 13, 10, 3, 0).getTime() / 1000
+    const end = new Date(2026, 7, 13, 10, 7, 0).getTime() / 1000
+    expect(bucketOverlapSec("10:00", start, end)).toBe(120)
+    expect(bucketOverlapSec("10:05", start, end)).toBe(120)
+    expect(bucketOverlapSec("10:15", start, end)).toBe(300)
+  })
+
+  it("buildBandwidth divides each store bin by its own overlap, not fixed 300", () => {
+    const start = new Date(2026, 7, 13, 10, 3, 0).getTime() / 1000
+    const packets = [
+      { num: 1, timestamp: start, srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1, dstPort: 2, protocol: "TCP", length: 60, flags: "", ttl: 64, info: "" },
+      { num: 2, timestamp: start + 720, srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1, dstPort: 2, protocol: "TCP", length: 60, flags: "", ttl: 64, info: "" },
+    ]
+    const bw = buildBandwidth(packets, [
+      { time: "10:00", in: 12000, out: 0 },
+      { time: "10:05", in: 3000, out: 0 },
+      { time: "10:10", in: 3000, out: 0 },
+    ], 720)
+    expect(bw.map((b) => b.in)).toEqual([100, 10, 10])
+  })
+
+  it("servicePortCounts keeps known service ports >= 49152 (WireGuard 51820)", () => {
+    const top = servicePortCounts([
+      { srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 50000, dstPort: 51820, protocol: "UDP" },
+    ])
+    expect(top[0].port).toBe(51820)
+  })
+})
+
+describe("top ports and throughput helpers", () => {
+  it("maps well-known ports to service names and dynamic ports to ephemeral", () => {
+    expect(portServiceName(443)).toBe("HTTPS")
+    expect(portServiceName(53)).toBe("DNS")
+    expect(portServiceName(5222)).toBe("XMPP")
+    expect(portServiceName(47942)).toBe("Dynamic/Ephemeral")
+    expect(portServiceName(49161)).toBe("Dynamic/Ephemeral")
+    expect(portServiceName(9999)).toBe("Unknown service")
+  })
+
+  it("protocol disambiguates port labels: UDP/443 is QUIC, TCP/443 is HTTPS", () => {
+    expect(portServiceName(443, "UDP")).toBe("QUIC")
+    expect(portServiceName(443, "TCP")).toBe("HTTPS")
+    expect(portServiceName(53, "UDP")).toBe("DNS")
+    expect(portServiceName(53, "TCP")).toBe("DNS")
+  })
+
+  it("labels discovery/real-time services the report actually sees (no more 'Unassigned' for STUN)", () => {
+    expect(portServiceName(3478)).toBe("STUN")
+    expect(portServiceName(5349)).toBe("STUN")
+    expect(portServiceName(5353)).toBe("mDNS")
+    expect(portServiceName(1900)).toBe("SSDP")
+    expect(portServiceName(3702)).toBe("WS-Discovery")
+    expect(portServiceName(51820)).toBe("WireGuard")
+  })
+
+  it("labels the previously missing TCP/7 Echo and TCP/5228 GCM ports", () => {
+    expect(portServiceName(7)).toBe("Echo")
+    expect(portServiceName(7, "TCP")).toBe("Echo")
+    expect(portServiceName(5228)).toBe("GCM (FCM)")
+    expect(portServiceName(5228, "TCP")).toBe("GCM (FCM)")
+  })
+
+  it("dnsLookupCount: a relayed lookup counts once, whatever the forwarding router", () => {
+    const mk = (src: string, dst: string, query: string, type = "A") => ({ id: "d", timestamp: "", srcIp: src, dstIp: dst, query, type, responseCode: "NOERROR", answer: "", ttl: 1 })
+    const entries = [
+      mk("192.168.1.5", "192.168.1.1", "api.github.com"),
+      mk("192.168.1.1", "8.8.8.8", "api.github.com"), // router relay \u2014 same lookup
+      mk("192.168.1.1", "8.8.8.8", "api.github.com"), // retransmit
+      mk("192.168.1.5", "192.168.1.1", "google.com", "AAAA"),
+    ]
+    expect(dnsLookupCount(entries)).toBe(2)
+  })
+
+  it("dnsLookupCount: direct-to-resolver queries dedupe by name+type", () => {
+    const mk = (query: string, type = "A") => ({ id: "d", timestamp: "", srcIp: "10.0.0.5", dstIp: "1.1.1.1", query, type, responseCode: "NOERROR", answer: "", ttl: 1 })
+    expect(dnsLookupCount([mk("a.com"), mk("a.com"), mk("b.com")])).toBe(2)
+  })
+
+  it("burst bonus is reported as applied only when an eligible rule actually benefits", () => {
+    const burstMetrics = { burst: { detected: true }, beaconDetected: true } as unknown as AdvancedMetrics
+    expect(buildReportRisk([portScanAlert], burstMetrics)?.burstApplied).toBe(false)
+    expect(buildReportRisk([beaconAlert], burstMetrics)?.burstApplied).toBe(true)
+    const noBurst = { burst: { detected: false }, beaconDetected: true } as unknown as AdvancedMetrics
+    expect(buildReportRisk([beaconAlert], noBurst)?.burstApplied).toBe(false)
+  })
+
+  it("bandwidthStats: min/median/p95 from interval sums; nulls when not enough data", () => {
+    expect(bandwidthStats([])).toEqual({ min: null, median: null, p95: null })
+    expect(bandwidthStats([{ in: 5, out: 5 }])).toEqual({ min: null, median: null, p95: null })
+    const bins = [{ in: 0, out: 1000 }, { in: 0, out: 2000 }, { in: 0, out: 3000 }, { in: 0, out: 4000 }]
+    expect(bandwidthStats(bins)).toEqual({ min: 1000, median: 2500, p95: 4000 })
+  })
+
+  it("iocTypeLabel maps internal identifiers to analyst-readable names", () => {
+    expect(iocTypeLabel("threat")).toBe("Network Threat")
+    expect(iocTypeLabel("dns-tunneling")).toBe("DNS Tunneling")
+    expect(iocTypeLabel("beaconing")).toBe("Beaconing")
+    expect(iocTypeLabel("data-exfiltration")).toBe("Data Exfiltration")
+    expect(iocTypeLabel("weird-type")).toBe("Weird Type")
+  })
+
+  it("shortAlertName strips signatures down to the finding", () => {
+    expect(shortAlertName("TCP Port Scan Detected")).toBe("TCP Port Scan")
+    expect(shortAlertName("Possible DNS Tunneling")).toBe("DNS Tunneling")
+    expect(shortAlertName("Regular Beaconing Detected")).toBe("Beaconing")
+    expect(shortAlertName("Suspicious TLS")).toBe("Suspicious TLS")
+  })
+})
+
+describe("timeline binning", () => {
+  it("an 88s capture with a single store bin rebins to 1s intervals and preserves the packet total", () => {
+    const bins = binPackets(state.packets, 88)
+    expect(bins.length).toBe(88)
+    expect(bins.reduce((s, b) => s + b.packets, 0)).toBe(88)
+    expect(bins[0].time).toBe("00:00")
+    expect(bins[87].time).toBe("01:27")
+  })
+
+  it("short captures (â‰¤10 min) rebin from packets even when the store has 2 coarse 5-minute bins \u2014 never collapses an 88s capture to 2 points", () => {
+    const multi = [{ time: "22:20", packets: 10, bytes: 1, tcp: 10, udp: 0, dns: 0, tls: 0 }, { time: "22:25", packets: 20, bytes: 2, tcp: 20, udp: 0, dns: 0, tls: 0 }]
+    const r = buildReportAnalysis({ ...state, timeline: multi })
+    expect(r.timeline.length).toBe(88)
+    expect(r.timeline.reduce((s, t) => s + t.packets, 0)).toBe(88)
+    expect(r.timeline[0].time).toBe("00:00")
+    expect(r.timeline[87].time).toBe("01:27")
+  })
+
+  it("long captures (>10 min) keep the store 5-minute bins", () => {
+    const multi = [{ time: "22:20", packets: 10, bytes: 1, tcp: 10, udp: 0, dns: 0, tls: 0 }, { time: "22:25", packets: 20, bytes: 2, tcp: 20, udp: 0, dns: 0, tls: 0 }]
+    const longPackets = [packet(0), packet(3600)]
+    const r = buildReportAnalysis({ ...state, job: { ...state.job, captureDuration: 3600 }, timeline: multi, packets: longPackets })
+    // Full entries, not just {time, packets}: the timeline page draws protocol
+    // slices (TCP/UDP/DNS/TLS/OTHER) from these rows.
+    expect(r.timeline).toEqual(multi)
+  })
+
+  it("bandwidth points are per-second: packet bins divide by bin width, store 5-min bins by 300", () => {
+    // 88s capture â†’ 1s bins; each packet is 128B from a private source â†’ out
+    const r = buildReportAnalysis(state)
+    expect(r.bandwidth.length).toBe(88)
+    expect(r.bandwidth[0].out).toBe(128)
+    expect(r.bandwidth[0].in).toBe(0)
+    // Store bins are 5-minute SUMS (1.5 MB in a bin) \u2014 as a rate that is 5 KB/s
+    const storeBins = [{ time: "22:20", in: 1_500_000, out: 0 }, { time: "22:25", in: 3_000_000, out: 0 }]
+    const long = buildReportAnalysis({ ...state, job: { ...state.job, captureDuration: 3600 }, bandwidth: storeBins, packets: [packet(0), packet(3600)] })
+    expect(long.bandwidth).toEqual([
+      { time: "22:20", in: 5000, out: 0 },
+      { time: "22:25", in: 10000, out: 0 },
+    ])
+  })
+
+  it("5s bins for captures up to 10 minutes", () => {
+    const dur = 300
+    const packets = Array.from({ length: 300 }, (_, i) => packet(i))
+    const bins = binPackets(packets, dur)
+    expect(bins.length).toBe(60)
+  })
+
+  it("DNS/TLS packets land in exactly one slice \u2014 never double-counted in the stacked bars (QA: 527 UDP + 2 DNS from 529 UDP packets)", () => {
+    const p: Packet[] = [
+      { ...packet(0), protocol: "UDP", dstPort: 53, appProtocol: "DNS" },
+      { ...packet(1), protocol: "UDP", dstPort: 53, appProtocol: "DNS" },
+      { ...packet(2), protocol: "UDP", dstPort: 53, appProtocol: "DNS" },
+      { ...packet(3), protocol: "TCP", dstPort: 443, appProtocol: "TLS" },
+      { ...packet(4), protocol: "TCP", dstPort: 80, appProtocol: "HTTP" },
+      { ...packet(5), protocol: "TCP", dstPort: 443, appProtocol: "HTTPS" },
+    ]
+    const bins = binPackets(p, 10)
+    const tot = bins.reduce(
+      (s, b) => ({ packets: s.packets + b.packets, dns: s.dns + b.dns, udp: s.udp + b.udp, tls: s.tls + b.tls, tcp: s.tcp + b.tcp }),
+      { packets: 0, dns: 0, udp: 0, tls: 0, tcp: 0 },
+    )
+    expect(tot.packets).toBe(6)
+    expect(tot.dns).toBe(3)
+    expect(tot.udp).toBe(0)
+    expect(tot.tls).toBe(2)
+    expect(tot.tcp).toBe(1)
+    // The stacked bar can never overflow its bucket: slices sum â‰¤ packets.
+    for (const b of bins) expect(b.tcp + b.udp + b.dns + b.tls).toBeLessThanOrEqual(b.packets)
+  })
+})
+
+describe("metadata", () => {
+  it("exposes mode, schema version and analysis duration", () => {
+    const r = buildReportAnalysis(state)
+    expect(r.metadata.mode).toContain("Local")
+    expect(r.metadata.schemaVersion).toBe("1.0")
+    expect(r.metadata.analysisDurationSec).toBe(12)
+    expect(r.metadata.analyzerVersion).toBe("v3.0.0")
+  })
+
+  it("demo jobs are labeled as local browser analysis", () => {
+    const r = buildReportAnalysis({ ...state, jobInfo: { isDemo: true } })
+    expect(r.metadata.mode).toContain("demo")
+  })
+})
+
+describe("demo dataset \u2014 header and breakdown cannot diverge", () => {
+  it("canonical risk from mock store state equals mockJob.riskScore (header == breakdown)", async () => {
+    const m = await import("@/lib/mock-data")
+    const r = buildReportAnalysis({
+      job: m.mockJob,
+      jobInfo: m.mockJobInfo,
+      alerts: m.mockThreats,
+      packets: m.mockPackets,
+      flows: m.mockFlows,
+      sessions: m.mockSessions,
+      tls: m.mockTls,
+      http: m.mockHttp,
+      timeline: m.mockTimeline,
+      bandwidth: m.mockBandwidth,
+      advancedMetrics: m.mockAdvancedMetrics,
+    })
+    expect(r.risk).not.toBeNull()
+    expect(r.risk!.normalizedScore).toBe(m.mockJob.riskScore)
+    expect(r.alerts).toBe(m.mockThreats)
+    expect(m.mockJob.alerts).toBe(m.mockThreats.length)
+  })
+
+  it("demo dataset \u2014 every section agrees on the data-exfiltration finding", async () => {
+    const m = await import("@/lib/mock-data")
+    const r = buildReportAnalysis({
+      job: m.mockJob,
+      jobInfo: m.mockJobInfo,
+      alerts: m.mockThreats,
+      packets: m.mockPackets,
+      flows: m.mockFlows,
+      sessions: m.mockSessions,
+      tls: m.mockTls,
+      http: m.mockHttp,
+      timeline: m.mockTimeline,
+      bandwidth: m.mockBandwidth,
+      advancedMetrics: m.mockAdvancedMetrics,
+    })
+// The demo metrics are now derived from the actual mock packets (QA: the
+    // hand-written 4.1 MB exfiltration finding was impossible from the data):
+    // no "large outbound transfers" recommendation may be claimed, and any
+    // data-exfiltration IOC / T1041 mitre row must be CONFIRMED_ALERT-sourced
+    // from a fired alert (the curated "ICMP Tunneling" shares rule
+    // DATA-EXFIL-001), never from the metrics.
+    const alert = m.mockThreats.find((t: { ruleId: string }) => t.ruleId === "DATA-EXFIL-001")
+    expect(m.mockAdvancedMetrics.dataExfiltrationSuspected).toBe(false)
+    const rec = r.recommendations.find((x) => x.text.includes("large outbound transfers"))
+    expect(rec).toBeUndefined()
+    for (const finding of [
+      r.iocs.find((i) => i.type === "data-exfiltration"),
+      r.mitre.find((m2) => m2.id === "T1041"),
+    ]) {
+      if (finding) {
+        expect(finding.source).toBe("CONFIRMED_ALERT")
+        expect(finding.severity).toBe(alert!.severity)
+      }
+    }
+  })
+})
+
+describe("servicePortCounts \u2014 conversation-based service-side attribution", () => {
+  // QA regression: ephemeral source ports BELOW 32768 (e.g. 12209) failed the
+  // old ">= 32768 is ephemeral" check, so serverâ†’client reply packets were
+  // attributed to the client's port and TCP/443 split (1,175 â†’ 768 + leaked).
+  const p = (srcIp: string, dstIp: string, srcPort: number, dstPort: number, protocol: string) =>
+    ({ srcIp, dstIp, srcPort, dstPort, protocol })
+
+  it("counts BOTH legs of a TCP/443 conversation under TCP/443 even when the client port is below 32768", () => {
+    const packets = [
+      p("10.0.0.5", "1.2.3.4", 12209, 443, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 12209, "TCP"),
+      p("10.0.0.5", "1.2.3.4", 12209, 443, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 12209, "TCP"),
+    ]
+    const top = servicePortCounts(packets)
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0 }])
+  })
+
+  it("applies the same rule to UDP (request and reply legs both count toward UDP/443)", () => {
+    const packets = [
+      p("10.0.0.5", "1.2.3.4", 49152, 443, "UDP"),
+      p("1.2.3.4", "10.0.0.5", 443, 49152, "UDP"),
+      p("10.0.0.5", "1.2.3.4", 49152, 53, "UDP"),
+      p("1.2.3.4", "10.0.0.5", 53, 49152, "UDP"),
+    ]
+    const top = servicePortCounts(packets)
+    expect(top).toEqual([
+      { protocol: "UDP", port: 443, count: 2, confirmed: 0 },
+      { protocol: "UDP", port: 53, count: 2, confirmed: 0 },
+    ])
+  })
+
+  it("keys conversations by normalized 5-tuple: independent client ports stay separate", () => {
+    const packets = [
+      p("10.0.0.5", "1.2.3.4", 12209, 443, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 12209, "TCP"),
+      p("10.0.0.6", "1.2.3.4", 14820, 443, "TCP"),
+      p("1.2.3.4", "10.0.0.6", 443, 14820, "TCP"),
+    ]
+    const top = servicePortCounts(packets)
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0 }])
+  })
+
+  it("skips port-less packets (ICMP/GRE/ESP have no srcPort/dstPort)", () => {
+    const packets = [
+      p("10.0.0.5", "1.2.3.4", 12209, 443, "TCP"),
+      { srcIp: "10.0.0.5", dstIp: "1.2.3.4", srcPort: undefined, dstPort: undefined, protocol: "ICMP" },
+    ]
+    const top = servicePortCounts(packets)
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 1, confirmed: 0 }])
+  })
+
+  it("ranks multiple services by total conversation packets", () => {
+    const packets = [
+      p("10.0.0.5", "1.2.3.4", 12209, 443, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 12209, "TCP"),
+      p("10.0.0.5", "8.8.8.8", 23061, 53, "UDP"),
+    ]
+    const top = servicePortCounts(packets)
+    expect(top[0]).toEqual({ protocol: "TCP", port: 443, count: 2, confirmed: 0 })
+    expect(top[1]).toEqual({ protocol: "UDP", port: 53, count: 1, confirmed: 0 })
+  })
+
+  it("handles mid-session captures: a flow whose FIRST packet is a server reply still counts under the known service port", () => {
+    // test.pcapng regression (fcb528a9): TCP/42224 295 + TCP/443 880 =
+    // 1,175. The 42224 conversation was captured mid-session \u2014 its first
+    // packets are serverâ†’client replies \u2014 so the old "first-packet
+    // destination" rule dumped the whole flow onto the client's port.
+    const packets = [
+      p("1.2.3.4", "10.0.0.5", 443, 42224, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 42224, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 42224, "TCP"),
+      p("10.0.0.5", "1.2.3.4", 42224, 443, "TCP"),
+    ]
+    const top = servicePortCounts(packets)
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0 }])
+    expect(top.some((e) => e.port === 42224)).toBe(false)
+    expect(top.some((e) => e.port >= 49152)).toBe(false)
+  })
+
+  it("excludes P2P conversations between two dynamic-range ports (UDP/57621 gone)", () => {
+    const packets = [
+      p("192.168.1.15", "192.168.1.255", 57621, 57621, "UDP"),
+      p("192.168.1.15", "192.168.1.255", 57621, 57621, "UDP"),
+    ]
+    expect(servicePortCounts(packets)).toEqual([])
+  })
+
+  it("attributes mDNS (5353) even when the first packet is the response leg", () => {
+    const packets = [
+      p("192.168.1.255", "192.168.1.15", 5353, 57621, "UDP"),
+      p("192.168.1.15", "192.168.1.255", 57621, 5353, "UDP"),
+    ]
+    expect(servicePortCounts(packets)).toEqual([{ protocol: "UDP", port: 5353, count: 2, confirmed: 0 }])
+  })
+
+  it("prefers the lower port when both endpoints use known service ports", () => {
+    const packets = [
+      p("10.0.0.5", "1.2.3.4", 8443, 443, "TCP"),
+      p("1.2.3.4", "10.0.0.5", 443, 8443, "TCP"),
+    ]
+    expect(servicePortCounts(packets)).toEqual([{ protocol: "TCP", port: 443, count: 2, confirmed: 0 }])
+  })
+})
+
+describe("osFromUserAgent \u2014 HTTP User-Agent OS fingerprint", () => {
+  it("maps Microsoft-CryptoAPI to Windows even though its UA never says 'Windows'", () => {
+    expect(osFromUserAgent("Microsoft-CryptoAPI/10.0")).toBe("Windows")
+  })
+
+  it("maps common browser/mobile UAs", () => {
+    expect(osFromUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126")).toBe("Windows")
+    expect(osFromUserAgent("Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/126")).toBe("Android")
+    expect(osFromUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)")).toBe("iOS")
+    expect(osFromUserAgent("curl/8.4.0")).toBeUndefined()
+    expect(osFromUserAgent("")).toBeUndefined()
+  })
+})
+
+describe("dltName \u2014 encapsulation diagnostics", () => {
+  it("maps known link types and keeps unknown DLT numbers (QA verylarge)", () => {
+    expect(dltName([1])).toBe("Ethernet")
+    expect(dltName([113])).toBe("Linux cooked v1 (SLL)")
+    expect(dltName([])).toBe("unknown")
+    expect(dltName([147])).toBe("DLT 147")
+    expect(dltName([1, 101])).toBe("Ethernet, Raw IP (IPv4/IPv6)")
+  })
+})
+
+describe("v3.2 export schema and verdict", () => {
+it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells for N/A", () => {
+    const geo = new Map<string, GeoLocation>([
+      ["203.0.113.9", { ip: "203.0.113.9", country: "United States", countryCode: "US", city: "X", lat: 1, lon: 1, isPrivate: false, asn: "AS64500" }],
+    ])
+    const flows: Flow[] = [
+      { id: "f1", srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1234, dstPort: 80, protocol: "TCP", packets: 42, bytesTotal: 6000, bytesSent: 4000, bytesRecv: 2000, duration: 10, startTime: "2024-01-01T00:00:00Z", endTime: "2024-01-01T00:00:10Z", rttMs: 9, retrans: 1 },
+      { id: "f2", srcIp: "203.0.113.9", dstIp: "10.0.0.5", srcPort: 80, dstPort: 1234, protocol: "TCP", packets: 12, bytesTotal: 1000, bytesSent: 0, bytesRecv: 0, duration: 2, startTime: "", endTime: "", directionUnknown: true, rttMs: 0, retrans: 0 },
+      { id: "f3", srcIp: "\u2014", dstIp: "\u2014", srcPort: 0, dstPort: 0, protocol: "OTHER", packets: 4, bytesTotal: 243, bytesSent: 0, bytesRecv: 0, duration: 1, startTime: "", endTime: "", directionUnknown: true },
+      { id: "f4", srcIp: "2401:4900:1:2:3:4:5:6", dstIp: "203.0.113.20", srcPort: 443, dstPort: 53000, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "", directionUnknown: true },
+    ]
+    const csv = buildFlowsCsv(flows, geo)
+    expect(csv.startsWith("\uFEFF")).toBe(true)
+    const lines = csv.split("\n")
+    expect(lines[0]).toBe("\uFEFFsrcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,lossPct")
+    // src/dst in their own columns — "ip:port" pairs are gone (IPv6 safety).
+    expect(lines[1]).toBe("10.0.0.5,1234,203.0.113.9,80,TCP,42,4000,2000,6000,2024-01-01T00:00:00Z,2024-01-01T00:00:10Z,10,,US,,AS64500,HTTP,port,9,1,")
+    // Direction-unknown: empty sent/recv cells, never the string "unknown".
+    expect(lines[2]).toBe("203.0.113.9,80,10.0.0.5,1234,TCP,12,,,1000,,,2,US,,AS64500,,,,0,0,")
+    expect(lines[2]).not.toContain("unknown")
+    expect(lines[2]).not.toContain("\u2014")
+    // Undecodable ("—") endpoints keep an explicit label, never an em-dash
+    // or a silent blank (QA: "OTHER flow has empty source/destination").
+    expect(lines[3]).toBe("Undecoded/unknown endpoint,0,Undecoded/unknown endpoint,0,OTHER,4,,,243,,,1,,,,,,,,,")
+    // IPv6 row parses as 4 separate columns (no 9-group "ip:port" address).
+    expect(lines[4]).toBe("2401:4900:1:2:3:4:5:6,443,203.0.113.20,53000,UDP,1,,,100,,,1,,,,,,,,,")
+    // Pure CSV: schema rows only — no comment/footer rows (strict importers
+    // must not see a non-schema record; audit: trailing "# Note:" row).
+    expect(lines).toHaveLength(5)
+    expect(lines.every((l) => !l.startsWith("#"))).toBe(true)
+  })
+
+  it("buildFlowsCsv: serviceEvidence column is port/mixed/payload, never a guess", () => {
+    // UDP/3478 conversation where only SOME packets were cookie-verified STUN
+    // (the audit's 26-of-622 case): the flow stays "STUN" (service port) but
+    // the evidence column says "mixed" — the label no longer reads as 622
+    // confirmed STUN packets.
+    const stunFlow: Flow = { id: "f1", srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", packets: 3, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "" }
+    const stunPackets = [
+      { srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", appProtocol: "STUN" },
+      { srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", appProtocol: "UDP" },
+      { srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", appProtocol: "UDP" },
+    ]
+    expect(buildFlowsCsv([stunFlow], new Map(), stunPackets).split("\n")[1].split(",")[17]).toBe("mixed")
+    // No packet evidence → "port". UDP/8001 HTTP-Alt is port-based, so even a
+    // port-labeled HTTP-Alt packet never counts as payload evidence.
+    const altPackets = [
+      { srcIp: "192.168.1.3", dstIp: "224.0.0.7", srcPort: 8001, dstPort: 8001, protocol: "UDP", appProtocol: "HTTP-Alt" },
+    ]
+    const altFlow: Flow = { id: "f2", srcIp: "192.168.1.3", dstIp: "224.0.0.7", srcPort: 8001, dstPort: 8001, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "" }
+    expect(buildFlowsCsv([altFlow], new Map(), altPackets).split("\n")[1].split(",")[17]).toBe("port")
+    // Direction-unknown rows carry no service, hence no evidence.
+    const dirUnknown: Flow = { id: "f3", srcIp: "203.0.113.9", dstIp: "10.0.0.5", srcPort: 443, dstPort: 53000, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 0, bytesRecv: 0, duration: 1, startTime: "", endTime: "", directionUnknown: true }
+    expect(buildFlowsCsv([dirUnknown], new Map(), []).split("\n")[1].split(",")[17]).toBe("")
+  })
+
+  it("DHCPv6 (UDP 546/547) is a known service, not Unknown service", () => {
+    expect(portServiceName(546, "UDP")).toBe("DHCPv6")
+    expect(portServiceName(547, "UDP")).toBe("DHCPv6")
+    expect(flowServiceName(546, 547, "UDP")).toBe("DHCPv6")
+    const flow: Flow = { id: "f1", srcIp: "fe80::bad1:fffa:a38:77dc", dstIp: "ff02::1:2", srcPort: 546, dstPort: 547, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "" }
+    expect(buildFlowsCsv([flow]).split("\n")[1].split(",")[16]).toBe("DHCPv6")
+  })
+
+  it("serviceEvidenceLabel: fully confirmed stays plain, partial carries the verified count, none says port-inferred", () => {
+    expect(serviceEvidenceLabel("STUN", 26, 622)).toBe("STUN (26 of 622 payload-confirmed)")
+    expect(serviceEvidenceLabel("HTTP-Alt", 0, 20)).toBe("HTTP-Alt (port-inferred)")
+    expect(serviceEvidenceLabel("STUN", 622, 622)).toBe("STUN")
+  })
+
+  it("servicePortCounts: STUN confirmed counts only cookie-verified packets; HTTP-Alt never counts", () => {
+    const packets = [
+      { srcIp: "10.0.0.5", dstIp: "101.2.27.162", srcPort: 65242, dstPort: 3478, protocol: "UDP", appProtocol: "STUN" },
+      { srcIp: "10.0.0.5", dstIp: "101.2.27.162", srcPort: 65242, dstPort: 3478, protocol: "UDP", appProtocol: "UDP" },
+      { srcIp: "10.0.0.5", dstIp: "101.2.27.162", srcPort: 65242, dstPort: 3478, protocol: "UDP", appProtocol: "UDP" },
+      { srcIp: "192.168.1.3", dstIp: "224.0.0.7", srcPort: 8001, dstPort: 8001, protocol: "UDP", appProtocol: "HTTP-Alt" },
+      { srcIp: "fe80::1", dstIp: "ff02::1:2", srcPort: 546, dstPort: 547, protocol: "UDP", appProtocol: "DHCPv6" },
+    ]
+    const top = servicePortCounts(packets)
+    expect(top.find((e) => e.port === 3478)).toEqual({ protocol: "UDP", port: 3478, count: 3, confirmed: 1 })
+    expect(top.find((e) => e.port === 8001)).toEqual({ protocol: "UDP", port: 8001, count: 1, confirmed: 0 })
+    expect(top.find((e) => e.port === 546)).toEqual({ protocol: "UDP", port: 546, count: 1, confirmed: 0 })
+  })
+
+  it("buildFlowsCsv: service column uses the canonical known-port rule and port-less N/A", () => {
+    const flows: Flow[] = [
+      // server-side tuple: known STUN port sits on the SOURCE side — the
+      // conversation is still STUN, and the CSV must say so (QA audit:
+      // 101.2.27.162:3478 was labeled Dynamic/Ephemeral by dstPort-only lookup).
+      { id: "f1", srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", packets: 622, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "" },
+      // port-less protocol: ARP has no transport service port — "N/A", not
+      // "Unknown service" (QA: ARP/ICMPv6/HOPOPT labeled "Unknown service").
+      { id: "f2", srcIp: "192.168.1.17", dstIp: "192.168.1.17", srcPort: 0, dstPort: 0, protocol: "ARP", packets: 2, bytesTotal: 84, bytesSent: 84, bytesRecv: 0, duration: 0.116, startTime: "", endTime: "" },
+    ]
+    const csv = buildFlowsCsv(flows)
+    const lines = csv.split("\n")
+    expect(lines[1].split(",")[16]).toBe("STUN")
+    expect(lines[2].split(",")[16]).toBe("N/A")
+  })
+
+  it("buildFlowsCsv: formula-prefixed cells are defused and embedded commas/quotes are quoted", () => {
+    // GeoIP ASN strings are external data — an ASN like "=1+1" would execute
+    // as an Excel formula when the exported CSV is opened (CSV injection).
+    const geo = new Map<string, GeoLocation>([
+      ["203.0.113.77", { ip: "203.0.113.77", country: "X", countryCode: "XX", city: "", lat: 0, lon: 0, isPrivate: false, asn: "=HYPERLINK(\"http://evil\")" }],
+      ["203.0.113.78", { ip: "203.0.113.78", country: "X", countryCode: "XX", city: "", lat: 0, lon: 0, isPrivate: false, asn: "+SUM(A1:A9)" }],
+      ["203.0.113.79", { ip: "203.0.113.79", country: "X", countryCode: "XX", city: "", lat: 0, lon: 0, isPrivate: false, asn: "AS64500" }],
+    ])
+    const flows: Flow[] = [
+      { id: "fx1", srcIp: "10.0.0.1", dstIp: "203.0.113.77", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 1, bytesTotal: 1, bytesSent: 0, bytesRecv: 1, duration: 1, startTime: "", endTime: "" },
+      { id: "fx2", srcIp: "10.0.0.1", dstIp: "203.0.113.78", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 1, bytesTotal: 1, bytesSent: 0, bytesRecv: 1, duration: 1, startTime: "", endTime: "" },
+      { id: "fx3", srcIp: "10.0.0.1", dstIp: "203.0.113.79", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 1, bytesTotal: 1, bytesSent: 0, bytesRecv: 1, duration: 1, startTime: "", endTime: "" },
+    ]
+    const csv = buildFlowsCsv(flows, geo)
+    const defusedLine = csv.split("\n")[1]
+    expect(defusedLine).toContain(`'=HYPERLINK(""http://evil"")`)
+    expect(defusedLine).toContain("'=HYPERLINK")
+    expect(defusedLine).not.toContain(",=HYPERLINK")
+    expect(csv.split("\n")[2]).toContain("'+SUM(A1:A9)")
+    expect(csv.split("\n")[3]).toContain("AS64500")
+  })
+
+  it("mdInline escapes ONCE — no &amp;amp; / literal &lt; in exported HTML", () => {
+    // The old flow pre-escaped at the call site AND inside mdInline, so the
+    // exported file rendered "&amp;amp;" for & and literal "&lt;" for <.
+    expect(mdInline("5 < 6 & 7 > 4")).toBe("5 &lt; 6 &amp; 7 &gt; 4")
+    expect(mdInline("C2 beacon on port 443 & DNS <tunnel>")).toBe("C2 beacon on port 443 &amp; DNS &lt;tunnel&gt;")
+  })
+
+  it("mdInline renders **bold** and `code` links from raw text", () => {
+    expect(mdInline("**Final verdict:** **LOW** \u2014 risk 12/100")).toBe("<strong>Final verdict:</strong> <strong>LOW</strong> \u2014 risk 12/100")
+    expect(mdInline("Analysis ID `abc-123` done")).toBe("Analysis ID <code>abc-123</code> done")
+  })
+
+  it("mdInline escapes code content and attribute-breaking quotes", () => {
+    expect(mdInline("`a & b`")).toBe("<code>a &amp; b</code>")
+    expect(escHtml(`say "hi" <now>`)).toBe("say &quot;hi&quot; &lt;now&gt;")
+  })
+
+it("verdictLine renders per-class text: LOW/MEDIUM/HIGH/CRITICAL and UNKNOWN on undecodable", () => {
+    expect(verdictLine("SAFE", 0, false)).toBe("- **Final verdict:** **SAFE** \u2014 risk 0/100 \u2014 no configured detection rules triggered")
+    expect(verdictLine("LOW", 12, false)).toBe("- **Final verdict:** **LOW** \u2014 risk 12/100")
+    expect(verdictLine("MEDIUM", 55, false)).toBe("- **Final verdict:** **MEDIUM** \u2014 risk 55/100")
+    expect(verdictLine("HIGH", 73, false)).toBe("- **Final verdict:** **HIGH** \u2014 risk 73/100")
+    expect(verdictLine("CRITICAL", 86, false)).toBe("- **Final verdict:** **CRITICAL** \u2014 risk 86/100")
+    expect(verdictLine("UNKNOWN", 0, true)).toBe("- **Final verdict:** **UNKNOWN** \u2014 risk not computable (insufficient data)")
+  })
+
+  it("risk breakdown shows the EFFECTIVE (burst-boosted) confidence that produced the multiplier", () => {
+    const alerts = [portScanAlert, beaconAlert]
+    const b = computeRiskBreakdown(buildRiskInputs(alerts), true)
+    const exfilLike = b.items.find((i) => i.ruleId === "PORT-SCAN-001")!
+    // PORT-SCAN-001 gets no burst bonus: 70 stays 70 â†’ medium Ã—1.0.
+    expect(exfilLike.confidence).toBe(70)
+    expect(exfilLike.effectiveConfidence).toBe(70)
+    expect(exfilLike.confidenceMult).toBe(1.0)
+    const beacon = b.items.find((i) => i.ruleId === "C2-BEACON-001")!
+    // Beacon 65 + 15 burst = 80 â†’ high Ã—1.5. The table must print 80, not 65
+    // next to "Ã—1.5" (QA: breakdown showed Ã—1.5 at a 65% base).
+    expect(beacon.confidence).toBe(65)
+    expect(beacon.effectiveConfidence).toBe(80)
+    expect(beacon.confidenceMult).toBe(1.5)
+    expect(beacon.contribution).toBeCloseTo((25 + 20) * 1.5, 5)
+    const raw = b.items.reduce((s, i) => s + i.contribution, 0)
+    expect(raw).toBeCloseTo(b.rawScore, 5)
+    expect(computeRisk(buildRiskInputs(alerts), true)).toBe(b.normalizedScore)
+  })
+})
+
+describe("tlsCipherSuiteName", () => {
+  it("names common TLS 1.3/1.2 suites and falls back to hex", () => {
+    expect(tlsCipherSuiteName(0x1301)).toBe("TLS_AES_128_GCM_SHA256")
+    expect(tlsCipherSuiteName(0x1302)).toBe("TLS_AES_256_GCM_SHA384")
+    expect(tlsCipherSuiteName(0xc02f)).toBe("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+    expect(tlsCipherSuiteName(0x9999)).toBe("0x9999")
+  })
+})

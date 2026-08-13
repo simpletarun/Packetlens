@@ -1,0 +1,45 @@
+{
+  "severity_weights": { "1": 1, "2": 3, "3": 8, "4": 15, "5": 25 },
+  "rule_weights": {
+    "PORT-SCAN-001": 8,
+    "SYN-FLOOD-001": 18,
+    "DNS-TUNNEL-001": 25,
+    "CRED-LEAK-001": 30,
+    "MALWARE-DL-001": 35,
+    "C2-BEACON-001": 20,
+    "DATA-EXFIL-001": 35,
+    "TLS-SUSPICIOUS-001": 15,
+    "HTTP-CREDS-001": 25
+  },
+  "confidence_multipliers": { "low": 0.5, "medium": 1.0, "high": 1.5 },
+  "confidence_bands": { "low_lt": 50, "high_ge": 80 },
+  "rule_params": {
+    "port_scan_min_unique_ports": 20,
+    "syn_flood_min_syns": 100,
+    "dns_tunnel_min_payload": 512,
+    "data_exfil_min_bytes": 102400,
+    "beacon_min_packets": 5,
+    "beacon_min_duration": 10,
+    "beacon_max_interval": 5
+  },
+  "burst_params": {
+    "detected": true,
+    "min_bytes": 10000,
+    "rate_ratio": 2.0,
+    "confidence_bonus": 15,
+    "data_exfil_bonus": 15,
+    "beacon_bonus": 15,
+    "dns_tunnel_bonus": 0
+  },
+  "normalization": { "curve_k": 80 },
+  "levels": [
+    { "min": 0, "label": "SAFE", "color": "green" },
+    { "min": 20, "label": "LOW", "color": "lime" },
+    { "min": 40, "label": "MEDIUM", "color": "yellow" },
+    { "min": 60, "label": "HIGH", "color": "orange" },
+    { "min": 80, "label": "CRITICAL", "color": "red" }
+  ],
+  "exposure": { "tor_ip": 15, "malicious_asn": 10, "c2_domain": 15, "malware_domain": 15 },
+  "asset_impact": { "domain_controller": 15, "database": 15, "firewall": 15 },
+  "ioc_weights": { "malicious_domain": 15, "malware_hash": 25, "suspicious_cert": 8 }
+}
