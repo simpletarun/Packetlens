@@ -399,12 +399,11 @@ const base = {
       container: containerRef.current,
       elements: [],
       pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
-minZoom: 0.05,
+      minZoom: 0.05,
       maxZoom: 8,
-      // wheelSensitivity 0.15 (old) made wheel zoom feel dead — each tick
-      // moved ~15% of the intended amount, so zooming required huge scrolls
-      // and read as "laggy/broken". 1 = cytoscape's default.
-      wheelSensitivity: 1,
+      // NOTE: wheelSensitivity is intentionally NOT set — cytoscape warns on
+      // ANY explicit value (even its own default of 1), and omitting it gives
+      // exactly the default behavior with zero console noise.
       textureOnViewport: false,
       motionBlur: false,
       style: [
@@ -571,10 +570,22 @@ return () => {
       if (pulseIdRef.current) clearInterval(pulseIdRef.current)
       if (flowIdRef.current) clearInterval(flowIdRef.current)
       ro.disconnect()
+      // The cose layout (and any animated layout) runs an rAF animation loop
+      // that RE-SCHEDULES ITSELF even after stop() — a frame already queued
+      // will still fire. cy.destroy() nulls the renderer synchronously, so a
+      // frame that lands after destroy calls renderer.notify() on null and
+      // throws "Cannot read properties of null (reading 'notify')".
+      // Stop the layout, then defer destroy by one frame: the queued frame
+      // runs its final pass against the LIVE renderer, and only then is the
+      // core torn down. This kills the crash on every path — StrictMode
+      // double-mount, HMR re-mounts, and mid-animation unmounts.
       try { layoutRef.current?.stop() } catch { /* ignore */ }
-      cy.destroy()
+      try { cy.elements().stop() } catch { /* ignore */ }
       cyRef.current = null
       layoutRef.current = null
+      requestAnimationFrame(() => {
+        try { cy.destroy() } catch { /* ignore */ }
+      })
       // StrictMode double-mounts effects (mount → cleanup → mount): without
       // this reset the data effect's lastGraphDataRef guard would survive the
       // cleanup and skip loading elements into the freshly re-created core,

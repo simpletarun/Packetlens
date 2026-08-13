@@ -29,6 +29,7 @@ const nextConfig: NextConfig = {
   images: isTauri ? { unoptimized: true } : undefined,
   poweredByHeader: false,
   reactStrictMode: true,
+  allowedDevOrigins: ["192.168.56.1", "localhost", "127.0.0.1"],
   // The dev-tools "N" bubble is position:fixed in dev builds — it repeats
   // once per full-page screenshot band and reads as a duplicated widget.
   devIndicators: false,
