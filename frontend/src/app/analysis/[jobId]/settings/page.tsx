@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react"
 import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
+import { useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
@@ -59,6 +60,7 @@ export default function SettingsPage() {
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const toggleBeginnerMode = useAnalysisStore((s) => s.toggleBeginnerMode)
   const resetAnalysis = useAnalysisStore((s) => s.resetAnalysis)
+  const router = useRouter()
   const dltOverride = useAnalysisStore((s) => s.dltOverride)
   const setDltOverride = useAnalysisStore((s) => s.setDltOverride)
   const settings = useAnalysisStore((s) => s.settings)
@@ -337,7 +339,7 @@ export default function SettingsPage() {
                   <p className="text-xs text-muted-foreground mb-3">Remove all loaded analysis data and return to the job list</p>
                   {confirming ? (
                     <div className="flex items-center gap-2">
-                      <Button variant="destructive" size="sm" onClick={() => { resetAnalysis(); setConfirming(false) }}>
+                      <Button variant="destructive" size="sm" onClick={() => { resetAnalysis(); setConfirming(false); router.push("/") }}>
                         Confirm Clear
                       </Button>
                       <Button variant="outline" size="sm" onClick={() => setConfirming(false)}>Cancel</Button>
