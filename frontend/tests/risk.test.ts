@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { computeRisk, riskLevel, computeRiskBreakdown, buildRiskInputs, burstDetected } from "@/lib/risk"
+import { computeRisk, riskLevel, computeRiskBreakdown, buildRiskInputs, burstDetected, burstConfidenceBoost } from "@/lib/risk"
 
 function alert(ruleId: string, severity: number, confidence: number, srcIp: string) {
   return { ruleId, severity, confidence, srcIp, dstIp: "10.0.0.9" }
@@ -59,6 +59,29 @@ describe("computeRisk — canonical scores (mirrors Rust engine)", () => {
     const withoutBurst = computeRisk([base], false)
     const withBurst = computeRisk([base], true)
     expect(withBurst).toBe(withoutBurst)
+  })
+})
+
+describe("burstConfidenceBoost — a DOWNLOAD burst must not boost exfil/beacon confidence", () => {
+  const exfil = () => alert("DATA-EXFIL-001", 5, 70, "10.0.0.5")
+
+  it("no burst -> no boost", () => {
+    expect(burstConfidenceBoost({ burst: { detected: false } })).toBe(false)
+  })
+
+  it("outbound-dominant burst -> boost", () => {
+    expect(burstConfidenceBoost({ burst: { detected: true, outboundDominant: true } })).toBe(true)
+  })
+
+  it("inbound (download) burst -> NO boost (QA: verylarge.pcapng 86 CRITICAL)", () => {
+    expect(burstConfidenceBoost({ burst: { detected: true, outboundDominant: false } })).toBe(false)
+    const withBoost = computeRisk([exfil()], true)
+    const withoutBoost = computeRisk([exfil()], false)
+    expect(withoutBoost).toBeLessThan(withBoost)
+  })
+
+  it("missing direction field defaults to boosting (parity fixtures)", () => {
+    expect(burstConfidenceBoost({ burst: { detected: true } })).toBe(true)
   })
 })
 

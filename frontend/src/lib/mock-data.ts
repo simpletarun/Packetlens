@@ -5,7 +5,7 @@ import type {
   AnalysisAdvancedMetrics,
 } from './analysis'
 import { deriveFlagThreats, ANALYZER_VERSION } from './analysis'
-import { computeRisk, buildRiskInputs, burstDetected } from './risk'
+import { computeRisk, buildRiskInputs, burstConfidenceBoost } from './risk'
 
 const NUM_PACKETS = 1200
 
@@ -449,7 +449,9 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
   let throughputPeak = 0
   for (const b of buckets.values()) if (b > throughputPeak) throughputPeak = b
   // Same burst rule as the real analyzer: a contiguous run above 2× average.
-  let burst: AnalysisAdvancedMetrics["burst"] = { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputAvg > 0 ? throughputPeak / throughputAvg : 0, start: 0, end: 0, duration: 0 }
+  // The mock's synthetic capture mixes upload/download traffic, so the burst
+  // is direction-neutral (outboundDominant: true keeps the curated score).
+  let burst: AnalysisAdvancedMetrics["burst"] = { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputAvg > 0 ? throughputPeak / throughputAvg : 0, start: 0, end: 0, duration: 0, outboundDominant: true }
   if (totalBytes > 10000 && buckets.size >= 2 && throughputPeak > throughputAvg * 2) {
     let peakSec = 0, peakBytes = 0
     for (const [sec, bytes] of buckets) if (bytes > peakBytes) { peakBytes = bytes; peakSec = sec }
@@ -457,7 +459,7 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
     let start = peakSec, end = peakSec
     while (start - 1 >= 0 && (buckets.get(start - 1) ?? 0) > threshold) start--
     while ((buckets.get(end + 1) ?? 0) > threshold) end++
-    burst = { detected: true, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start, end, duration: end - start + 1 }
+    burst = { detected: true, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start, end, duration: end - start + 1, outboundDominant: true }
   }
   const talkers = [...talkerMap.entries()]
     .sort((a, b) => (b[1].bytesOut + b[1].bytesIn) - (a[1].bytesOut + a[1].bytesIn))
@@ -520,7 +522,7 @@ export const mockJob = {
   alerts: mockThreats.length,
   riskScore: computeRisk(
     buildRiskInputs(mockThreats),
-    burstDetected(mockAdvancedMetrics)
+    burstConfidenceBoost(mockAdvancedMetrics)
   ),
   captureDuration: 3600,
   createdAt: new Date(REFERENCE_TIME).toISOString(),

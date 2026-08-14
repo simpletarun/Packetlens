@@ -7,7 +7,7 @@ import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass } from "@/lib/risk"
-import { SOURCE_LABELS, buildReportAnalysis, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf } from "@/lib/report"
+import { SOURCE_LABELS, buildReportAnalysis, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_STAMP } from "@/lib/build-stamp"
@@ -101,7 +101,22 @@ function shortIp(ip: string): string {
 
 const PROTO_COLORS: Record<string, string> = { TCP: "bg-info", UDP: "bg-success", DNS: "bg-warning", TLS: "bg-chart-3" }
 
-const sevLabel = (s: number) => s >= 4 ? "High" : s >= 3 ? "Medium" : "Low"
+const sevLabel = (s: number) => s >= 5 ? "Critical" : s >= 4 ? "High" : s >= 3 ? "Medium" : "Low"
+
+// "2 critical, 1 high" style breakdown for alert counts (severity 5 is
+// Critical — previously lumped into "high").
+const severityCounts = (alerts: { severity: number }[]) => {
+  const c = alerts.filter((t) => t.severity >= 5).length
+  const h = alerts.filter((t) => t.severity === 4).length
+  const m = alerts.filter((t) => t.severity === 3).length
+  const l = alerts.filter((t) => t.severity <= 2).length
+  const parts: string[] = []
+  if (c) parts.push(`${c} critical`)
+  if (h) parts.push(`${h} high`)
+  if (m) parts.push(`${m} medium`)
+  if (l) parts.push(`${l} low`)
+  return parts.length ? parts.join(", ") : "0 high"
+}
 
 const sourceBadge = (source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC") => (
   <Badge variant={source === "CONFIRMED_ALERT" ? "default" : "outline"} className="text-[10px] whitespace-nowrap" title={source === "CONFIRMED_ALERT" ? "Derived from a confirmed signature alert" : "Derived from behavioral analysis of advanced metrics, not a signature alert"}>
@@ -501,7 +516,7 @@ export default function ReportsPage() {
       `- **File size:** ${formatBytes(job.fileSize)}`,
       `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
       `- **Duration:** ${formatDuration(durationSec)} · Risk score: ${riskValue()}`,
-      `- **Alerts:** ${report.alerts.length} (${report.alerts.filter((t) => t.severity >= 4).length} high)`,
+      `- **Alerts:** ${report.alerts.length} (${severityCounts(report.alerts)})`,
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
@@ -560,55 +575,7 @@ export default function ReportsPage() {
   }
 
   const exportHtml = () => {
-    const mdLines = buildMarkdown().split("\n")
-    // window.location.origin keeps the real scheme — hardcoding https:// broke
-    // the deep link on localhost/http deployments. encodeURIComponent keeps a
-    // hostile job id out of the exported file's href/HTML without breaking
-    // deep links (the router sees the same encoded id).
-    const appUrl = `${window.location.origin}/analysis/${encodeURIComponent(job.id)}`
-    const out: string[] = []
-    let inUl = false
-    let tableRows: string[] = []
-    const closeUl = () => { if (inUl) { out.push("</ul>"); inUl = false } }
-    const closeTable = () => {
-      if (tableRows.length === 0) return
-      const cells = (r: string) => r.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim())
-      const rows = tableRows.filter((r) => !/^\|[\s:|-]+\|$/.test(r)).map(cells)
-      const header = rows[0]
-      out.push("<table><thead><tr>", ...header.map((h) => `<th>${inline(h)}</th>`), "</tr></thead><tbody>")
-      for (const r of rows.slice(1)) out.push("<tr>", ...r.map((c) => `<td>${inline(c)}</td>`), "</tr>")
-      out.push("</tbody></table>")
-      tableRows = []
-    }
-    for (const line of mdLines) {
-      if (line.startsWith("|")) { closeUl(); tableRows.push(line); continue }
-      closeTable()
-      if (line.startsWith("- ")) {
-        if (!inUl) { out.push("<ul>"); inUl = true }
-        let html = inline(line.slice(2))
-        if (html.includes("Final verdict")) {
-          html = html.replace(`<strong>${esc(levelLabel)}</strong>`, `<strong class="lv-${esc(levelLabel).toLowerCase()}">${esc(levelLabel)}</strong>`)
-        }
-        out.push(`<li>${html}</li>`)
-        continue
-      }
-      closeUl()
-      if (line.startsWith("### ")) out.push(`<h3>${esc(line.slice(4))}</h3>`)
-      else if (line.startsWith("## ")) out.push(`<h2>${esc(line.slice(3))}</h2>`)
-      else if (line.startsWith("# ")) {
-        out.push(`<h1>${esc(line.slice(2))}</h1>`)
-        // This export is the summary artifact, not the full in-app report.
-        out.push(`<p class="note">Summary export — the full report (Packets, Flows, Sessions, DNS, TCP Health, Endpoints, Timeline, Risk Breakdown, IOCs, MITRE) is only in PacketLens. <a href="${appUrl}">View in PacketLens</a></p>`)
-      }
-      else if (line.startsWith("_") && line.endsWith("_")) out.push(`<p class="note">${inline(line.slice(1, -1))}</p>`)
-      else if (line.trim() !== "") out.push(`<p>${inline(line)}</p>`)
-    }
-    closeUl()
-    closeTable()
-    const bodyHtml = out.join("\n").replace(`<code>${esc(job.id)}</code>`, `<code><a href="${appUrl}">${esc(job.id)}</a></code>`)
-    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>PacketLens Report — ${esc(job.filename)}</title>
-<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:2rem auto;padding:0 1.5rem;color:#1a1a2e;line-height:1.5}h1{color:#2563eb;border-bottom:2px solid #2563eb;padding-bottom:.5rem}h2{color:#1e3a8a;margin-top:2rem}h3{color:#374151;margin-top:1.5rem}li{margin:.3rem 0}p{margin:.5rem 0}p.note{font-size:.85rem;color:#6b7280;font-style:italic}table{border-collapse:collapse;width:100%;margin:.75rem 0;font-size:.9rem}th,td{border:1px solid #d1d5db;padding:.35rem .6rem;text-align:left}th{background:#f3f4f6}.lv-safe{color:#15803d}.lv-low{color:#2563eb}.lv-medium{color:#d97706}.lv-high{color:#dc2626}.lv-critical{color:#991b1b}</style></head><body>${bodyHtml}</body></html>`
-    downloadText(`${job.filename}-report.html`, html, "text/html")
+    downloadText(`${job.filename}-report.html`, markdownToHtml(buildMarkdown(), { jobId: job.id, jobFilename: job.filename, origin: window.location.origin }), "text/html")
   }
 
   const exportCsv = () => {
@@ -685,7 +652,7 @@ export default function ReportsPage() {
                   {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
                   {files.length > 0 && <p><strong>{files.length}</strong> files extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{credentials.length}</strong> credentials, <strong>{certificates.length}</strong> certificates observed.</p>}
                   {alerts.length > 0 ? (
-                    <p><span className="text-danger font-medium">{alerts.length} alerts</span> ({alerts.filter((t) => t.severity >= 4).length} high, {alerts.filter((t) => t.severity === 3).length} medium, {alerts.filter((t) => t.severity <= 2).length} low). Risk score: <strong>{riskValue()}</strong>.</p>
+                    <p><span className="text-danger font-medium">{alerts.length} alerts</span> ({severityCounts(alerts)}). Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
                     <p>No signature-based alerts. Risk score: <strong>{riskValue()}</strong>.</p>
                   )}
@@ -1316,15 +1283,16 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={AlertTriangle} title="14. Threats & Alerts" sub={`${alerts.length.toLocaleString()} alerts · ${alerts.filter((t) => t.severity >= 4).length} high severity`} />
+              <SectionTitle icon={AlertTriangle} title="14. Threats & Alerts" sub={`${alerts.length.toLocaleString()} alerts · ${severityCounts(alerts)} severity`} />
               <Card>
                 <CardContent className="pt-6 space-y-4">
-                  <div className="grid grid-cols-4 gap-4 text-xs">
+                  <div className="grid grid-cols-5 gap-4 text-xs">
                     <StatGrid tint items={[
                       { label: "⚠️ Total Alerts", value: alerts.length.toLocaleString(), accent: "text-danger" },
-                      { label: "🔴 High", value: alerts.filter((t) => t.severity >= 4).length.toLocaleString(), accent: "text-danger" },
-                      { label: "🟠 Medium", value: alerts.filter((t) => t.severity === 3).length.toLocaleString(), accent: "text-warning" },
-                      { label: "🟡 Low", value: alerts.filter((t) => t.severity <= 2).length.toLocaleString(), accent: "text-success" },
+                      { label: "🔴 Critical", value: alerts.filter((t) => t.severity >= 5).length.toLocaleString(), accent: "text-danger" },
+                      { label: "🟠 High", value: alerts.filter((t) => t.severity === 4).length.toLocaleString(), accent: "text-warning" },
+                      { label: "🟡 Medium", value: alerts.filter((t) => t.severity === 3).length.toLocaleString(), accent: "text-warning" },
+                      { label: "🟢 Low", value: alerts.filter((t) => t.severity <= 2).length.toLocaleString(), accent: "text-success" },
                     ]} />
                   </div>
                   {alerts.length === 0 && advancedMetrics && (advancedMetrics.beaconDetected || advancedMetrics.dnsTunnelingSuspected || advancedMetrics.dataExfiltrationSuspected || advancedMetrics.torVpnProxyDetected || advancedMetrics.ja3Suspicious) && (

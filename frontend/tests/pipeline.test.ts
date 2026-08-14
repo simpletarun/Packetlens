@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 import { parsePcap } from "@/lib/pcap"
 import { analyzePcap } from "@/lib/analysis"
-import { computeRisk, buildRiskInputs, burstDetected } from "@/lib/risk"
+import { computeRisk, buildRiskInputs, burstConfidenceBoost } from "@/lib/risk"
 import { computeStats } from "@/lib/stats"
 import { dnsLookupCount, portServiceName } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
@@ -47,7 +47,7 @@ describe("end-to-end pipeline on testing.pcapng", () => {
     expect(privateHosts.length).toBeGreaterThan(0)
 
     // 5. Risk is a pure, explainable function of alerts (parity with the risk table).
-    expect(analysis.job.riskScore).toBe(computeRisk(buildRiskInputs(analysis.threats), burstDetected(analysis.advancedMetrics)))
+    expect(analysis.job.riskScore).toBe(computeRisk(buildRiskInputs(analysis.threats), burstConfidenceBoost(analysis.advancedMetrics)))
     // No alerts on benign traffic => risk 0. Every alert the report shows is present here.
     expect(analysis.job.riskScore).toBe(0)
 
@@ -112,9 +112,13 @@ describe("end-to-end pipeline on testing.pcapng", () => {
 
     // Throughput: report avg (total bytes / capture span) and the advanced
     // metric agree — the old pair 402.8 vs 404.6 KB/s came from dividing by
-    // two different durations.
-    const totalBytes = analysis.packets.reduce((s, p) => s + p.length, 0)
-    expect(Math.abs(totalBytes / duration - analysis.advancedMetrics.throughputAvg)).toBeLessThan(1)
+    // two different durations. throughputAvg is the WAN-crossing rate
+    // (private↔public bytes only), so LAN↔LAN chatter (router DNS replies,
+    // ARP, probes) is excluded from both sides of the comparison.
+    const wanBytes = analysis.packets.reduce(
+      (s, p) => s + ((isPrivateIP(p.srcIp) !== isPrivateIP(p.dstIp) && p.srcIp !== "\u2014" && p.dstIp !== "\u2014") ? p.length : 0),
+      0)
+    expect(Math.abs(wanBytes / duration - analysis.advancedMetrics.throughputAvg)).toBeLessThan(1)
 
     // Port services: previously-unlabeled well-known ports resolve.
     expect(portServiceName(7, "TCP")).toBe("Echo")

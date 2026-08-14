@@ -81,7 +81,9 @@ describe("Analysis engine", () => {
   it("calculates throughput", () => {
     const packets: ParsedPacket[] = []
     for (let i = 0; i < 10; i++) {
-      packets.push(makePacket({ num: i + 1, length: 1000 }))
+      // WAN crossing (private→public): throughput is the LAN↔internet rate;
+      // LAN↔LAN chatter is not internet throughput and must not inflate it.
+      packets.push(makePacket({ num: i + 1, length: 1000, dstIp: "8.8.8.8", dstPort: 443 }))
     }
     const result: PCAPResult = {
       packets,
@@ -988,6 +990,63 @@ describe("v3.2 QA regression fixes", () => {
     expect(t?.evidence).toMatch(/KB sent/)
   })
 
+  it("exfil detector: fires even when the PUBLIC IP sorts first in the flow key (QA: flowKeyOf is lexicographic — 104.x < 192.168.x)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
+    // 104.20.1.154 sorts BEFORE 192.168.1.10, so the flow key srcIp is the
+    // PUBLIC server — the old isPrivateIp(f.srcIp) gate missed the whole
+    // class of captures whose remote IP sorts first (Cloudflare, AWS, Apple).
+    for (let i = 0; i < 150; i++) packets.push(makePacket({ num: i + 1, timestamp: t0 + i, srcIp: "192.168.1.10", dstIp: "104.20.1.154", srcPort: 50000, dstPort: 443, tcpFlags: "ACK", length: 1400 }))
+    for (let i = 0; i < 3; i++) packets.push(makePacket({ num: 200 + i, timestamp: t0 + 200 + i, srcIp: "104.20.1.154", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000, tcpFlags: "ACK", length: 300 }))
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(true)
+    const t = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+    expect(t).toBeDefined()
+    // Evidence reads private → public regardless of key order
+    expect(t?.evidence).toMatch(/192\.168\.1\.10 → 104\.20\.1\.154/)
+  })
+
+  it("exfil detector: a LAN-only transfer between private hosts is NEVER exfiltration", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
+    for (let i = 0; i < 200; i++) packets.push(makePacket({ num: i + 1, timestamp: t0 + i, srcIp: "192.168.1.10", dstIp: "192.168.1.20", srcPort: 50000, dstPort: 445, tcpFlags: "ACK", length: 1400 }))
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+    expect(analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")).toBeUndefined()
+  })
+
+  it("topTalkers includes EXTERNAL IPs (packet-direction attribution, not the private-IP proxy)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
+    for (let i = 0; i < 200; i++) packets.push(makePacket({ num: i + 1, timestamp: t0 + i, srcIp: "172.64.190.1", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000, tcpFlags: "ACK", length: 1400 }))
+    for (let i = 0; i < 20; i++) packets.push(makePacket({ num: 300 + i, timestamp: t0 + 300 + i, srcIp: "192.168.1.10", dstIp: "172.64.190.1", srcPort: 50000, dstPort: 443, tcpFlags: "ACK", length: 60 }))
+    const analysis = analyzePcap(mkResult(packets))
+    const server = analysis.advancedMetrics.topTalkers.find((t) => t.ip === "172.64.190.1")
+    const phone = analysis.advancedMetrics.topTalkers.find((t) => t.ip === "192.168.1.10")
+    expect(server).toBeDefined()
+    expect(server!.packetsOut).toBe(200)
+    expect(server!.bytesOut).toBe(200 * 1400)
+    expect(server!.packetsIn).toBe(20)
+    expect(phone!.packetsIn).toBe(200)
+    expect(phone!.packetsOut).toBe(20)
+  })
+
+  it("burst direction: LAN chatter must NOT tilt outboundDominant on a download-heavy capture", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
+    let n = 1
+    // Steady small baseline (phone ↔ internet)
+    for (let i = 0; i < 60; i++) packets.push(makePacket({ num: n++, timestamp: t0 + i, srcIp: "192.168.1.10", dstIp: "172.64.190.1", srcPort: 50000, dstPort: 443, tcpFlags: "ACK", length: 200 }))
+    // Download burst: 3 s of 800 KB/s from the CDN
+    for (let s = 0; s < 3; s++) for (let b = 0; b < 80; b++) packets.push(makePacket({ num: n++, timestamp: t0 + 100 + s, srcIp: "172.64.190.1", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000, tcpFlags: "ACK", length: 10000 }))
+    // LAN chatter inside the burst window: router DNS replies + ARP (private→private)
+    for (let s = 0; s < 3; s++) for (let b = 0; b < 20; b++) packets.push(makePacket({ num: n++, timestamp: t0 + 100 + s, srcIp: "192.168.1.1", dstIp: "192.168.1.10", srcPort: 53, dstPort: 50001, protocol: "UDP", tcpFlags: "", length: 1200 }))
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.burst?.detected).toBe(true)
+    // The router's LAN replies are not an upload: direction stays download
+    expect(analysis.advancedMetrics.burst?.outboundDominant).toBe(false)
+  })
+
   it("packets page: relative TCP Seq is rebased per flow, not a global counter", () => {
     const t0 = 1_700_000_000
     const packets: ParsedPacket[] = [
@@ -1057,8 +1116,64 @@ describe("v3.2 QA regression fixes", () => {
   it("beaconing: the same cadence to an IP with no benign DNS name DOES fire C2-BEACON-001", () => {
     const t0 = 1_700_000_000
     const packets: ParsedPacket[] = []
+    // 6 connections over 10s: ≥ beacon_min_packets (5) and ≥ beacon_min_duration (10s)
+    for (let i = 0; i < 6; i++) {
+      packets.push(makePacket({ num: i * 2 + 1, timestamp: t0 + i * 2, srcIp: "192.168.1.10", dstIp: "104.20.1.154", srcPort: 50000 + i, dstPort: 443, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+      packets.push(makePacket({ num: i * 2 + 2, timestamp: t0 + i * 2 + 1, srcIp: "104.20.1.154", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000 + i, tcpFlags: "SYN-ACK", tcpSeq: 5000 + i }))
+    }
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.threats.find((t) => t.ruleId === "C2-BEACON-001")).toBeDefined()
+  })
+
+  it("SYN-FLOOD-001 fires only past the 100-SYN threshold (QA: rule was dead code locally)", () => {
+    const t0 = 1_700_000_000
+    const mk = (n: number) => {
+      const packets: ParsedPacket[] = []
+      for (let i = 0; i < n; i++) {
+        packets.push(makePacket({ num: i + 1, timestamp: t0 + i, srcIp: "10.0.0.50", dstIp: "8.8.8.8", srcPort: 40000 + (i % 100), dstPort: 80, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+      }
+      return analyzePcap(mkResult(packets))
+    }
+    const under = mk(99)
+    expect(under.threats.find((t) => t.ruleId === "SYN-FLOOD-001")).toBeUndefined()
+    const over = mk(100)
+    const t = over.threats.find((x) => x.ruleId === "SYN-FLOOD-001")
+    expect(t).toBeDefined()
+    expect(t!.severity).toBe(4)
+    expect(t!.evidence).toContain("100 SYN packets")
+    expect(over.job.riskScore).toBeGreaterThan(0)
+  })
+
+  it("beaconing: a 4-connection keepalive cadence to an IP with no benign name is NOT C2 (QA: verylarge.pcapng Cloudflare keepalive FP)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
     for (let i = 0; i < 4; i++) {
       packets.push(makePacket({ num: i * 2 + 1, timestamp: t0 + i * 2, srcIp: "192.168.1.10", dstIp: "104.20.1.154", srcPort: 50000 + i, dstPort: 443, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+      packets.push(makePacket({ num: i * 2 + 2, timestamp: t0 + i * 2 + 1, srcIp: "104.20.1.154", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000 + i, tcpFlags: "SYN-ACK", tcpSeq: 5000 + i }))
+    }
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.beaconDetected).toBe(false)
+    expect(analysis.threats.find((t) => t.ruleId === "C2-BEACON-001")).toBeUndefined()
+  })
+
+  it("beaconing: a VPN API poll loop identified ONLY by TLS SNI is not C2 (QA: large.pcapng api.windscribe.com at ~60 s)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
+    // 9 connections at a 60 s cadence — no DNS answer in the capture, only SNI.
+    for (let i = 0; i < 9; i++) {
+      packets.push(makePacket({ num: i * 2 + 1, timestamp: t0 + i * 60, srcIp: "192.168.1.10", dstIp: "104.20.1.154", srcPort: 50000 + i, dstPort: 443, tcpFlags: "SYN", tcpSeq: 1000 + i, tlsSni: "api.windscribe.com" }))
+      packets.push(makePacket({ num: i * 2 + 2, timestamp: t0 + i * 60 + 1, srcIp: "104.20.1.154", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000 + i, tcpFlags: "SYN-ACK", tcpSeq: 5000 + i }))
+    }
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.beaconDetected).toBe(false)
+    expect(analysis.threats.find((t) => t.ruleId === "C2-BEACON-001")).toBeUndefined()
+  })
+
+  it("beaconing: the same cadence with an UNKNOWN SNI still fires C2-BEACON-001 (SNI suppression is name-scoped)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = []
+    for (let i = 0; i < 6; i++) {
+      packets.push(makePacket({ num: i * 2 + 1, timestamp: t0 + i * 2, srcIp: "192.168.1.10", dstIp: "104.20.1.154", srcPort: 50000 + i, dstPort: 443, tcpFlags: "SYN", tcpSeq: 1000 + i, tlsSni: "c2.evil.example" }))
       packets.push(makePacket({ num: i * 2 + 2, timestamp: t0 + i * 2 + 1, srcIp: "104.20.1.154", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000 + i, tcpFlags: "SYN-ACK", tcpSeq: 5000 + i }))
     }
     const analysis = analyzePcap(mkResult(packets))
@@ -1147,5 +1262,105 @@ describe("v3.2 QA regression fixes", () => {
     expect(cert.notBefore).toBeNull()
     expect(cert.notAfter).toBeNull()
     expect(cert.subject).toBe("CN=example.com")
+  })
+
+  it("a host's delegated public IPv6 folds into its device via the link-local pairing; forwarded servers stay remote (QA: test.pcapng)", () => {
+    const hostMac = "8c:90:2d:ca:b4:d5"
+    const routerMac = "6c:22:f7:e5:0f:d3"
+    const wanMac = "6e:22:f7:e5:0f:dd"
+    const hostV6 = "2401:4900:8911:7943:754b:ad97:bd76:275b"
+    const hostFe80 = "fe80::16b0:3a5e:da5a:39b6"
+    const routerV6 = "2401:4900:8911:7943:0:0:0:1"
+    const serverV6 = "2600:9000:245b:6000:15:913f:6800:93a1"
+    const packets: ParsedPacket[] = [
+      // Host's own link-local (NDP) — first, as in the real capture; its MAC
+      // is what the delegated v6 later folds into.
+      makePacket({ num: 1, srcMac: hostMac, srcIp: hostFe80, dstIp: "ff02::1:2", dstPort: 0, protocol: "UDP", tcpFlags: "" }),
+      makePacket({ num: 2, srcMac: routerMac, srcIp: "fe80::1", dstIp: "ff02::1:2", dstPort: 0, protocol: "UDP", tcpFlags: "" }),
+      // Host uploads over its SLAAC v6 (server sorts LAST — irrelevant here).
+      makePacket({ num: 3, srcMac: hostMac, srcIp: hostV6, dstIp: serverV6, dstPort: 443, length: 1000 }),
+      // The server's /64 is forwarded through the router LAN MAC AND its
+      // WAN/capture NIC — without the shadow-MAC collapse this /64 would
+      // look like a two-interface "delegated prefix" and fold the server in.
+      makePacket({ num: 4, srcMac: routerMac, srcIp: serverV6, dstIp: hostV6, srcPort: 443, tcpFlags: "ACK", length: 1200 }),
+      makePacket({ num: 5, srcMac: wanMac, srcIp: serverV6, dstIp: hostV6, srcPort: 443, tcpFlags: "ACK", length: 1200 }),
+      // Router's own delegated v6: a SECOND real LAN interface sources the /64.
+      makePacket({ num: 6, srcMac: routerMac, srcIp: routerV6, dstIp: "8.8.8.8", length: 500 }),
+      // ARP declarations mark both MACs as real LAN interfaces.
+      makePacket({ num: 7, srcMac: hostMac, srcIp: "192.168.1.10", dstIp: "8.8.8.8", srcPort: 50000, length: 300 }),
+      makePacket({ num: 8, srcMac: routerMac, srcIp: "192.168.1.1", dstIp: "192.168.1.10", protocol: "ARP", tcpFlags: "", arpSenderMac: routerMac }),
+      makePacket({ num: 9, srcMac: hostMac, srcIp: "192.168.1.10", dstIp: "192.168.1.1", protocol: "ARP", tcpFlags: "", arpSenderMac: hostMac }),
+    ]
+    const analysis = analyzePcap(mkResult(packets))
+    // Host: ONE device holding v4 + link-local + delegated v6 (the fe80 is
+    // the row's PRIMARY — it was seen first — so check ip + aliases); the v6
+    // is never its own "external" row (pre-fix it stranded on its own MAC).
+    const host = analysis.devices.find((d) => d.ip === hostFe80 || d.addresses?.includes(hostFe80))
+    expect(host).toBeDefined()
+    const hostAddrs = [host!.ip, ...(host!.addresses ?? [])]
+    expect(hostAddrs).toEqual(expect.arrayContaining([hostV6, hostFe80, "192.168.1.10"]))
+    expect(analysis.devices.some((d) => d.ip === hostV6)).toBe(false)
+    // Router: holds its own delegated v6, never the forwarded server.
+    const router = analysis.devices.find((d) => d.addresses?.includes(routerV6))
+    expect(router).toBeDefined()
+    expect(router?.addresses).not.toContain(serverV6)
+    // The server stays a clean remote row.
+    const server = analysis.devices.find((d) => d.ip === serverV6)
+    expect(server).toBeDefined()
+    expect(server?.mac).toBe("\u2014")
+    expect(server?.addresses ?? []).toEqual([])
+    // External = 8.8.8.8 + the server only (host v6, router v6, fe80s all local).
+    expect(analysis.job.externalIps).toBe(2)
+  })
+
+  it("exfil detector: a host uploading over its own delegated public IPv6 fires DATA-EXFIL-001 (QA: test.pcapng SLAAC uploads)", () => {
+    const t0 = 1_700_000_000
+    const hostMac = "8c:90:2d:ca:b4:d5"
+    const routerMac = "6c:22:f7:e5:0f:d3"
+    const hostV6 = "2401:4900:8911:7943:754b:ad97:bd76:275b"
+    const serverV6 = "2001:db8::1" // sorts BEFORE 2401:… → server owns the flow key srcIp
+    const packets: ParsedPacket[] = [
+      // Host's link-local anchors its MAC as a LAN interface (NDP).
+      makePacket({ num: 1, srcMac: hostMac, srcIp: "fe80::16b0:3a5e:da5a:39b6", dstIp: "ff02::1:2", dstPort: 0, protocol: "UDP", tcpFlags: "" }),
+      // Router's own v6 on the same /64: second LAN interface sources it.
+      makePacket({ num: 2, srcMac: routerMac, srcIp: "2401:4900:8911:7943:0:0:0:1", dstIp: "8.8.8.8", length: 100 }),
+    ]
+    // Host uploads 210 KB over its SLAAC address.
+    for (let i = 0; i < 150; i++) packets.push(makePacket({ num: 100 + i, timestamp: t0 + i, srcMac: hostMac, srcIp: hostV6, dstIp: serverV6, srcPort: 50000, dstPort: 443, tcpFlags: "ACK", length: 1400 }))
+    // Server replies are tiny.
+    for (let i = 0; i < 3; i++) packets.push(makePacket({ num: 300 + i, timestamp: t0 + 200 + i, srcMac: routerMac, srcIp: serverV6, dstIp: hostV6, srcPort: 443, dstPort: 50000, tcpFlags: "ACK", length: 300 }))
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(true)
+    const t = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+    expect(t).toBeDefined()
+    expect(t?.category).toBe("Exfiltration")
+    // Evidence reads local-v6 → public, never the reverse.
+    expect(t?.evidence).toMatch(/2401:4900:8911:7943:754b:ad97:bd76:275b → 2001:db8::1/)
+  })
+
+  it("beacon detector: remoteOf names the SERVER when the local side is a delegated public IPv6 that sorts first (QA: test.pcapng)", () => {
+    const t0 = 1_700_000_000
+    const hostMac = "8c:90:2d:ca:b4:d5"
+    const routerMac = "6c:22:f7:e5:0f:d3"
+    const hostV6 = "2401:4900:8911:7943:754b:ad97:bd76:275b"
+    const serverV6 = "2600:9000:245b:6000:15:913f:6800:93a1" // sorts AFTER the host v6
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, srcMac: hostMac, srcIp: "fe80::16b0:3a5e:da5a:39b6", dstIp: "ff02::1:2", dstPort: 0, protocol: "UDP", tcpFlags: "" }),
+      makePacket({ num: 2, srcMac: routerMac, srcIp: "2401:4900:8911:7943:0:0:0:1", dstIp: "8.8.8.8", length: 100 }),
+    ]
+    // 6 regular connections from the host's SLAAC v6: the flow key srcIp is
+    // the HOST v6, so the old isPrivateIp(srcIp) remoteOf grouped by the
+    // local host's own address and the cadence was invisible.
+    for (let i = 0; i < 6; i++) {
+      packets.push(makePacket({ num: 100 + i * 2, timestamp: t0 + i * 2, srcMac: hostMac, srcIp: hostV6, dstIp: serverV6, srcPort: 50000 + i, dstPort: 443, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+      packets.push(makePacket({ num: 101 + i * 2, timestamp: t0 + i * 2 + 1, srcMac: routerMac, srcIp: serverV6, dstIp: hostV6, srcPort: 443, dstPort: 50000 + i, tcpFlags: "SYN-ACK", tcpSeq: 5000 + i }))
+    }
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.advancedMetrics.beaconDetected).toBe(true)
+    const t = analysis.threats.find((t) => t.ruleId === "C2-BEACON-001")
+    expect(t).toBeDefined()
+    // The remote is the SERVER (stable :443), never the local host's rotating ports.
+    expect(t?.evidence).toMatch(/2600:9000:245b:6000:15:913f:6800:93a1:443/)
+    expect(t?.evidence).not.toMatch(/2401:4900/)
   })
 })

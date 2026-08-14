@@ -37,6 +37,17 @@ export function burstDetected(anomalies?: RiskAnomalies & { burst?: { detected?:
   return !!(anomalies?.burst?.detected)
 }
 
+// Whether the burst may boost alert confidence. A DOWNLOAD spike (inbound)
+// is not evidence of data exfiltration, so a burst that is not outbound-
+// dominated must not raise the exfil/beacon/DNS-tunnel contributions
+// (QA: verylarge.pcapng — 86 CRITICAL driven by an inbound burst boosting
+// an upload-style exfil alert to the ×1.5 band). Absent direction data
+// (parity fixtures, older captures) the bonus applies as before.
+export function burstConfidenceBoost(anomalies?: RiskAnomalies & { burst?: { detected?: boolean; outboundDominant?: boolean } | null }): boolean {
+  if (!burstDetected(anomalies)) return false
+  return (anomalies?.burst?.outboundDominant ?? true)
+}
+
 export interface RiskBreakdownItem {
   ruleId: string
   ruleName: string

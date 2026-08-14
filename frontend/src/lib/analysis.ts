@@ -1,5 +1,5 @@
 import { PCAPResult, ParsedPacket, tlsCipherSuiteName } from './pcap'
-import { computeRisk, buildRiskInputs, burstDetected, RISK_PARAMS } from './risk'
+import { computeRisk, buildRiskInputs, burstConfidenceBoost, RISK_PARAMS } from './risk'
 
 export const ANALYZER_VERSION = "3.2.0"
 
@@ -157,6 +157,11 @@ export interface BurstInfo {
   start: number
   end: number
   duration: number
+  /** Whether OUTBOUND (private→public) bytes dominate the burst window. A
+   *  download spike is not evidence of data exfiltration, so the exfil
+   *  confidence bonus must not ride on it (QA: verylarge.pcapng scored 86
+   *  CRITICAL — beacon FP + inbound download burst boosting an upload). */
+  outboundDominant: boolean
 }
 
 export interface AnalysisAdvancedMetrics {
@@ -865,6 +870,53 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
       s.add(p.srcMac)
     }
   }
+  // A MAC that only ever sources /64s another MAC also sources is that
+  // device's SECOND interface (a router's WAN/capture NIC forwarding the same
+  // server traffic its LAN MAC sees). Counting both would make every
+  // forwarded server /64 look like a two-interface "delegated prefix" and
+  // fold remote hosts into the LAN (QA: test.pcapng — the router's 6e:22 WAN
+  // MAC put Akamai/Cloudflare/Google rows into the router's device).
+  // Collapse ONLY MACs that never declared themselves: a LAN interface always
+  // either ARP-declares an IP or speaks link-local IPv6 (NDP), and such a MAC
+  // is never collapsible — the host's own MAC sources a strict subset of the
+  // router's (the router's ::1 sits on the same delegated /64), yet must keep
+  // counting. Strict subset only: two separate hosts on one delegated /64
+  // source identical sets and must keep counting (QA: calls.pcap — host and
+  // router both source 2401:4900:1:2).
+  const arpMacByIp = new Map<string, string>()
+  for (const p of packets) {
+    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac) continue
+    if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
+  }
+  const lanMacs = new Set<string>(arpMacByIp.values())
+  for (const p of packets) {
+    const ip = p.srcIp
+    if (!ip || !p.srcMac || !ip.includes(':')) continue
+    const v = ip.toLowerCase()
+    if (v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')) lanMacs.add(p.srcMac)
+  }
+  const macToPrefixes = new Map<string, Set<string>>()
+  for (const [prefix, macs] of prefixSourcers) {
+    for (const m of macs) {
+      let s = macToPrefixes.get(m)
+      if (!s) { s = new Set<string>(); macToPrefixes.set(m, s) }
+      s.add(prefix)
+    }
+  }
+  const shadowMacs = new Set<string>()
+  for (const [m, mine] of macToPrefixes) {
+    if (lanMacs.has(m)) continue
+    for (const [o, theirs] of macToPrefixes) {
+      if (o === m) continue
+      if (mine.size < theirs.size && [...mine].every((p) => theirs.has(p))) {
+        shadowMacs.add(m)
+        break
+      }
+    }
+  }
+  for (const m of shadowMacs) {
+    for (const macs of prefixSourcers.values()) macs.delete(m)
+  }
   const homePrefix = (ip: string): boolean => {
     if (!ip.includes(':') || isPrivateIp(ip) || isNonUnicast(ip)) return false
     const n = (prefixSourcers.get(ip.split(':').slice(0, 4).join(':')) ?? new Set()).size
@@ -875,12 +927,8 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
   // own ARP (192.168.1.1 → 192.168.1.20) declares its interface MAC, which is
   // the same MAC its link-local fe80:: and delegated public v6 speak on — so
   // all three fold into ONE device instead of a phantom router split (QA:
-  // Devices card read 5 where the report said 4).
-  const arpMacByIp = new Map<string, string>()
-  for (const p of packets) {
-    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac) continue
-    if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
-  }
+  // Devices card read 5 where the report said 4). (Declarations also mark the
+  // MAC as a real LAN interface for the shadow-MAC collapse above.)
   for (const p of packets) {
     // Dedupe self-addressed packets (gratuitous ARP, DAD): srcIp === dstIp
     // would otherwise count the packet twice for one device (QA).
@@ -993,7 +1041,24 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
 function sameL2Surface(a: string, b: string): boolean {
   const va = a.includes(':'), vb = b.includes(':')
   if (va !== vb) return true
-  if (va) return a.split(':').slice(0, 4).join(':') === b.split(':').slice(0, 4).join(':')
+  if (va) {
+    if (a.split(':').slice(0, 4).join(':') === b.split(':').slice(0, 4).join(':')) return true
+    // Link-local IPv6 always rides the same NIC as that interface's global
+    // v6, so a same-MAC fe80:: + delegated-global pair is ONE device even
+    // across /64s (the F-04 cross-subnet rule applies to v4 subnets, not to
+    // one interface's own addresses). Without this, whichever of the two
+    // reached the merge pass first claimed the MAC and the other was
+    // stranded as an external phantom (QA: test.pcapng — the host's
+    // 2401:…:275b appeared as a Remote device next to its own link-local).
+    // Safe: only mergeable IPs ever reach this test, and a remote server's
+    // /64 is never home-prefix, so forwarded v6s cannot fold in via the
+    // router's fe80::1 (reviewer Meta 2a03:…).
+    const linkLocal = (ip: string) => {
+      const v = ip.toLowerCase()
+      return v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')
+    }
+    return linkLocal(a) || linkLocal(b)
+  }
   return a.split('.').slice(0, 3).join('.') === b.split('.').slice(0, 3).join('.')
 }
 
@@ -1092,6 +1157,7 @@ const BENIGN_POLLER_DOMAINS = [
   'whatsapp.net', 'whatsapp.com', 'skype.com', 'wns.windows.com',
   'windowsupdate.com', 'msftconnecttest.com', 'apple.com', 'mzstatic.com',
   'icloud.com', 'mtalk.google.com', 'google.com', 'googleapis.com', 'gstatic.com',
+  'windscribe.com',
 ]
 
 function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
@@ -1136,6 +1202,24 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} scanned ${e.ports.size} ports on ${e.dsts.size} host(s) over ${dur}s (${e.syn} SYN, ${e.rst} RST, ${e.fin} FIN; e.g. ${samples})`,
+    })
+  }
+  // SYN flood: the same scan pass counts SYN probes per source — a host
+  // blasting SYN segments past the spec threshold is a flood regardless of
+  // port spread (spec rule_params.syn_flood_min_syns). The rule existed in
+  // risk-spec/risk.ts but the local engine never emitted it (QA: audit —
+  // SYN-FLOOD-001 was dead code on the local path).
+  for (const [ip, e] of scans) {
+    if (e.syn < RISK_PARAMS.syn_flood_min_syns) continue
+    const dur = (e.last - e.first).toFixed(1)
+    threats.push({
+      id: `alert-${threats.length + 1}`,
+      timestamp: new Date(e.last * 1000).toISOString(),
+      signature: 'SYN Flood Attempt', category: 'Denial of Service', severity: 4,
+      confidence: 65, ruleId: 'SYN-FLOOD-001',
+      srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
+      protocol: 'TCP',
+      evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (possible SYN flood)`,
     })
   }
   return threats
@@ -1211,7 +1295,7 @@ function deriveTimeline(packets: ParsedPacket[]): AnalysisTimelineEntry[] {
   return entries.map(([k, v]) => ({ ...v, time: m5Label(k, multiDay) }))
 }
 
-function deriveBandwidth(packets: ParsedPacket[]): AnalysisBandwidthPoint[] {
+function deriveBandwidth(packets: ParsedPacket[], localIps: ReadonlySet<string>): AnalysisBandwidthPoint[] {
   const buckets = new Map<string, AnalysisBandwidthPoint>()
   for (const p of packets) {
     const key = m5Bucket(new Date(p.timestamp * 1000))
@@ -1219,7 +1303,9 @@ function deriveBandwidth(packets: ParsedPacket[]): AnalysisBandwidthPoint[] {
       buckets.set(key, { time: key, in: 0, out: 0 })
     }
     const b = buckets.get(key)!
-    if (p.srcIp && isPrivateIp(p.srcIp)) {
+    // localIps carries the LAN's own delegated public v6 (merged aliases),
+    // so a host's SLAAC address counts as OUT, not a mislabeled IN.
+    if (p.srcIp && (localIps.has(p.srcIp) || isPrivateIp(p.srcIp))) {
       b.out += p.length
     } else {
       b.in += p.length
@@ -1230,7 +1316,7 @@ function deriveBandwidth(packets: ParsedPacket[]): AnalysisBandwidthPoint[] {
   return entries.map(([k, v]) => ({ ...v, time: m5Label(k, multiDay) }))
 }
 
-function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threats: AnalysisThreat[]): AnalysisAdvancedMetrics {
+function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threats: AnalysisThreat[], localIps: ReadonlySet<string>): AnalysisAdvancedMetrics {
   // Scan for min/max timestamps: Math.max(...raw.map()) spreads overflow the
   // call stack on captures with hundreds of thousands of packets.
   let firstTs = 0, lastTs = 0
@@ -1244,45 +1330,71 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   let totalBytesIn = 0
   const talkerMap = new Map<string, { bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }>()
 
+  // WAN direction of one packet: 1 = leaving the LAN (private→public),
+  // 0 = entering (public→private), -1 = internal/transit (LAN↔LAN or
+  // public↔public). The old isPrivateIp(srcIp) proxy counted LAN↔LAN chatter
+  // (router DNS replies, ARP, port probes) as OUTBOUND and never credited the
+  // receiving private host — so a download-heavy capture with LAN traffic
+  // showed fake "outbound" bytes and its burst direction was skewed
+  // (QA: testing.pcapng — the router's 110 packets read as 12 KB of outbound).
+  // localIps extends the private set with the LAN's own delegated public v6
+  // (merged device aliases), so a host's SLAAC address is a local side here,
+  // not a public peer (QA: test.pcapng IPv6 WAN traffic never counted).
+  const wanDir = (srcIp?: string, dstIp?: string): -1 | 0 | 1 => {
+    if (!srcIp || !dstIp || srcIp === '\u2014' || dstIp === '\u2014') return -1
+    const s = localIps.has(srcIp) || isPrivateIp(srcIp)
+    const d = localIps.has(dstIp) || isPrivateIp(dstIp)
+    return s !== d ? (s ? 1 : 0) : -1
+  }
   for (const p of raw) {
-    const isInternal = isPrivateIp(p.srcIp)
     const bytes = p.length
-    if (isInternal && p.srcIp) {
-      totalBytesOut += bytes
+    const dir = wanDir(p.srcIp, p.dstIp)
+    // Talker attribution is pure packet direction (the same pass the report's
+    // Top Talkers tables use): the source side sends, the destination
+    // receives — regardless of who is private. External servers therefore
+    // appear in the talker list too (the old proxy credited every packet to
+    // the private dstIp, so a 26,836-packet CDN host never made the list).
+    if (p.srcIp && p.srcIp !== '\u2014') {
       const t = talkerMap.get(p.srcIp) || { bytesOut: 0, bytesIn: 0, packetsOut: 0, packetsIn: 0 }
       t.bytesOut += bytes
       t.packetsOut++
       talkerMap.set(p.srcIp, t)
-    } else {
-      totalBytesIn += bytes
-      if (p.dstIp) {
-        const t = talkerMap.get(p.dstIp) || { bytesOut: 0, bytesIn: 0, packetsOut: 0, packetsIn: 0 }
-        t.bytesIn += bytes
-        t.packetsIn++
-        talkerMap.set(p.dstIp, t)
-      }
     }
+    if (p.dstIp && p.dstIp !== '\u2014') {
+      const t = talkerMap.get(p.dstIp) || { bytesOut: 0, bytesIn: 0, packetsOut: 0, packetsIn: 0 }
+      t.bytesIn += bytes
+      t.packetsIn++
+      talkerMap.set(p.dstIp, t)
+    }
+    if (dir === 1) totalBytesOut += bytes
+    else if (dir === 0) totalBytesIn += bytes
   }
 
   const throughputAvg = duration > 0 ? (totalBytesOut + totalBytesIn) / duration : 0
 
-  // Per-second throughput buckets — real peak, not the fabricated avg*3
+  // Per-second throughput buckets — real peak, not the fabricated avg*3.
+  // Direction is tracked separately so a download spike can be told apart
+  // from an upload burst (the exfil confidence bonus only applies to the
+  // latter). Outbound = private→public crossing ONLY: LAN chatter between
+  // local hosts is not an upload and must not tilt the burst's direction.
   const buckets = new Map<number, number>()
+  const outBuckets = new Map<number, number>()
   for (const p of raw) {
     const sec = Math.floor(p.timestamp - firstTs)
     buckets.set(sec, (buckets.get(sec) || 0) + p.length)
+    if (wanDir(p.srcIp, p.dstIp) === 1) outBuckets.set(sec, (outBuckets.get(sec) || 0) + p.length)
   }
   let throughputPeak = 0
   for (const b of buckets.values()) if (b > throughputPeak) throughputPeak = b
 
   const burst = (() => {
     if (totalBytesOut + totalBytesIn <= 10000 || buckets.size < 2) {
-      return { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: 0, start: 0, end: 0, duration: 0 } satisfies BurstInfo
+      return { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: 0, start: 0, end: 0, duration: 0, outboundDominant: totalBytesOut >= totalBytesIn } satisfies BurstInfo
     }
     const threshold = throughputAvg * 2
     const detected = throughputPeak > threshold
     if (!detected) {
-      return { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start: 0, end: 0, duration: 0 } satisfies BurstInfo
+      return { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start: 0, end: 0, duration: 0, outboundDominant: totalBytesOut >= totalBytesIn } satisfies BurstInfo
     }
     // Window = the contiguous run containing the PEAK second. The banner's
     // ratio is peak/average, so a window elsewhere would label the spike
@@ -1298,7 +1410,14 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     while (start - 1 >= 0 && (buckets.get(start - 1) ?? 0) > threshold) start--
     while ((buckets.get(end + 1) ?? 0) > threshold) end++
     const bestLen = end - start + 1
-    return { detected: true, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start, end, duration: bestLen } satisfies BurstInfo
+    let outBytes = 0
+    for (let s = start; s <= end; s++) outBytes += outBuckets.get(s) ?? 0
+    // Outbound-dominance over the whole window (not just the peak second):
+    // an upload spike IS exfil-relevant; a download spike is not.
+    let totalWindow = 0
+    for (let s = start; s <= end; s++) totalWindow += buckets.get(s) ?? 0
+    const outboundDominant = totalWindow > 0 && outBytes >= totalWindow / 2
+    return { detected: true, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start, end, duration: bestLen, outboundDominant } satisfies BurstInfo
   })()
 
   // Beaconing: repeated connections to the same host at a regular cadence.
@@ -1311,17 +1430,30 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       set.add(a.name)
       dstNames.set(a.ip, set)
     }
+    // The capture's TLS SNI is client-observed identity evidence too: a
+    // poller whose DNS was resolved outside the capture (or via DoH) is only
+    // identifiable by SNI (QA: large.pcapng — api.windscribe.com's 60 s
+    // status polls fired C2-BEACON-001 because no DNS answer named the IP).
+    if (p.tlsSni && p.dstIp) {
+      const set = dstNames.get(p.dstIp) || new Set<string>()
+      set.add(p.tlsSni.toLowerCase())
+      dstNames.set(p.dstIp, set)
+    }
   }
   const beaconEvidence = (() => {
     // Flows key lexicographically, so "dstIp" is NOT always the server: for a
     // client 192.168.x talking to 8.8.8.8 the flow srcIp IS 8.8.8.8. Group by
-    // the REMOTE endpoint instead — the side that is not the private host —
-    // or the cadence detector silently misses half of all conversations
-    // (QA-adjacent: beacon FPs keyed on dstIp that was sometimes the client).
-    const remoteOf = (f: AnalysisFlow): { ip: string; port: number } =>
-      isPrivateIp(f.srcIp) && !isPrivateIp(f.dstIp)
+    // the REMOTE endpoint instead — the side that is not the local host (a
+    // delegated public v6 in localIps is local too) — or the cadence detector
+    // silently misses half of all conversations and can even name the local
+    // host as its own remote (QA: beacon remoteOf vs the host's SLAAC v6).
+    const remoteOf = (f: AnalysisFlow): { ip: string; port: number } => {
+      const srcLocal = localIps.has(f.srcIp) || isPrivateIp(f.srcIp)
+      const dstLocal = localIps.has(f.dstIp) || isPrivateIp(f.dstIp)
+      return srcLocal && !dstLocal
         ? { ip: f.dstIp, port: f.dstPort }
         : { ip: f.srcIp, port: f.srcPort }
+    }
     const byRemote = new Map<string, AnalysisFlow[]>()
     for (const f of flows) {
       const r = remoteOf(f)
@@ -1331,8 +1463,13 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       byRemote.get(key)!.push(f)
     }
     for (const [key, list] of byRemote) {
-      if (list.length < 3) continue
+      // Spec parity (risk-spec.json rule_params): at least beacon_min_packets
+      // connections spanning beacon_min_duration seconds. The old hardcoded
+      // "< 3" fired on a 4-connection keepalive cadence (QA: verylarge.pcapng
+      // scored C2-BEACON-001 on 4 HTTPS polls to a Cloudflare IP at ~56 s).
+      if (list.length < RISK_PARAMS.beacon_min_packets) continue
       const starts = list.map(f => new Date(f.startTime).getTime()).sort((a, b) => a - b)
+      if ((starts[starts.length - 1] - starts[0]) / 1000 < RISK_PARAMS.beacon_min_duration) continue
       const intervals: number[] = []
       for (let i = 1; i < starts.length; i++) {
         const iv = (starts[i] - starts[i - 1]) / 1000
@@ -1386,17 +1523,39 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         : ''
   const dnsTunnelingSuspected = dnsTunnelEvidence !== ''
 
-  // Upload-style exfiltration: a private host SENDING >100 KB outward, at
-  // least 5× what it receives. Triggering on bytesTotal flags CDN/media
-  // DOWNLOADS as exfiltration — a WhatsApp media fetch (≈10 MB total, 123 KB
-  // sent) must not fire (QA: exfil detector counted downloads).
-  const externalFlows = flows.filter(f =>
-    isPrivateIp(f.srcIp) && !isPrivateIp(f.dstIp) &&
-    f.bytesSent > 100000 && f.bytesSent > 5 * f.bytesRecv
-  )
+  // Upload-style exfiltration: a private host SENDING > spec threshold
+  // outward, at least 5× what it receives. Triggering on bytesTotal flags
+  // CDN/media DOWNLOADS as exfiltration — a WhatsApp media fetch (≈10 MB
+  // total, 123 KB sent) must not fire (QA: exfil detector counted downloads).
+  // Flows key LEXICOGRAPHICALLY (flowKeyOf), NOT by direction, so the local
+  // host is not always f.srcIp: a public IP that sorts first (104.x vs
+  // 192.168.x, 13.107.x, 18.x…) puts the private side in dstIp, and the old
+  // isPrivateIp(f.srcIp) gate silently missed every such capture (QA: exfil
+  // depended on which IP happened to sort first). localIps adds the LAN's own
+  // delegated public v6 to the local side, so a host uploading over its
+  // SLAAC address fires like a v4 host would (QA: test.pcapng IPv6 uploads).
+  // Direction is resolved per flow; LAN↔LAN and transit conversations are
+  // never exfiltration.
+  const exfilDirection = (f: AnalysisFlow): { out: number; in: number; priv: string; pub: string } | null => {
+    const sPriv = localIps.has(f.srcIp) || isPrivateIp(f.srcIp)
+    const dPriv = localIps.has(f.dstIp) || isPrivateIp(f.dstIp)
+    if (sPriv === dPriv) return null
+    const privateIsSrc = sPriv
+    return {
+      out: privateIsSrc ? f.bytesSent : f.bytesRecv,
+      in: privateIsSrc ? f.bytesRecv : f.bytesSent,
+      priv: privateIsSrc ? f.srcIp : f.dstIp,
+      pub: privateIsSrc ? f.dstIp : f.srcIp,
+    }
+  }
+  const externalFlows = flows
+    .map((f) => ({ f, d: exfilDirection(f) }))
+    .filter((x): x is { f: AnalysisFlow; d: NonNullable<ReturnType<typeof exfilDirection>> } =>
+      x.d !== null && x.d.out > RISK_PARAMS.data_exfil_min_bytes && x.d.out > 5 * x.d.in
+    )
   const dataExfiltrationSuspected = externalFlows.length > 0
   const dataExfilDetail = externalFlows.length > 0
-    ? `${externalFlows.length} flow(s) sending >100 KB to external IPs (outbound ≥5× received; top: ${externalFlows[0].srcIp} → ${externalFlows[0].dstIp}, ${(externalFlows[0].bytesSent / 1024).toFixed(0)} KB sent)`
+    ? `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received; top: ${externalFlows[0].d.priv} → ${externalFlows[0].d.pub}, ${(externalFlows[0].d.out / 1024).toFixed(0)} KB sent)`
     : ''
 
   // Tor exit-node subnet (ASN-TOR, 185.220.101.0/24) in either direction. A
@@ -1536,10 +1695,22 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
     }
   }
   const devices = deriveDevices(raw)
+  // Local = every private-primary device and all aliases merged onto it —
+  // including the LAN's own delegated-prefix public IPv6 (SLAAC/DHCPv6 on the
+  // same NIC), which is local even though isPrivateIp() says public. Without
+  // this set the host's own global v6 counts as an external peer, its
+  // uploads can never trip exfil, and beacon remoteOf can name the local host
+  // as the C2 remote (QA: test.pcapng External 25 → 24 after the v6 folded).
+  const localAliases = new Set<string>()
+  for (const d of devices) {
+    if (!isPrivateIp(d.ip)) continue
+    localAliases.add(d.ip)
+    for (const a of d.addresses ?? []) localAliases.add(a)
+  }
   const threats = deriveThreats(raw)
   const timeline = deriveTimeline(raw)
-  const bandwidth = deriveBandwidth(raw)
-  const advancedMetrics = deriveAdvancedMetrics(raw, flows, threats)
+  const bandwidth = deriveBandwidth(raw, localAliases)
+  const advancedMetrics = deriveAdvancedMetrics(raw, flows, threats, localAliases)
   let captureEndSec = Date.now() / 1000
   if (raw.length) {
     let cMax = 0
@@ -1548,16 +1719,30 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
   }
   threats.push(...deriveFlagThreats(advancedMetrics, threats.length, captureEndSec))
 
+  // Cleartext credentials extracted from the capture are real findings: the
+  // Rust engine emits HTTP-CREDS-001 / CRED-LEAK-001 for them, and the local
+  // path must mirror that or a capture of plaintext logins scores zero risk
+  // (QA: login.pcapng — 2 HTTP form passwords, risk 0 SAFE).
+  if (credentials.length > 0) {
+    const c = credentials[0]
+    const isHttp = c.service.toUpperCase().startsWith('HTTP')
+    threats.push({
+      id: `alert-${threats.length + 1}`,
+      timestamp: new Date(captureEndSec * 1000).toISOString(),
+      signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
+      category: isHttp ? 'Credential Theft' : 'Credential Leak',
+      severity: 4, confidence: isHttp ? 75 : 70,
+      ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
+      srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
+      protocol: 'TCP',
+      evidence: `${credentials.length} plaintext credential submission(s) over ${c.service} (first: ${c.username} → ${c.dstIp})`,
+    })
+  }
+
   // External = non-LAN destinations; multicast/broadcast/unspecified/loopback
   // are transport chatter, not peers (they used to inflate the count). VPN and
   // the client's own delegated-prefix IPv6 are local, so their aliases never
   // count (QA: calls.pcap External 22 behaved as 21 after the v6 merged).
-  const localAliases = new Set<string>()
-  for (const d of devices) {
-    if (!isPrivateIp(d.ip)) continue
-    localAliases.add(d.ip)
-    for (const a of d.addresses ?? []) localAliases.add(a)
-  }
   const externalIps = new Set(
     raw.map(p => p.dstIp).filter(Boolean).filter((ip): ip is string => !isNonUnicast(ip!) && !localAliases.has(ip!))
   )
@@ -1573,7 +1758,7 @@ const job: AnalysisJob = {
     alerts: threats.length, analyzerVersion: ANALYZER_VERSION,
     riskScore: computeRisk(
       buildRiskInputs(threats),
-      burstDetected(advancedMetrics)
+      burstConfidenceBoost(advancedMetrics)
     ),
     captureDuration: stats.duration,
     createdAt: new Date((stats.startTime || raw[0]?.timestamp || 0) * 1000).toISOString(),

@@ -9,7 +9,7 @@ import type {
 import { isPrivateIP, slaacPrefixesOf, matchesSlaacPrefix } from "@/lib/map-data"
 import { isNonUnicast } from "@/lib/analysis"
 import type { GeoLocation } from "@/lib/geo"
-import { buildRiskInputs, burstDetected, computeRiskBreakdown, riskLevel } from "./risk"
+import { buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel } from "./risk"
 import type { RiskBreakdownItem } from "./risk"
 
 // MAC-merged alias → owning device IP (the analyzer's addresses[] field).
@@ -368,7 +368,7 @@ export function buildReportRisk(alerts: AlertEntry[], advancedMetrics: AdvancedM
   const riskAlerts = buildRiskInputs(alerts)
   // "Applied" means at least one alert actually received the burst confidence
   // bonus. A bare burst with no C2/exfil/DNS rule to boost shows "No".
-  const burstApplied = burstDetected(advancedMetrics) &&
+  const burstApplied = burstConfidenceBoost(advancedMetrics) &&
     riskAlerts.some((a) => burstEligibleRules.includes(a.ruleId))
   const b = computeRiskBreakdown(riskAlerts, burstApplied)
   const level = riskLevel(b.normalizedScore)
@@ -948,6 +948,62 @@ function csvCell(v: string | number): string {
   const defused = /^[=+\-@]/.test(s) ? `'${s}` : s
   if (/[",\r\n]/.test(defused)) return `"${defused.replace(/"/g, '""')}"`
   return defused
+}
+
+// Standalone HTML export artifact — the ONLY renderer of the exported report
+// file, so it lives in a testable lib instead of the page component. The
+// converter is structural: every NUMBER in the export comes from the report
+// data (stats/report/engine), which the export tests cross-check per capture.
+export function markdownToHtml(
+  md: string,
+  opts: { jobId: string; jobFilename: string; origin: string },
+): string {
+  const { jobId, jobFilename, origin } = opts
+  const appUrl = `${origin}/analysis/${encodeURIComponent(jobId)}`
+  const out: string[] = []
+  let inUl = false
+  let tableRows: string[] = []
+  const closeUl = () => { if (inUl) { out.push("</ul>"); inUl = false } }
+  const closeTable = () => {
+    if (tableRows.length === 0) return
+    const cells = (r: string) => r.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim())
+    const rows = tableRows.filter((r) => !/^\|[\s:|-]+\|$/.test(r)).map(cells)
+    const header = rows[0]
+    out.push("<table><thead><tr>", ...header.map((h) => `<th>${mdInline(h)}</th>`), "</tr></thead><tbody>")
+    for (const r of rows.slice(1)) out.push("<tr>", ...r.map((c) => `<td>${mdInline(c)}</td>`), "</tr>")
+    out.push("</tbody></table>")
+    tableRows = []
+  }
+  for (const line of md.split("\n")) {
+    if (line.startsWith("|")) { closeUl(); tableRows.push(line); continue }
+    closeTable()
+    if (line.startsWith("- ")) {
+      if (!inUl) { out.push("<ul>"); inUl = true }
+      let html = mdInline(line.slice(2))
+      if (html.includes("Final verdict")) {
+        // Verdict label gets the risk color class (lv-safe/lv-low/…), derived
+        // from the markdown itself so the converter needs no page state.
+        html = html.replace(/<strong>([^<]*)<\/strong>(?!.*<strong>)/, (_, lbl) => `<strong class="lv-${lbl.toLowerCase()}">${lbl}</strong>`)
+      }
+      out.push(`<li>${html}</li>`)
+      continue
+    }
+    closeUl()
+    if (line.startsWith("### ")) out.push(`<h3>${escHtml(line.slice(4))}</h3>`)
+    else if (line.startsWith("## ")) out.push(`<h2>${escHtml(line.slice(3))}</h2>`)
+    else if (line.startsWith("# ")) {
+      out.push(`<h1>${escHtml(line.slice(2))}</h1>`)
+      // This export is the summary artifact, not the full in-app report.
+      out.push(`<p class="note">Summary export — the full report (Packets, Flows, Sessions, DNS, TCP Health, Endpoints, Timeline, Risk Breakdown, IOCs, MITRE) is only in PacketLens. <a href="${appUrl}">View in PacketLens</a></p>`)
+    }
+    else if (line.startsWith("_") && line.endsWith("_")) out.push(`<p class="note">${mdInline(line.slice(1, -1))}</p>`)
+    else if (line.trim() !== "") out.push(`<p>${mdInline(line)}</p>`)
+  }
+  closeUl()
+  closeTable()
+  const bodyHtml = out.join("\n").replace(`<code>${escHtml(jobId)}</code>`, `<code><a href="${appUrl}">${escHtml(jobId)}</a></code>`)
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>PacketLens Report — ${escHtml(jobFilename)}</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:2rem auto;padding:0 1.5rem;color:#1a1a2e;line-height:1.5}h1{color:#2563eb;border-bottom:2px solid #2563eb;padding-bottom:.5rem}h2{color:#1e3a8a;margin-top:2rem}h3{color:#374151;margin-top:1.5rem}li{margin:.3rem 0}p{margin:.5rem 0}p.note{font-size:.85rem;color:#6b7280;font-style:italic}table{border-collapse:collapse;width:100%;margin:.75rem 0;font-size:.9rem}th,td{border:1px solid #d1d5db;padding:.35rem .6rem;text-align:left}th{background:#f3f4f6}.lv-safe{color:#15803d}.lv-low{color:#2563eb}.lv-medium{color:#d97706}.lv-high{color:#dc2626}.lv-critical{color:#991b1b}</style></head><body>${bodyHtml}</body></html>`
 }
 
 // Port → service label for a FLOW (not a packet): a conversation whose known

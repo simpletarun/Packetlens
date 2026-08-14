@@ -34,12 +34,14 @@ export default function ThreatsPage() {
   }
 
   const sevLabel = (s: number) => {
+    if (s >= 5) return "Critical"
     if (s >= 4) return "High"
     if (s >= 3) return "Medium"
     return "Low"
   }
 
-  const highCount = alerts.filter((t) => t.severity >= 4).length
+  const criticalCount = alerts.filter((t) => t.severity >= 5).length
+  const highCount = alerts.filter((t) => t.severity === 4).length
 
   return (
     <div className="flex h-screen">
@@ -51,9 +53,10 @@ export default function ThreatsPage() {
             <h1 className="text-lg font-bold mb-1">{beginnerMode ? "Security Threats" : "Threats"}</h1>
             <p className="text-xs text-muted-foreground">Detected security events and anomalies</p>
           </div>
-          <div className="p-4 grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="p-4 grid grid-cols-1 md:grid-cols-5 gap-4">
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Alerts</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{alerts.length}</div></CardContent></Card>
-            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">High Severity</CardTitle></CardHeader><CardContent><div className={"text-2xl font-bold" + (highCount > 0 ? " text-danger" : " text-muted-foreground")}>{highCount}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Critical</CardTitle></CardHeader><CardContent><div className={"text-2xl font-bold" + (criticalCount > 0 ? " text-danger" : " text-muted-foreground")}>{criticalCount}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">High</CardTitle></CardHeader><CardContent><div className={"text-2xl font-bold" + (highCount > 0 ? " text-danger" : " text-muted-foreground")}>{highCount}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Categories</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(alerts.map((t) => t.category)).size}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Signatures</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(alerts.map((t) => t.signature)).size}</div></CardContent></Card>
           </div>
