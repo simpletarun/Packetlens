@@ -31,7 +31,7 @@ const dnsTunnelAlert: AlertEntry = {
 
 const advancedMetrics: AdvancedMetrics = {
   throughputAvg: 1000, throughputPeak: 5000,
-  burst: { detected: true, peakThroughput: 5000, averageThroughput: 1000, ratio: 5, start: 1, end: 3, duration: 2 },
+  burst: { detected: true, peakThroughput: 5000, averageThroughput: 1000, ratio: 5, start: 1, end: 3, duration: 2, outboundDominant: true },
   beaconDetected: true, dnsTunnelingSuspected: true, dataExfiltrationSuspected: false,
   torVpnProxyDetected: false, portScanEnhanced: true, ja3Suspicious: false,
   topTalkers: [],

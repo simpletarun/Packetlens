@@ -7,10 +7,18 @@ import { analyzePcap, isNonUnicast } from "@/lib/analysis"
 import { buildReportAnalysis, buildFlowsCsv, markdownToHtml, dnsLookupCount } from "@/lib/report"
 import { computeStats } from "@/lib/stats"
 import { isPrivateIP } from "@/lib/map-data"
+import type { JobSummary } from "@/stores/analysis"
 
 const testsDir = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(testsDir, "fixtures")
 const externalDir = "C:/Users/hp/Downloads/all pcap"
+
+// The API route (api/v1/jobs/[id]/data/route.ts) serves JobSummary = the
+// engine AnalysisJob with done/progress/stage overrides; tests must call
+// buildReportAnalysis with the exact same shape.
+function jobSummary(j: ReturnType<typeof analyzePcap>["job"]): JobSummary {
+  return { ...j, status: "done", progress: 100, stage: "complete" }
+}
 
 function corpusFiles(): { file: string; name: string }[] {
   const files: { file: string; name: string }[] = []
@@ -70,7 +78,7 @@ describe("report export data layer parity — every capture must feed the export
     const parsed = await parsePcap(readFileSync(file))
     const a = analyzePcap(parsed)
     const stats = computeStats({
-      job: a.job, packets: a.packets, flows: a.flows, sessions: a.sessions,
+      job: jobSummary(a.job), packets: a.packets, flows: a.flows, sessions: a.sessions,
       dns: a.dns, devices: a.devices, alerts: a.threats, geo: new Map(),
     })
     expect.soft(stats.totalPackets, `${name}: totalPackets`).toBe(a.packets.length)
@@ -104,7 +112,7 @@ describe("report export data layer parity — every capture must feed the export
     const parsed = await parsePcap(readFileSync(file))
     const a = analyzePcap(parsed)
     const report = buildReportAnalysis({
-      job: a.job, jobInfo: { id: a.job.id, isDemo: false },
+      job: jobSummary(a.job), jobInfo: { isDemo: false },
       alerts: a.threats, packets: a.packets, flows: a.flows,
       sessions: a.sessions, tls: a.tls, http: a.http,
       timeline: a.timeline, bandwidth: a.bandwidth, advancedMetrics: a.advancedMetrics,
@@ -124,9 +132,9 @@ describe("report export data layer parity — every capture must feed the export
     }
     for (const r of report.recommendations) {
       expect.soft(r.text.length > 0 && r.severity >= 1 && r.severity <= 5, `${name}: rec "${r.text.slice(0, 40)}"`).toBe(true)
-      expect.soft(r.source === "CONFIRMED_ALERT" || r.source === "ANOMALY" || r.source === "METRIC", `${name}: rec source ${r.source}`).toBe(true)
+      expect.soft(r.source === "CONFIRMED_ALERT" || r.source === "BEHAVIORAL_METRIC", `${name}: rec source ${r.source}`).toBe(true)
     }
-    expect.soft(report.risk.normalizedScore, `${name}: report risk`).toBe(a.job.riskScore)
+    expect.soft(report.risk?.normalizedScore ?? -1, `${name}: report risk`).toBe(a.job.riskScore)
   }, 120_000)
 })
 
@@ -177,9 +185,9 @@ describe("flows CSV artifact — the exported file must mirror the engine flows 
         id: "f1", srcIp: "1.2.3.4", srcPort: 1, dstIp: "5.6.7.8", dstPort: 2,
         protocol: "TCP", packets: 2, bytesSent: 10, bytesRecv: 20, bytesTotal: 30,
         startTime: "2026-01-01T00:00:00.000Z", endTime: "2026-01-01T00:00:01.000Z",
-        duration: 1, directionUnknown: false, retrans: 0, lossPct: 0, rttMs: null,
+        duration: 1, directionUnknown: false, retrans: 0, lossPct: 0,
       },
-    ], new Map([["5.6.7.8", { countryCode: "US", asn: "=HYPERLINK(\"http://evil\")" }]]), [])
+    ], new Map([["5.6.7.8", { ip: "5.6.7.8", country: "US", countryCode: "US", city: "X", lat: 0, lon: 0, isPrivate: false, asn: "=HYPERLINK(\"http://evil\")" }]]), [])
     expect(csv).toContain("'=HYPERLINK")
     expect(csv).not.toContain(",=HYPERLINK")
   })
@@ -279,7 +287,7 @@ describe("end-to-end export artifact — the files users audit are regenerated f
     const parsed = await parsePcap(readFileSync(file))
     const a = analyzePcap(parsed)
     const stats = computeStats({
-      job: a.job, packets: a.packets, flows: a.flows, sessions: a.sessions,
+      job: jobSummary(a.job), packets: a.packets, flows: a.flows, sessions: a.sessions,
       dns: a.dns, devices: a.devices, alerts: a.threats, geo: new Map(),
     })
     // Reconstruct the page's summary export markdown from the SAME stats the

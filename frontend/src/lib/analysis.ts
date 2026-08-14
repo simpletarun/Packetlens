@@ -557,11 +557,16 @@ function deriveFiles(packets: ParsedPacket[]): AnalysisFile[] {
   let idx = 0
   for (const p of packets) {
     if (!p.httpMethod) continue
-    const ascii = hexToAscii(p.payload)
-    const ct = ascii.match(/Content-Type:\s*(\S+)/i)
+    // CR/LF are kept (like deriveCredentials): a CR/LF-stripped dump merges
+    // header lines into one string, and \S+ then swallows the NEXT header's
+    // name into the mime type (e.g. "...form-urlencodedUser-Agent:").
+    const raw = hexToAsciiKeep(p.payload)
+    const sep = raw.indexOf('\r\n\r\n')
+    const head = sep >= 0 ? raw.slice(0, sep) : raw
+    const ct = head.match(/Content-Type:\s*(\S+)/i)
     if (!ct) continue
     const mime = ct[1].replace(/;.*/, '')
-    const fn = ascii.match(/filename="?([^"\r\n]+)"?/i)
+    const fn = head.match(/filename="?([^"\r\n]+)"?/i)
     files.push({
       id: `file-${++idx}`,
       timestamp: new Date(p.timestamp * 1000).toISOString(),

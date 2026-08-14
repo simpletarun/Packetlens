@@ -886,6 +886,19 @@ describe("Credential extraction (deriveCredentials)", () => {
     expect(analysis.credentials[0].username).toBe("x%zz")
   })
 
+  it("file MIME types stop at the header boundary (no next-header gluing)", () => {
+    // Regression: CR/LF-stripped decoding merged "Content-Type: ...\r\nUser-Agent:"
+    // into one token, yielding mime "application/x-www-form-urlencodedUser-Agent:".
+    const analysis = analyzePcap(mkResult([
+      httpPacket('POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/x-www-form-urlencoded\r\nUser-Agent: Mozilla/5.0\r\n\r\na=1'),
+      httpPacket('POST /up2 HTTP/1.1\r\nHost: example.com\r\nContent-Disposition: form-data; name="f"; filename=doc.txt\r\nContent-Type: text/plain\r\n\r\nx'),
+    ]))
+    expect(analysis.files).toHaveLength(2)
+    expect(analysis.files[0].mimeType).toBe("application/x-www-form-urlencoded")
+    expect(analysis.files[1].mimeType).toBe("text/plain")
+    expect(analysis.files[1].filename).toBe("doc.txt")
+  })
+
   it("a plus sign in form data decodes to a space", () => {
     const analysis = analyzePcap(mkResult([
       httpPacket('GET /login?password=a+b HTTP/1.1\r\nHost: example.com\r\n'),

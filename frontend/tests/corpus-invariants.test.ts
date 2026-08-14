@@ -7,6 +7,7 @@ import { analyzePcap } from "@/lib/analysis"
 import { buildReportAnalysis, dnsLookupCount } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel } from "@/lib/risk"
+import type { JobSummary } from "@/stores/analysis"
 
 const testsDir = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(testsDir, "fixtures")
@@ -49,6 +50,12 @@ function assertNoNaN(obj: unknown, path = "", problems: string[]) {
       if (v !== undefined) assertNoNaN(v, path ? `${path}.${k}` : k, problems)
     }
   }
+}
+
+// The API route serves JobSummary = engine AnalysisJob + done/progress/stage
+// overrides; buildReportAnalysis must receive that exact shape.
+function jobSummary(j: ReturnType<typeof analyzePcap>["job"]): JobSummary {
+  return { ...j, status: "done", progress: 100, stage: "complete" }
 }
 
 async function audit(file: string, display: string) {
@@ -197,13 +204,21 @@ async function audit(file: string, display: string) {
   expect.soft(a1.advancedMetrics.torVpnProxyDetected, `${display}: tor parity`).toBe(expectTor)
 
   expect.soft(a1.credentials.length === 0 || a1.threats.some((t) => t.ruleId === "HTTP-CREDS-001" || t.ruleId === "CRED-LEAK-001"), `${display}: creds => threat`).toBe(true)
+  for (const f of a1.files) {
+    // Regression: CR/LF-stripped header decode glued the next header name onto
+    // Content-Type values ("...form-urlencodedUser-Agent:"). A well-formed
+    // mime has exactly one '/' and no whitespace or header-name residue.
+    expect.soft(/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(f.mimeType), `${display}: file mime well-formed (${f.mimeType})`).toBe(true)
+  }
   const floodSrcs = [...synCounts.entries()].filter(([, c]) => c >= 100).map(([ip]) => ip)
   expect.soft(floodSrcs.length === 0 || a1.threats.some((t) => t.ruleId === "SYN-FLOOD-001"), `${display}: 100+ SYNs => SYN-FLOOD-001`).toBe(true)
 
-  let report
+  // Definite-assignment (no null union): TS narrows a `let x: T | null = null`
+  // that is assigned only inside a callback to `never` after the call.
+  let report!: ReturnType<typeof buildReportAnalysis>
   expect.soft(() => {
     report = buildReportAnalysis({
-      job: j, jobInfo: { id: j.id, isDemo: false },
+      job: jobSummary(j), jobInfo: { isDemo: false },
       alerts: a1.threats, packets: a1.packets, flows: a1.flows,
       sessions: a1.sessions, tls: a1.tls, http: a1.http,
       timeline: a1.timeline, bandwidth: a1.bandwidth, advancedMetrics: a1.advancedMetrics,
