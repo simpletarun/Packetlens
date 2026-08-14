@@ -1,7 +1,7 @@
 // Shared IP-map data derivation — used by the static SVG world map and the
 // MapLibre interactive map so both views always agree on nodes and arcs.
 
-import { isNonUnicast } from "@/lib/analysis"
+import { isNonUnicast, safeIso } from "@/lib/analysis"
 
 export const PROTOCOL_COLORS: Record<string, string> = {
   TCP: "#3b82f6", UDP: "#22c55e", DNS: "#eab308", TLS: "#a855f7",
@@ -480,7 +480,9 @@ export function deriveMapData(
         if (ip === p.dstIp) { n.isDest = true }
         const epoch = epochOf(p.timestamp)
         if (epoch > 0) {
-          const iso = new Date(epoch * 1000).toISOString()
+          // safeIso: a crafted capture timestamp beyond the Date range must
+          // not crash the map pass (QA: overflow pcapng).
+          const iso = safeIso(epoch * 1000)
           if (!n.firstSeen || iso < n.firstSeen) n.firstSeen = iso
           if (!n.lastSeen || iso > n.lastSeen) n.lastSeen = iso
         }

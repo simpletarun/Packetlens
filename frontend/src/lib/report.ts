@@ -7,7 +7,7 @@ import type {
   JobInfo, JobSummary, Packet, Session, TimelineEntry, TlsEntry,
 } from "@/stores/analysis"
 import { isPrivateIP, slaacPrefixesOf, matchesSlaacPrefix } from "@/lib/map-data"
-import { isNonUnicast } from "@/lib/analysis"
+import { isNonUnicast, safeIso } from "@/lib/analysis"
 import type { GeoLocation } from "@/lib/geo"
 import { buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel } from "./risk"
 import type { RiskBreakdownItem } from "./risk"
@@ -235,8 +235,8 @@ function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
       occurrences: list.length,
       srcHosts: [...new Set(list.map((a) => a.srcIp))],
       dstHosts: [...new Set(list.map((a) => a.dstIp))],
-      firstSeen: new Date(times[0]).toISOString(),
-      lastSeen: new Date(times[times.length - 1]).toISOString(),
+      firstSeen: safeIso(times[0]),
+      lastSeen: safeIso(times[times.length - 1]),
       evidence: first.evidence,
       alertIds: list.map((a) => a.id),
       packets: null,

@@ -4,6 +4,19 @@ import { captureRates, CaptureRates, CaptureQuality } from './metrics'
 
 export const ANALYZER_VERSION = "3.4.0"
 
+// JS Dates are valid up to ±8.64e15 ms (year 275760); a crafted pcapng with a
+// µs-resolution timestamp near the 2^64-ns ceiling overflows that range and
+// new Date(...).toISOString() THROWS RangeError, crashing the whole analysis.
+// Clamp instead so an extreme (absurd) capture time still renders as the real
+// instant it represents — the file's time field is preserved, never
+// fabricated, and the pipeline never crashes (QA: overflow capture).
+export function safeIso(ms: number): string {
+  if (!Number.isFinite(ms)) ms = 0
+  if (ms > 8.64e15) ms = 8.64e15
+  if (ms < -8.64e15) ms = -8.64e15
+  return new Date(ms).toISOString()
+}
+
 // Version of the canonical Analysis JSON emitted by analyzePcap. Every
 // consumer (report builder, exports, UI, snapshots) must regenerate against
 // this version; bump it on any shape change so snapshot tests fail loudly
@@ -117,6 +130,8 @@ interface AnalysisCall {
 export interface AnalysisCredential {
   id: string; timestamp: string; srcIp: string; dstIp: string
   protocol: string; username: string; password: string; service: string
+  /** Provenance: the capture packet number that carried the credential. */
+  packetNum?: number
 }
 
 export interface AnalysisCertificate {
@@ -142,6 +157,15 @@ export interface AnalysisThreat {
   id: string; timestamp: string; signature: string; category: string
   severity: number; confidence: number; ruleId: string; srcIp: string; dstIp: string
   srcPort: number; dstPort: number; protocol: string; evidence: string
+  // Evidence provenance: the exact packets that triggered the finding (first
+  // few, ascending; count lives in the evidence text). Absent for behavioral
+  // aggregates (DNS tunnel, beacon) that span many packets.
+  packetNums?: number[]
+  // The conversation (flow) the finding belongs to, when single-flow.
+  flowId?: string
+  // True when the finding was derived from decoded payload content (e.g.
+  // cleartext credentials), distinguishing payload proof from port inference.
+  payloadConfirmed?: boolean
 }
 
 export interface AnalysisTimelineEntry {
@@ -325,7 +349,7 @@ function pktToAnalysis(p: ParsedPacket, seqBase: number | undefined): AnalysisPa
   else info = `${p.protocol || 'IP'} packet #${p.num}`
   return {
     num: p.num,
-    timestamp: new Date(p.timestamp * 1000).toISOString(),
+    timestamp: safeIso(p.timestamp * 1000),
     srcIp: p.srcIp || '\u2014',
     dstIp: p.dstIp || '\u2014',
     srcPort: p.srcPort || 0,
@@ -419,8 +443,8 @@ function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
       // Sub-second flows keep ms precision (116 ms → 0.116 s); the desktop
       // engine exports raw f64 seconds, rounding here broke parity (QA audit).
       duration: Math.round(((tMax - tMin) / 1000) * 1000) / 1000,
-      startTime: new Date(tMin).toISOString(),
-      endTime: new Date(tMax).toISOString(),
+      startTime: safeIso(tMin),
+      endTime: safeIso(tMax),
       appProtocol,
       protocolSource,
       ...(protocol === 'TCP' ? tcpHealth(pkts, srcIp) : {}),
@@ -577,7 +601,7 @@ function deriveDns(packets: ParsedPacket[]): AnalysisDnsEntry[] {
     const first = p.dnsAnswers?.[0]
     return {
       id: `dns-${i + 1}`,
-      timestamp: new Date(p.timestamp * 1000).toISOString(),
+      timestamp: safeIso(p.timestamp * 1000),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
       query: p.dnsQuery!,
       // Record type from the question section; the old answer-based
@@ -608,7 +632,7 @@ function deriveHttp(packets: ParsedPacket[]): AnalysisHttpEntry[] {
       : undefined
     return {
       id: `http-${i + 1}`,
-      timestamp: new Date(p.timestamp * 1000).toISOString(),
+      timestamp: safeIso(p.timestamp * 1000),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
       method: p.httpMethod!, uri: p.httpUri || '/', host: p.httpHost || '',
       // Real status when the server answered; 0 renders as "—" (no response).
@@ -664,7 +688,7 @@ function deriveTls(packets: ParsedPacket[]): AnalysisTlsEntry[] {
       : tlsVersionName(p.tlsVersion)
     return {
       id: `tls-${i + 1}`,
-      timestamp: new Date(p.timestamp * 1000).toISOString(),
+      timestamp: safeIso(p.timestamp * 1000),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
       version, sni: p.tlsSni!,
       cipherSuite: negotiated !== undefined ? tlsCipherSuiteName(negotiated) : '',
@@ -690,7 +714,7 @@ function deriveFiles(packets: ParsedPacket[]): AnalysisFile[] {
     const fn = head.match(/filename="?([^"\r\n]+)"?/i)
     files.push({
       id: `file-${++idx}`,
-      timestamp: new Date(p.timestamp * 1000).toISOString(),
+      timestamp: safeIso(p.timestamp * 1000),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
       filename: fn ? fn[1] : `file-${idx}`,
       // Honest size: the HTTP payload bytes of THIS packet (no reassembly —
@@ -784,8 +808,8 @@ function deriveVoip(packets: ParsedPacket[]): AnalysisCall[] {
       from: d.from || '\u2014',
       to: d.to || '\u2014',
       viaIp: d.viaIp || '\u2014',
-      startTime: new Date(d.start * 1000).toISOString(),
-      endTime: end !== null ? new Date(end * 1000).toISOString() : null,
+      startTime: safeIso(d.start * 1000),
+      endTime: end !== null ? safeIso(end * 1000) : null,
       durationSec: end !== null ? Math.max(0, end - d.start) : null,
       userAgent: d.userAgent || '\u2014',
       status: d.status ? `SIP ${d.status}` : 'SIP',
@@ -857,12 +881,13 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
       if (colon < 0) continue
       creds.push({
         id: `cred-${++idx}`,
-        timestamp: new Date(p.timestamp * 1000).toISOString(),
+        timestamp: safeIso(p.timestamp * 1000),
         srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
         protocol: p.protocol || 'HTTP',
         username: decoded.slice(0, colon),
         password: decoded.slice(colon + 1),
         service: 'HTTP Basic',
+        packetNum: p.num,
       })
       continue
     }
@@ -899,12 +924,13 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
     if (!user && !pass) continue
     creds.push({
       id: `cred-${++idx}`,
-      timestamp: new Date(p.timestamp * 1000).toISOString(),
+      timestamp: safeIso(p.timestamp * 1000),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
       protocol: p.protocol || 'HTTP',
       username: user ?? '\u2014',
       password: pass ?? '\u2014',
       service: 'HTTP Form',
+      packetNum: p.num,
     })
   }
   return creds
@@ -1153,8 +1179,8 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
     return {
       id: `dev-${i + 1}`, ip: m.ip, mac: m.e.mac, hostname: ipToName.get(m.ip) ?? sniByIp.get(m.ip) ?? m.ip,
       vendor: '', os: fp.os, osSource: fp.source,
-      firstSeen: new Date(m.e.first * 1000).toISOString(),
-      lastSeen: new Date(m.e.last * 1000).toISOString(),
+      firstSeen: safeIso(m.e.first * 1000),
+      lastSeen: safeIso(m.e.last * 1000),
       packets: m.e.count, bytes: m.e.bytes,
       addresses: m.addresses.sort(),
     }
@@ -1288,7 +1314,7 @@ const BENIGN_POLLER_DOMAINS = [
 
 function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
   const threats: AnalysisThreat[] = []
-  const scans = new Map<string, { ports: Set<number>; dsts: Set<string>; syn: number; rst: number; fin: number; first: number; last: number }>()
+  const scans = new Map<string, { ports: Set<number>; dsts: Set<string>; syn: number; rst: number; fin: number; first: number; last: number; packetNums: number[] }>()
   for (const p of packets) {
     if (!p.srcIp) continue
     if (p.dstPort && p.tcpFlags?.includes('SYN')) {
@@ -1297,12 +1323,14 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       // port fired on plain UDP traffic (WebRTC/STUN/NAT traversal).
       let e = scans.get(p.srcIp)
       if (!e) {
-        e = { ports: new Set(), dsts: new Set(), syn: 0, rst: 0, fin: 0, first: p.timestamp, last: p.timestamp }
+        e = { ports: new Set(), dsts: new Set(), syn: 0, rst: 0, fin: 0, first: p.timestamp, last: p.timestamp, packetNums: [] }
         scans.set(p.srcIp, e)
       }
       e.ports.add(p.dstPort)
       if (p.dstIp) e.dsts.add(p.dstIp)
       e.syn++
+      // Provenance: the first few triggering packet numbers (UI shows these).
+      if (e.packetNums.length < 5) e.packetNums.push(p.num)
       e.first = Math.min(e.first, p.timestamp)
       e.last = Math.max(e.last, p.timestamp)
     } else if (p.tcpFlags?.includes('RST') || p.tcpFlags?.includes('FIN')) {
@@ -1322,12 +1350,13 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
     const dur = (e.last - e.first).toFixed(1)
     threats.push({
       id: `alert-${threats.length + 1}`,
-      timestamp: new Date(e.last * 1000).toISOString(),
+      timestamp: safeIso(e.last * 1000),
       signature: 'Port Scan Detected', category: 'Reconnaissance', severity: 3,
       confidence: 70, ruleId: 'PORT-SCAN-001',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} scanned ${e.ports.size} ports on ${e.dsts.size} host(s) over ${dur}s (${e.syn} SYN, ${e.rst} RST, ${e.fin} FIN; e.g. ${samples})`,
+      packetNums: e.packetNums,
     })
   }
   // SYN flood: the same scan pass counts SYN probes per source — a host
@@ -1340,12 +1369,13 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
     const dur = (e.last - e.first).toFixed(1)
     threats.push({
       id: `alert-${threats.length + 1}`,
-      timestamp: new Date(e.last * 1000).toISOString(),
+      timestamp: safeIso(e.last * 1000),
       signature: 'SYN Flood Attempt', category: 'Denial of Service', severity: 4,
       confidence: 65, ruleId: 'SYN-FLOOD-001',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (possible SYN flood)`,
+      packetNums: e.packetNums,
     })
   }
   return threats
@@ -1363,7 +1393,7 @@ export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, exis
       id: `alert-${existing + out.length + 1}`,
       // The Rust engine stamps alerts with the last triggering packet's time
       // (stats.flow_end) — mirror that with the capture end, never "now".
-      timestamp: new Date((captureEndSec ?? Date.now() / 1000) * 1000).toISOString(),
+      timestamp: safeIso((captureEndSec ?? Date.now() / 1000) * 1000),
       signature, category, severity, confidence, ruleId,
       srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
       protocol: 'TCP', evidence,
@@ -1840,8 +1870,8 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
       certificates.push({
         id: `cert-${certificates.length + 1}`,
         serial: c.serial, subject: c.subject || '\u2014', issuer: c.issuer || '\u2014',
-        notBefore: c.notBefore > 0 ? new Date(c.notBefore).toISOString() : null,
-        notAfter: c.notAfter > 0 ? new Date(c.notAfter).toISOString() : null,
+        notBefore: c.notBefore > 0 ? safeIso(c.notBefore) : null,
+        notAfter: c.notAfter > 0 ? safeIso(c.notAfter) : null,
         san: c.san, signatureAlgorithm: c.signatureAlgorithm || 'unknown',
         keySize: c.keySize,
       })
@@ -1881,7 +1911,7 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
     const isHttp = c.service.toUpperCase().startsWith('HTTP')
     threats.push({
       id: `alert-${threats.length + 1}`,
-      timestamp: new Date(captureEndSec * 1000).toISOString(),
+      timestamp: safeIso(captureEndSec * 1000),
       signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
       category: isHttp ? 'Credential Theft' : 'Credential Leak',
       severity: 4, confidence: isHttp ? 75 : 70,
@@ -1889,6 +1919,10 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
       srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${credentials.length} plaintext credential submission(s) over ${c.service} (first: ${c.username} → ${c.dstIp})`,
+      packetNums: [...new Set(credentials.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))].slice(0, 5),
+      // Credentials exist only because payload content was decoded: this is
+      // payload proof, not port inference.
+      payloadConfirmed: true,
     })
   }
 
@@ -1915,7 +1949,7 @@ const job: AnalysisJob = {
     ),
     captureDuration: advancedMetrics.rates.durationSec ?? 0,
     captureQuality: advancedMetrics.rates.quality,
-    createdAt: new Date((stats.startTime || raw[0]?.timestamp || 0) * 1000).toISOString(),
+    createdAt: safeIso((stats.startTime || raw[0]?.timestamp || 0) * 1000),
   }
 
   // File info is provided by the backend Rust analyzer

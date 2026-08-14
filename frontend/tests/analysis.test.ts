@@ -194,8 +194,8 @@ describe("burst semantics — unevaluable bursts stay null and never boost risk"
 
 describe("alert deduplication — one event, one alert, counts kept as evidence", () => {
   const hex = (s: string) => Buffer.from(s, "latin1").toString("hex")
-  const synPkt = (i: number, dstPort: number) =>
-    makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp: "10.0.0.5", dstIp: "8.8.8.8", dstPort, tcpFlags: "SYN" })
+  const synPkt = (i: number, dstPort: number, srcIp = "10.0.0.5") =>
+    makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp, dstIp: "8.8.8.8", dstPort, tcpFlags: "SYN" })
   const httpPacket = (payload: string, overrides: Partial<ParsedPacket> = {}): ParsedPacket =>
     makePacket({
       num: 1,
@@ -253,6 +253,65 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
     ])
     const keys = new Set(a.threats.map((t) => `${t.ruleId}|${t.srcIp}|${t.dstIp}`))
     expect(keys.size).toBe(a.threats.length)
+  })
+
+  it("provenance: findings cite the exact triggering packet numbers", () => {
+    const a = run([
+      ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443)),
+      ...Array.from({ length: 25 }, (_, i) => synPkt(1000 + i, 2000 + i, "10.0.0.6")),
+    ])
+    const flood = a.threats.find((t) => t.ruleId === "SYN-FLOOD-001")!
+    expect(flood.packetNums?.[0]).toBe(1)
+    expect(flood.packetNums!.length).toBeLessThanOrEqual(5)
+    expect(flood.packetNums!.every((n) => n >= 1)).toBe(true)
+    const scan = a.threats.find((t) => t.ruleId === "PORT-SCAN-001")!
+    expect(scan.packetNums![0]).toBe(1001)
+  })
+
+  it("provenance: credential findings are payloadConfirmed and cite the packet", () => {
+    const a = run(Array.from({ length: 5 }, (_, i) =>
+      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: 10 + i, timestamp: 1000000 + i })))
+    const cred = a.threats.find((t) => t.ruleId === "HTTP-CREDS-001")!
+    expect(cred.payloadConfirmed).toBe(true)
+    expect(cred.packetNums).toEqual([10, 11, 12, 13, 14])
+    expect(a.credentials.map((c) => c.packetNum)).toEqual([10, 11, 12, 13, 14])
+  })
+})
+
+describe("timestamp robustness — long captures, multi-day timeline", () => {
+  const DAY = 86400
+  const pkt = (i: number, ts: number) =>
+    makePacket({ num: i + 1, timestamp: ts, length: 100, tcpFlags: "ACK" })
+
+  it("a multi-day capture keeps every day's buckets separate and labels include the date", () => {
+    const day0 = 1_700_000_000
+    // Same wall-clock minute on three consecutive days: without the date in
+    // the key the buckets would merge into one (and duplicate React keys).
+    const a = analyzePcap({
+      packets: [
+        pkt(0, day0),
+        pkt(1, day0 + 86400),
+        pkt(2, day0 + 2 * 86400),
+      ],
+      stats: { totalPackets: 3, totalBytes: 300, duration: 2 * 86400, startTime: day0, endTime: day0 + 2 * 86400, protocols: { TCP: 3 }, linkTypes: [1], decodedPackets: 3 },
+    })
+    expect(a.timeline.length).toBe(3)
+    expect(new Set(a.timeline.map((t) => t.time)).size).toBe(3)
+    expect(a.timeline.every((t) => t.time.includes("-"))).toBe(true)
+    expect(a.timeline.reduce((s, t) => s + t.packets, 0)).toBe(3)
+  })
+
+  it("flow durations use max-min even with out-of-order packets", () => {
+    const a = analyzePcap({
+      packets: [
+        pkt(0, 1_700_000_100),
+        pkt(1, 1_700_000_050),
+        pkt(2, 1_700_000_200),
+      ],
+      stats: { totalPackets: 3, totalBytes: 300, duration: 150, startTime: 1_700_000_050, endTime: 1_700_000_200, protocols: { TCP: 3 }, linkTypes: [1], decodedPackets: 3 },
+    })
+    expect(a.flows[0].duration).toBe(150)
+    expect(a.flows[0].packets).toBe(3)
   })
 })
 

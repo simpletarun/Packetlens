@@ -562,6 +562,98 @@ describe("protocol honesty — payload vs port-inferred labels", () => {
   })
 })
 
+// Minimal pcapng: SHB + IDB (with optional if_tsresol) + one EPB per packet.
+// tsRaw is in the interface's resolution units (default µs, resol 10^9 = ns).
+// Extreme timestamps pass explicit {hi, lo} — computing 2^64-1 in JS doubles
+// rounds to a value whose hi/lo split becomes 0x00000000/0x00000000 (QA: the
+// overflow fixture silently became epoch 1970).
+function buildPcapNg(records: Array<{ tsRaw?: number; hi?: number; lo?: number; payload: number[] }>, resol = 1_000_000): Buffer {
+  const body: number[] = []
+  const shb = [
+    0x0a, 0x0d, 0x0d, 0x0a, 0x1c, 0x00, 0x00, 0x00,
+    0x4d, 0x3c, 0x2b, 0x1a, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  ]
+  body.push(...shb, ...little32(28))
+  const resolByte = resol === 1_000_000 ? 6 : 9 // if_tsresol: 10^6 or 10^9
+  const idb = [
+    0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
+    0x09, 0x00, 0x01, 0x00, resolByte, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+  ]
+  body.push(...idb, ...little32(32))
+  for (const r of records) {
+    const padded = Math.ceil(r.payload.length / 4) * 4
+    const len = 32 + padded
+    const hi = r.hi ?? Math.floor((r.tsRaw ?? 0) / 4294967296)
+    const lo = r.lo ?? (r.tsRaw ?? 0) % 4294967296
+    const epb = [
+      0x06, 0x00, 0x00, 0x00, ...little32(len),
+      0x00, 0x00, 0x00, 0x00,
+      ...little32(hi), ...little32(lo),
+      ...little32(r.payload.length), ...little32(r.payload.length),
+      ...r.payload,
+    ]
+    while (epb.length < len - 4) epb.push(0)
+    body.push(...epb, ...little32(len))
+  }
+  return Buffer.from(body)
+}
+
+// Ethernet frame carrying 10.0.0.5:50000 → 8.8.8.8:80 (payload bytes as given).
+function etherTcp(payload: number[], flags = 0x18): number[] {
+  const tcpLen = 20 + payload.length
+  const ipLen = 20 + tcpLen
+  const ip = [
+    0x45, 0x00, ...be16(ipLen), ...be16(3), ...be16(0), 64, 6, 0x00, 0x00,
+    10, 0, 0, 5, 8, 8, 8, 8,
+  ]
+  const tcp = [...be16(50000), ...be16(80), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, (5 << 4) | flags, flags, ...be16(65535), ...be16(0), 0x00, 0x00, ...payload]
+  return [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x08, 0x00, ...ip, ...tcp]
+}
+
+describe("timestamp robustness — pcapng ns precision, out-of-order, extremes", () => {
+  it("ns-resolution timestamps convert exactly (tsRaw / 1e9)", async () => {
+    const r = await parsePcap(buildPcapNg([{ tsRaw: 123456789, payload: etherTcp([]) }], 1_000_000_000))
+    expect(Math.abs(r.packets[0].timestamp - 0.123456789)).toBeLessThan(1e-12)
+  })
+
+  it("default µs resolution converts to seconds", async () => {
+    const r = await parsePcap(buildPcapNg([{ tsRaw: 1_500_000, payload: etherTcp([]) }]))
+    expect(r.packets[0].timestamp).toBe(1.5)
+  })
+
+  it("out-of-order timestamps: duration = max-min, file order preserved", async () => {
+    const r = await parsePcap(buildPcapNg([
+      { tsRaw: 5_000_000, payload: etherTcp([]) },
+      { tsRaw: 1_000_000, payload: etherTcp([]) },
+    ]))
+    expect(r.packets[0].timestamp).toBe(5)
+    expect(r.packets[1].timestamp).toBe(1)
+    expect(r.stats.startTime).toBe(1)
+    expect(r.stats.endTime).toBe(5)
+    expect(r.stats.duration).toBe(4)
+  })
+
+  it("maximum pcapng timestamp (year 2554) parses and analyzes without crashing", async () => {
+    const r = await parsePcap(buildPcapNg([{ hi: 0xffffffff, lo: 0xffffffff, payload: etherTcp([]) }]))
+    expect(Number.isFinite(r.packets[0].timestamp)).toBe(true)
+    expect(r.packets[0].timestamp).toBeGreaterThan(1e13)
+    const { analyzePcap } = await import("@/lib/analysis")
+    const a = analyzePcap(r)
+    expect(a.flows[0].startTime).toBeDefined()
+    // Clamped to the Date range by safeIso — the analysis never crashes and
+    // never fabricates epoch 1970 for an extreme capture time.
+    expect(new Date(a.flows[0].startTime).getTime()).toBeGreaterThan(0)
+  })
+
+  it("missing timestamps (zero) parse cleanly", async () => {
+    const r = await parsePcap(buildPcapNg([{ tsRaw: 0, payload: etherTcp([]) }]))
+    expect(r.packets[0].timestamp).toBe(0)
+  })
+})
+
 // ── DER helpers + hand-crafted X.509 certificate for parser tests ──────────
 
 function derLen(n: number): number[] {

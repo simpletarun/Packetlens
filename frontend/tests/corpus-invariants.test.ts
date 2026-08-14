@@ -153,6 +153,14 @@ async function audit(file: string, display: string) {
     `${display}: threats unique by (rule, src, dst) (${threatKeys.length} threats)`,
   ).toBe(true)
   expect.soft(a1.job.alerts === a1.threats.length, `${display}: job.alerts mirrors threat count`).toBe(true)
+  expect.soft(
+    a1.threats.every((t) => (t.packetNums ?? []).every((n) => Number.isInteger(n) && n >= 1)),
+    `${display}: threat packetNums are valid packet numbers`,
+  ).toBe(true)
+  expect.soft(
+    a1.threats.filter((t) => t.payloadConfirmed).every((t) => ["HTTP-CREDS-001", "CRED-LEAK-001"].includes(t.ruleId)),
+    `${display}: payloadConfirmed only on payload-derived findings`,
+  ).toBe(true)
   let flowPkts = 0, flowBytes = 0
   const flowKeys = new Set<string>()
   for (const f of a1.flows) {
