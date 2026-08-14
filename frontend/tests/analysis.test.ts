@@ -315,6 +315,39 @@ describe("timestamp robustness — long captures, multi-day timeline", () => {
   })
 })
 
+describe("large-capture safety — exact integer counters, no RangeError", () => {
+  it("50k packets across 100 flows analyze without spread-overflow or counter drift", () => {
+    const packets: ParsedPacket[] = []
+    let bytes = 0
+    for (let i = 0; i < 50_000; i++) {
+      const f = i % 100
+      const p = makePacket({
+        num: i + 1,
+        timestamp: 1_700_000_000 + i / 10,
+        length: 1500,
+        srcIp: `10.0.${Math.floor(f / 10)}.${f % 10 + 1}`,
+        dstIp: "8.8.8.8",
+        srcPort: 10000 + f,
+        dstPort: 443,
+        tcpFlags: "ACK",
+        protocol: "TCP",
+      })
+      packets.push(p)
+      bytes += 1500
+    }
+    const a = analyzePcap({
+      packets,
+      stats: { totalPackets: packets.length, totalBytes: bytes, duration: 4999.9, startTime: 1_700_000_000, endTime: 1_700_004_999, protocols: { TCP: packets.length }, linkTypes: [1], decodedPackets: packets.length },
+    })
+    expect(a.job.totalPackets).toBe(50_000)
+    expect(a.job.totalFlows).toBe(100)
+    expect(a.flows.length).toBe(100)
+    expect(Number.isSafeInteger(a.flows.reduce((s, f) => s + f.bytesTotal, 0))).toBe(true)
+    expect(a.flows.reduce((s, f) => s + f.bytesTotal, 0)).toBe(50_000 * 1500)
+    expect(a.packets.length).toBe(50_000)
+  })
+})
+
 describe("Analysis engine", () => {
   it("analyzes an empty capture", () => {
     const result: PCAPResult = {

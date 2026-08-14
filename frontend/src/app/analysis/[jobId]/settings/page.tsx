@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react"
 import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
+import { formatBytes } from "@/lib/map-data"
 import { useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -30,9 +31,7 @@ interface GeoDbStatus {
 }
 
 function formatSize(b: number): string {
-  if (b >= 1048576) return `${(b / 1048576).toFixed(1)} MB`
-  if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`
-  return `${b} B`
+  return formatBytes(b)
 }
 
 // Poll loop shared by the mount effect and the Retry button: re-arming it
