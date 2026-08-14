@@ -1,5 +1,6 @@
 import { PCAPResult, ParsedPacket, tlsCipherSuiteName } from './pcap'
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, RISK_PARAMS } from './risk'
+import { captureRates, CaptureRates } from './metrics'
 
 export const ANALYZER_VERSION = "3.2.0"
 
@@ -141,6 +142,9 @@ interface AnalysisJob {
   sha256?: string
   sha1?: string
   md5?: string
+  /** VALID / SINGLE_PACKET / ZERO_DURATION / EMPTY — drives the verdict and
+   *  whether rate metrics exist. */
+  captureQuality?: string
 }
 
 interface FileInfo {
@@ -165,8 +169,12 @@ export interface BurstInfo {
 }
 
 export interface AnalysisAdvancedMetrics {
-  throughputAvg: number
-  throughputPeak: number
+  /** Canonical capture metrics (see metrics.ts). Every renderer reads rates
+   *  from here; avg/peak throughput below are derived copies. */
+  rates: CaptureRates
+  /** null = no time interval (single packet / zero duration) — show N/A. */
+  throughputAvg: number | null
+  throughputPeak: number | null
   burst: BurstInfo | null
   beaconDetected: boolean
   dnsTunnelingSuspected: boolean
@@ -1322,14 +1330,17 @@ function deriveBandwidth(packets: ParsedPacket[], localIps: ReadonlySet<string>)
 }
 
 function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threats: AnalysisThreat[], localIps: ReadonlySet<string>): AnalysisAdvancedMetrics {
-  // Scan for min/max timestamps: Math.max(...raw.map()) spreads overflow the
-  // call stack on captures with hundreds of thousands of packets.
-  let firstTs = 0, lastTs = 0
+  // Canonical duration + rates (see metrics.ts): a single packet or identical
+  // timestamps have NO time interval — rates are null (N/A), never fabricated
+  // with a >= 1 s fallback denominator (QA: 1-SYN capture showed 66 B/s).
+  const rates = captureRates(raw)
+  const duration = rates.durationSec ?? 0
+  // Bucket base for the burst scan: the earliest timestamp (same convention
+  // as captureRates, so peakBps and the burst scan measure the same seconds).
+  let firstTs = 0
   for (const p of raw) {
     if (firstTs === 0 || p.timestamp < firstTs) firstTs = p.timestamp
-    if (p.timestamp > lastTs) lastTs = p.timestamp
   }
-  const duration = Math.max(raw.length > 0 ? lastTs - firstTs : 1, 1)
 
   let totalBytesOut = 0
   let totalBytesIn = 0
@@ -1375,7 +1386,8 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     else if (dir === 0) totalBytesIn += bytes
   }
 
-  const throughputAvg = duration > 0 ? (totalBytesOut + totalBytesIn) / duration : 0
+  const throughputAvg = rates.avgBps
+  const throughputPeak = rates.peakBps
 
   // Per-second throughput buckets — real peak, not the fabricated avg*3.
   // Direction is tracked separately so a download spike can be told apart
@@ -1389,17 +1401,21 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     buckets.set(sec, (buckets.get(sec) || 0) + p.length)
     if (wanDir(p.srcIp, p.dstIp) === 1) outBuckets.set(sec, (outBuckets.get(sec) || 0) + p.length)
   }
-  let throughputPeak = 0
-  for (const b of buckets.values()) if (b > throughputPeak) throughputPeak = b
 
+  // Burst = NOT EVALUABLE (null) when no time interval exists: a single
+  // packet or identical timestamps have no rate to spike against. Never
+  // evaluate a burst over a fabricated 1 s interval (QA: 66 B/s one-packet).
   const burst = (() => {
-    if (totalBytesOut + totalBytesIn <= 10000 || buckets.size < 2) {
-      return { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: 0, start: 0, end: 0, duration: 0, outboundDominant: totalBytesOut >= totalBytesIn } satisfies BurstInfo
+    if (rates.durationSec === null || totalBytesOut + totalBytesIn <= 10000 || rates.bucketCount < 2) {
+      return null
     }
-    const threshold = throughputAvg * 2
-    const detected = throughputPeak > threshold
+    // Guarded above: a VALID capture always has numeric rates.
+    const avg = throughputAvg!
+    const peak = throughputPeak!
+    const threshold = avg * 2
+    const detected = peak > threshold
     if (!detected) {
-      return { detected: false, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start: 0, end: 0, duration: 0, outboundDominant: totalBytesOut >= totalBytesIn } satisfies BurstInfo
+      return { detected: false, peakThroughput: peak, averageThroughput: avg, ratio: peak / Math.max(avg, 1), start: 0, end: 0, duration: 0, outboundDominant: totalBytesOut >= totalBytesIn } satisfies BurstInfo
     }
     // Window = the contiguous run containing the PEAK second. The banner's
     // ratio is peak/average, so a window elsewhere would label the spike
@@ -1422,7 +1438,7 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     let totalWindow = 0
     for (let s = start; s <= end; s++) totalWindow += buckets.get(s) ?? 0
     const outboundDominant = totalWindow > 0 && outBytes >= totalWindow / 2
-    return { detected: true, peakThroughput: throughputPeak, averageThroughput: throughputAvg, ratio: throughputPeak / Math.max(throughputAvg, 1), start, end, duration: bestLen, outboundDominant } satisfies BurstInfo
+    return { detected: true, peakThroughput: peak, averageThroughput: avg, ratio: peak / Math.max(avg, 1), start, end, duration: bestLen, outboundDominant } satisfies BurstInfo
   })()
 
   // Beaconing: repeated connections to the same host at a regular cadence.
@@ -1620,8 +1636,9 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   }
 
   return {
-    throughputAvg: Math.round(throughputAvg),
-    throughputPeak: Math.round(throughputPeak),
+    rates,
+    throughputAvg: rates.avgBps === null ? null : Math.round(rates.avgBps),
+    throughputPeak: rates.peakBps === null ? null : Math.round(rates.peakBps),
     burst,
     beaconDetected,
     dnsTunnelingSuspected,
@@ -1765,7 +1782,8 @@ const job: AnalysisJob = {
       buildRiskInputs(threats),
       burstConfidenceBoost(advancedMetrics)
     ),
-    captureDuration: stats.duration,
+    captureDuration: advancedMetrics.rates.durationSec ?? 0,
+    captureQuality: advancedMetrics.rates.quality,
     createdAt: new Date((stats.startTime || raw[0]?.timestamp || 0) * 1000).toISOString(),
   }
 

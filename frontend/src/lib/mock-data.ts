@@ -465,6 +465,9 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
     .sort((a, b) => (b[1].bytesOut + b[1].bytesIn) - (a[1].bytesOut + a[1].bytesIn))
     .slice(0, 2)
   return {
+    // Canonical capture metrics (same shape the real engine emits): the mock
+    // has real timestamps, so it is always VALID with numeric rates.
+    rates: { quality: "VALID", durationSec: duration, avgPacketsSec: _mockPackets.length / duration, avgBps: throughputAvg, peakBps: throughputPeak, bucketCount: buckets.size },
     throughputAvg,
     throughputPeak,
     burst,

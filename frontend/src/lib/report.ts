@@ -342,6 +342,10 @@ export interface ReportAnalysis {
     ruleVersion?: string
     riskSpecVersion?: string
     analysisDurationSec?: number
+    /** Capture quality (VALID/SINGLE_PACKET/ZERO_DURATION/EMPTY) + whether
+     *  rate metrics exist — the report shows N/A when they do not. */
+    captureQuality?: string
+    ratesAvailable?: boolean
   }
 }
 
@@ -653,8 +657,12 @@ export function bucketOverlapSec(label: string, captureStartSec: number, capture
 export function buildBandwidth(
   packets: Array<{ timestamp: string | number }>,
   storeBandwidth: BandwidthPoint[],
-  durationSec: number
+  durationSec: number | null
 ): { time: string; in: number; out: number }[] {
+  // No time interval (single packet / zero duration): rates do not exist.
+  // An empty series is honest — a 1-packet chart divided by a fabricated
+  // interval would draw a fake per-second rate (QA: 66 B/s one-packet peak).
+  if (durationSec === null || durationSec <= 0) return []
   if (durationSec > 600 && storeBandwidth.length >= 2) {
     const [start, end] = packetSpanSec(packets)
     return storeBandwidth.map((b) => ({
@@ -1152,13 +1160,17 @@ export function buildFlowsCsv(
 
 // Analyst Conclusion wording — the verdict must NEVER claim the capture is
 // clean while confirmed findings exist (QA: never_end.pcapng reported 1 High
-// alert + IOC yet concluded "No suspicious indicators were detected").
+// alert + IOC yet concluded "No suspicious indicators were detected"), and a
+// capture without a measurable time interval (single packet / zero duration)
+// has NO rate or burst evidence — "insufficient evidence", not proof of
+// safety (QA: 1-SYN capture concluded clean).
 export function analystConclusion(opts: {
   undecodable: boolean
   decodeRatePct: number
   encapName: string
   alerts: { signature: string }[]
   score: number
+  quality?: string
 }): string {
   if (opts.undecodable) {
     return `Only ${opts.decodeRatePct}% of packets could be decoded — the capture uses unsupported encapsulation (${opts.encapName}), so lengths and timestamps parsed but no headers did. No verdict is possible on undecodable traffic; re-capture with Ethernet encapsulation (or an explicit DLT override) and re-analyze.`
@@ -1166,24 +1178,31 @@ export function analystConclusion(opts: {
   if (opts.alerts.length > 0) {
     return `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${opts.alerts[0].signature}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
   }
+  // 0 alerts on a VALID capture: no configured rule triggered. This is not
+  // "proven safe" — it is clean under the configured rules only.
+  if (opts.quality && opts.quality !== "VALID") {
+    return `No configured detection rules triggered, but the capture provides insufficient evidence (${opts.quality.toLowerCase().replace("_", " ")}): rate analysis, burst detection, and behavioral detection were not possible. This is NOT proof of safety — collect a longer capture and re-analyze.`
+  }
   if (opts.score >= 70) {
     return "Significant malicious activity was detected. Prioritize immediate remediation and incident response."
   }
   if (opts.score >= 40) {
     return "Suspicious or anomalous behavior was detected. Review the findings above and apply the recommended mitigations."
   }
-  return "No suspicious indicators were detected by the configured detection rules. The capture is considered clean under those rules; continue routine monitoring."
+  return "No configured detection rules triggered on this capture; under those rules no findings were confirmed. Continue routine monitoring."
 }
 
 export function buildReportAnalysis(state: ReportState): ReportAnalysis {
   const { job, jobInfo, alerts, packets, flows, sessions, tls, http, timeline, bandwidth, advancedMetrics } = state
-  // Duration driven by real packet timestamps (matches the report page + the
-  // engine's min/max); the rounded job summary is only a fallback. No 1 s
-  // floor: a sub-second capture's rates must divide by its true duration,
-  // or Avg Throughput reads ~2.4x low (QA: 80 KB/s shown for 190 KB/s real).
-  const durationSec = packets.length > 1
-    ? Math.max(packetSpanSec(packets)[1] - packetSpanSec(packets)[0], 0.001)
-    : (job?.captureDuration ?? 1)
+  // Duration from the CANONICAL metrics engine (real min/max packet span,
+  // null when no time interval exists — single packet or identical
+  // timestamps). Never fabricated with a 0.001 s / 1 s fallback denominator:
+  // a one-packet capture has no rates, and the report must show N/A
+  // (QA: 1-SYN capture showed 66 B/s average over a fake 1 s interval).
+  // Fixtures built without the engine's rates field fall back to the real
+  // packet span (never a rounded job summary).
+  const durationSec = advancedMetrics?.rates?.durationSec ??
+    (packets.length > 1 ? (() => { const [a, b] = packetSpanSec(packets); return b - a > 0 ? b - a : null })() : null)
 
   const risk = buildReportRisk(alerts, advancedMetrics)
   const groups = groupAlerts(alerts)
@@ -1301,7 +1320,7 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
     iocs,
     mitre,
     recommendations,
-    timeline: buildTimeline(packets, timeline, durationSec),
+    timeline: buildTimeline(packets, timeline, durationSec ?? 0),
     bandwidth: buildBandwidth(packets, bandwidth, durationSec),
     alertTraffic,
     emptyReasons,
@@ -1312,6 +1331,11 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
       ruleVersion: jobInfo.ruleVersion,
       riskSpecVersion: jobInfo.riskSpecVersion || RISK_SPEC_VERSION,
       analysisDurationSec,
+      // Capture quality + rate availability (canonical metrics engine):
+      // SINGLE_PACKET / ZERO_DURATION captures have null rates and the report
+      // must render N/A, never a fabricated number.
+      captureQuality: advancedMetrics?.rates?.quality,
+      ratesAvailable: durationSec !== null,
     },
   }
 }

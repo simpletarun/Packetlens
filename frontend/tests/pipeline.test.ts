@@ -110,15 +110,15 @@ describe("end-to-end pipeline on testing.pcapng", () => {
     })
     expect(stats.devices).toBe(localDevices)
 
-    // Throughput: report avg (total bytes / capture span) and the advanced
-    // metric agree — the old pair 402.8 vs 404.6 KB/s came from dividing by
-    // two different durations. throughputAvg is the WAN-crossing rate
-    // (private↔public bytes only), so LAN↔LAN chatter (router DNS replies,
-    // ARP, probes) is excluded from both sides of the comparison.
-    const wanBytes = analysis.packets.reduce(
-      (s, p) => s + ((isPrivateIP(p.srcIp) !== isPrivateIP(p.dstIp) && p.srcIp !== "\u2014" && p.dstIp !== "\u2014") ? p.length : 0),
-      0)
-    expect(Math.abs(wanBytes / duration - analysis.advancedMetrics.throughputAvg)).toBeLessThan(1)
+    // Throughput: the engine's canonical avg divides total bytes by the rate
+    // window = max(real span, covered seconds), so it can never exceed the
+    // peak bucket (QA: Teardrop 914 B/s avg vs 764 B/s peak on dense short
+    // captures). This is the single number the report page renders.
+    const total = analysis.packets.reduce((s, p) => s + p.length, 0)
+    const rates = analysis.advancedMetrics.rates
+    const rateWindow = Math.max(rates.durationSec ?? duration, rates.bucketCount)
+    expect(Math.abs(total / rateWindow - (analysis.advancedMetrics.throughputAvg ?? 0))).toBeLessThan(1)
+    expect(analysis.advancedMetrics.throughputAvg!).toBeLessThanOrEqual(analysis.advancedMetrics.throughputPeak!)
 
     // Port services: previously-unlabeled well-known ports resolve.
     expect(portServiceName(7, "TCP")).toBe("Echo")

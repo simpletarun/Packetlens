@@ -317,26 +317,29 @@ export default function ReportsPage() {
 
   const bwStats = bandwidthStats(report.bandwidth)
   // Peak of per-second bandwidth (report.bandwidth is already in /s units);
-  // advancedMetrics carries the same peak when present.
-  const peakBandwidth = report.bandwidth.length ? Math.max(...report.bandwidth.map((b) => b.in + b.out)) : (advancedMetrics?.throughputPeak ?? 0)
+  // advancedMetrics carries the same peak when present. A capture without a
+  // time interval (single packet / zero duration) has NO rates — null, not 0.
+  const peakBandwidth = report.bandwidth.length ? Math.max(...report.bandwidth.map((b) => b.in + b.out)) : (advancedMetrics?.throughputPeak ?? null)
 
-  // Duration derived from real packet timestamps. This is the number every
-  // rate/duration label uses; job.captureDuration (the engine summary) is
-  // only a fallback when no packets are loaded. No 1 s floor: sub-second
-  // captures must divide rates by their true duration (QA: an 0.42 s capture
-  // showed 80 KB/s where the real average is 190 KB/s).
-  const durationSec = captureClock.start && captureClock.end
-    ? Math.max((captureClock.end.getTime() - captureClock.start.getTime()) / 1000, 0.001)
-    : Math.max(job?.captureDuration ?? 1, 1)
+  // Duration from the CANONICAL metrics engine (real min/max packet span);
+  // null = no time interval (single packet / zero duration) — rates are N/A,
+  // never a fabricated 0.001 s / 1 s denominator (QA: 1-SYN capture showed
+  // 66 B/s average over a fake 1 s interval).
+  const durationSec = advancedMetrics?.rates?.durationSec ?? null
+  const ratesAvailable = durationSec !== null
 
   // The label must describe the divisor the data was actually divided by:
   // clock-aligned 5-min buckets on long captures, binWidthSec rebins on
   // short ones (QA: a mid-5-min capture read "288-second" while values were
   // divided by 300).
-  const bwInterval = job && report.bandwidth.length >= 2
+  const bwInterval = job && report.bandwidth.length >= 2 && durationSec !== null
     ? (durationSec > 600 ? 300 : binWidthSec(durationSec))
     : null
   const bwIntervalLabel = bwInterval ? (Number.isInteger(bwInterval) ? `${bwInterval}-second` : `${bwInterval.toFixed(1)}-second`) : "capture"
+
+  // Rate formatting: no time interval -> N/A, never a fabricated number.
+  const rateLabel = (bps: number | null) => (bps === null ? "N/A" : formatBytes(bps) + "/s")
+  const durLabel = (sec: number | null) => (sec === null ? "—" : formatDuration(sec))
 
   // Query packets only (QR=0). Responses echo the question name in the header
   // and come back from the resolver, so they are packets, not queries.
@@ -463,6 +466,10 @@ export default function ReportsPage() {
     encapName: dltName(linkTypes),
     alerts: report.alerts,
     score: scoreVal,
+    // Capture quality from the canonical metrics engine: a capture without a
+    // measurable time interval (single packet / zero duration) yields an
+    // INSUFFICIENT EVIDENCE verdict — never "clean" (QA: 1-SYN capture).
+    quality: advancedMetrics?.rates?.quality,
   })
 
   const handleExport = () => {
@@ -506,7 +513,7 @@ export default function ReportsPage() {
         ["Flows", stats.totalFlows.toLocaleString()],
         ["Sessions", stats.sessions.toLocaleString()],
         ["Local Devices", stats.devices.toLocaleString()],
-        ["Duration", formatDuration(durationSec)],
+        ["Duration", durLabel(durationSec)],
         ["Risk score", riskValue()],
       ]),
       "",
@@ -515,7 +522,7 @@ export default function ReportsPage() {
       `- **Capture file:** \`${job.filename}\`` + (job.sha256 ? `\n- **SHA256:** \`${job.sha256}\`` : "") + (job.sha1 ? `\n- **SHA1:** \`${job.sha1}\`` : "") + (job.md5 ? `\n- **MD5:** \`${job.md5}\`` : ""),
       `- **File size:** ${formatBytes(job.fileSize)}`,
       `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
-      `- **Duration:** ${formatDuration(durationSec)} · Risk score: ${riskValue()}`,
+      `- **Duration:** ${durLabel(durationSec)} · Risk score: ${riskValue()}`,
       `- **Alerts:** ${report.alerts.length} (${severityCounts(report.alerts)})`,
       "",
       "## Traffic",
@@ -624,7 +631,7 @@ export default function ReportsPage() {
                   {job.sha1 && <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>SHA1</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{job.sha1}</td></tr>}
                   {job.md5 && <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>MD5</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{job.md5}</td></tr>}
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Packets</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{stats.totalPackets.toLocaleString()}</td></tr>
-                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Duration</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{formatDuration(durationSec)}</td></tr>
+                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Duration</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{durLabel(durationSec)}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Risk Score</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{riskValue()}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Generated</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{new Date().toISOString().slice(0, 10)}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Build</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{BUILD_STAMP}</td></tr>
@@ -639,7 +646,7 @@ export default function ReportsPage() {
               <SectionTitle icon={FileText} title="1. Executive Summary" />
               <Card>
                 <CardContent className="text-sm text-muted-foreground space-y-2 pt-6">
-                  <p>Report generated for <strong>{job.filename}</strong>, containing <strong>{stats.totalPackets.toLocaleString()}</strong> packets over <strong>{formatDuration(durationSec)}</strong>. File: <strong>{formatBytes(job.fileSize)}</strong>, payload: <strong>{formatBytes(totalBytes)}</strong>.</p>
+                  <p>Report generated for <strong>{job.filename}</strong>, containing <strong>{stats.totalPackets.toLocaleString()}</strong> packets over <strong>{durLabel(durationSec)}</strong>. File: <strong>{formatBytes(job.fileSize)}</strong>, payload: <strong>{formatBytes(totalBytes)}</strong>.</p>
                   {undecodable ? (
                     <p><strong>{stats.totalFlows}</strong> undecodable traffic bucket{stats.totalFlows === 1 ? "" : "s"} — no endpoints were parsed (unsupported encapsulation).</p>
                   ) : (
@@ -664,7 +671,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={Package} title="2. Traffic Summary" sub={`${stats.totalPackets.toLocaleString()} packets over ${formatDuration(durationSec)}`} />
+              <SectionTitle icon={Package} title="2. Traffic Summary" sub={`${stats.totalPackets.toLocaleString()} packets over ${durLabel(durationSec)}`} />
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 {[
                   { label: "Total Packets", value: stats.totalPackets.toLocaleString(), icon: Package, color: "text-info" },
@@ -682,7 +689,7 @@ export default function ReportsPage() {
                   { label: "Certificates", value: certificates.length.toLocaleString(), icon: Verified, color: "text-chart-2" },
                   { label: "Alerts", value: alerts.length.toLocaleString(), icon: AlertTriangle, color: "text-danger" },
                   { label: "Risk Score", value: riskValue(), icon: AlertTriangle, color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))) },
-                  { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: formatBytes(peakBandwidth) + "/s", icon: BarChart3, color: "text-chart-2" },
+                  { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
                   { label: "Avg Packet Size", value: avgPacketBytes + " B", icon: Package, color: "text-muted-foreground" },
                 ].map(({ label, value, color }) => (
                   <Card key={label}>
@@ -715,14 +722,14 @@ export default function ReportsPage() {
                       {[
                         { label: "File", value: job.filename },
                         { label: "Size", value: formatBytes(job.fileSize) },
-                        { label: "Duration", value: formatDuration(durationSec) },
+                        { label: "Duration", value: durLabel(durationSec) },
                         { label: "Capture Start", value: fmtDateTime(captureClock.start) },
                         { label: "Capture End", value: fmtDateTime(captureClock.end) },
                         { label: "Total Bytes", value: formatBytes(totalBytes) },
-                        { label: "Avg Packets/s", value: (packets.length / durationSec).toFixed(1) },
-                        { label: "Avg Throughput", value: formatBytes(totalBytes / durationSec) + "/s" },
+                        { label: "Avg Packets/s", value: ratesAvailable ? (packets.length / durationSec).toFixed(1) : "N/A" },
+                        { label: "Avg Throughput", value: advancedMetrics ? rateLabel(advancedMetrics.throughputAvg) : "N/A" },
                         { label: "Avg Packet Size", value: avgPacketBytes + " bytes" },
-                        { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: formatBytes(peakBandwidth) + "/s" },
+                        { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: rateLabel(peakBandwidth) },
                         { label: "Source IPs", value: uniqueSrcIps.toLocaleString() },
                         { label: "Dest IPs", value: uniqueDstIps.toLocaleString() },
                       ].map(({ label, value }) => (
@@ -1418,7 +1425,7 @@ export default function ReportsPage() {
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
                             <div className="text-[10px]">({(count / packets.length * 100).toFixed(1)}%)</div>
-                            <div className="text-[10px]">avg {formatBytes(bytes / durationSec)}/s</div>
+                            <div className="text-[10px]">avg {ratesAvailable ? formatBytes(bytes / durationSec) + "/s" : "N/A"}</div>
                           </div>
                         </div>
                       )
@@ -1443,7 +1450,7 @@ export default function ReportsPage() {
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
                             <div className="text-[10px]">({(count / packets.length * 100).toFixed(1)}%)</div>
-                            <div className="text-[10px]">avg {formatBytes(bytes / durationSec)}/s</div>
+                            <div className="text-[10px]">avg {ratesAvailable ? formatBytes(bytes / durationSec) + "/s" : "N/A"}</div>
                           </div>
                         </div>
                       )
@@ -1460,8 +1467,8 @@ export default function ReportsPage() {
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     {[
                       { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle },
-                      { label: "Throughput Avg", value: formatBytes(totalBytes / durationSec) + "/s", color: "text-info", icon: BarChart3 },
-                      { label: "Throughput Peak (instantaneous)", value: formatBytes(advancedMetrics.throughputPeak) + "/s", color: "text-chart-2", icon: BarChart3 },
+                      { label: "Throughput Avg", value: rateLabel(advancedMetrics.throughputAvg), color: "text-info", icon: BarChart3 },
+                      { label: "Throughput Peak (instantaneous)", value: rateLabel(advancedMetrics.throughputPeak), color: "text-chart-2", icon: BarChart3 },
                        { label: "Burst", value: advancedMetrics.burst?.detected ? "Detected" : "Not Detected", color: advancedMetrics.burst?.detected ? "text-danger" : "text-success", icon: Zap, sub: advancedMetrics.burst?.detected ? `${advancedMetrics.burst.ratio.toFixed(1)}× average · ${advancedMetrics.burst.duration.toFixed(1)} s` : undefined },
                     ].map(({ label, value, color, icon: Icon, sub }) => (
                       <Card key={label}>
@@ -1490,8 +1497,8 @@ export default function ReportsPage() {
                     <CardHeader><CardTitle className="text-sm">Throughput Statistics</CardTitle></CardHeader>
                     <CardContent className="space-y-1 text-xs">
                       {[
-                        { label: "Average", value: formatBytes(totalBytes / durationSec) + "/s" },
-                        { label: "Peak", value: formatBytes(advancedMetrics.throughputPeak) + "/s" },
+                        { label: "Average", value: rateLabel(advancedMetrics.throughputAvg) },
+                        { label: "Peak", value: rateLabel(advancedMetrics.throughputPeak) },
                         { label: `Minimum (${bwIntervalLabel} interval)`, value: bwStats.min === null ? "—" : formatBytes(bwStats.min) + "/s" },
                         { label: `Median (${bwIntervalLabel} interval)`, value: bwStats.median === null ? "—" : formatBytes(bwStats.median) + "/s" },
                         { label: `95th percentile (${bwIntervalLabel} interval)`, value: bwStats.p95 === null ? "—" : formatBytes(bwStats.p95) + "/s" },
@@ -1807,7 +1814,7 @@ export default function ReportsPage() {
                       {job.sha1 && <p><strong>SHA1:</strong> <span className="font-mono text-xs break-all">{job.sha1}</span></p>}
                       {job.md5 && <p><strong>MD5:</strong> <span className="font-mono text-xs">{job.md5}</span></p>}
                       <p><strong>Packets:</strong> {stats.totalPackets.toLocaleString()} · <strong>Flows:</strong> {stats.totalFlows.toLocaleString()} · <strong>Sessions:</strong> {stats.sessions.toLocaleString()} · <strong>Local Devices:</strong> {stats.devices.toLocaleString()}</p>
-                      <p><strong>Duration:</strong> {formatDuration(durationSec)} · <strong>External IPs:</strong> {stats.externalIps} · <strong>Countries:</strong> {countriesLabel(stats.countries, stats.externalIps)}</p>
+                      <p><strong>Duration:</strong> {durLabel(durationSec)} · <strong>External IPs:</strong> {stats.externalIps} · <strong>Countries:</strong> {countriesLabel(stats.countries, stats.externalIps)}</p>
                       <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"}</p>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>

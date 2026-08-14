@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import type { BurstInfo } from "@/lib/analysis"
+import type { CaptureRates } from "@/lib/metrics"
 import type { GeoLocation } from "@/lib/geo"
 import { computeStats, AnalysisStats } from "@/lib/stats"
 
@@ -146,8 +147,11 @@ export interface BandwidthPoint {
 }
 
 export interface AdvancedMetrics {
-  throughputAvg: number
-  throughputPeak: number
+  /** Canonical rates/duration from the metrics engine; null avg/peak = no
+   *  time interval (single packet / zero duration) — render N/A. */
+  rates?: CaptureRates
+  throughputAvg: number | null
+  throughputPeak: number | null
   burst: BurstInfo | null
   beaconDetected: boolean
   dnsTunnelingSuspected: boolean

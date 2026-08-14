@@ -32,7 +32,9 @@ describe("Analysis engine", () => {
     expect(analysis.packets.length).toBe(0)
     expect(analysis.flows.length).toBe(0)
     expect(analysis.threats.length).toBe(0)
-    expect(analysis.advancedMetrics.throughputAvg).toBe(0)
+    // EMPTY capture: no time interval -> canonical rates are null (N/A).
+    expect(analysis.advancedMetrics.rates.quality).toBe("EMPTY")
+    expect(analysis.advancedMetrics.throughputAvg).toBeNull()
     expect(analysis.advancedMetrics.iocs.length).toBe(0)
   })
 
@@ -83,7 +85,7 @@ describe("Analysis engine", () => {
     for (let i = 0; i < 10; i++) {
       // WAN crossing (private→public): throughput is the LAN↔internet rate;
       // LAN↔LAN chatter is not internet throughput and must not inflate it.
-      packets.push(makePacket({ num: i + 1, length: 1000, dstIp: "8.8.8.8", dstPort: 443 }))
+      packets.push(makePacket({ num: i + 1, timestamp: 1000000 + i, length: 1000, dstIp: "8.8.8.8", dstPort: 443 }))
     }
     const result: PCAPResult = {
       packets,

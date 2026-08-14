@@ -250,10 +250,42 @@ async function audit(file: string, display: string) {
   const conclusion = analystConclusion({
     undecodable: false, decodeRatePct: 100, encapName: "Ethernet",
     alerts: report?.alerts ?? [], score: j.riskScore,
+    quality: a1.advancedMetrics.rates?.quality,
   })
   expect.soft(
     (report?.alerts.length ?? 0) === 0 || conclusion.includes("NOT clean"),
     `${display}: verdict acknowledges findings (${conclusion.slice(0, 60)})`,
+  ).toBe(true)
+  // 0 alerts on a capture without a time interval: INSUFFICIENT EVIDENCE,
+  // never a "clean" verdict (QA: 1-SYN capture concluded clean).
+  if ((report?.alerts.length ?? 0) === 0 && a1.advancedMetrics.rates?.quality && a1.advancedMetrics.rates.quality !== "VALID") {
+    expect.soft(conclusion.includes("insufficient evidence"), `${display}: non-VALID zero-alert capture concludes insufficient evidence (${conclusion.slice(0, 80)})`).toBe(true)
+  }
+
+  // Canonical capture metrics (metrics.ts): the engine's rates are the ONLY
+  // numbers the report may divide by. On a capture without a time interval
+  // (single packet / zero duration) the rates MUST be null and the report
+  // must produce NO bandwidth series (QA: a 1-SYN capture reported 66 B/s).
+  const q = a1.advancedMetrics.rates
+  expect.soft(q, `${display}: advancedMetrics.rates present`).toBeTruthy()
+  if (q) {
+    if (q.quality === "VALID") {
+      expect.soft(q.durationSec! > 0, `${display}: VALID duration > 0`).toBe(true)
+      expect.soft(q.avgPacketsSec!, `${display}: VALID avgPacketsSec`).toBeGreaterThan(0)
+      expect.soft(q.avgBps!, `${display}: VALID avgBps`).toBeGreaterThan(0)
+      expect.soft(q.avgBps!, `${display}: avg <= peak BY CONSTRUCTION`).toBeLessThanOrEqual(q.peakBps!)
+    } else {
+      expect.soft(q.durationSec === null && q.avgBps === null && q.avgPacketsSec === null && q.peakBps === null, `${display}: ${q.quality} has null rates`).toBe(true)
+    }
+    expect.soft(a1.advancedMetrics.burst === null || q.quality === "VALID", `${display}: burst only when VALID`).toBe(true)
+  }
+  expect.soft(
+    q === undefined || q.quality === "VALID" ? true : (report?.bandwidth.length ?? 1) === 0,
+    `${display}: no bandwidth series without a time interval`,
+  ).toBe(true)
+  expect.soft(
+    (report?.metadata.ratesAvailable ?? true) || report?.bandwidth.length === 0,
+    `${display}: ratesAvailable consistent`,
   ).toBe(true)
 }
 

@@ -824,8 +824,20 @@ describe("analystConclusion � the verdict must never call a capture clean whil
     expect(text).toContain("2 confirmed findings detected (A)")
   })
 
-  it("keeps the clean wording only when there are zero alerts and a low score", () => {
-    expect(analystConclusion({ ...base, score: 39 })).toContain("No suspicious indicators")
+  it("uses the configured-rules wording when zero alerts fire and no score-driven branch matches", () => {
+    expect(analystConclusion({ ...base, score: 39 })).toContain("No configured detection rules triggered")
+    expect(analystConclusion({ ...base, score: 39 })).not.toContain("clean")
+  })
+
+  it("INSUFFICIENT EVIDENCE when the capture has no measurable time interval", () => {
+    const text = analystConclusion({ ...base, quality: "SINGLE_PACKET" })
+    expect(text).toContain("insufficient evidence")
+    expect(text).toContain("NOT proof of safety")
+    expect(text).not.toContain("clean")
+  })
+
+  it("a VALID capture with zero alerts keeps the standard conclusion", () => {
+    expect(analystConclusion({ ...base, quality: "VALID" })).toContain("No configured detection rules triggered")
   })
 
   it("keeps score-based wording when no alerts fired", () => {
