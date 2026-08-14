@@ -541,7 +541,7 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
       p("1.2.3.4", "10.0.0.5", 443, 12209, "TCP"),
     ]
     const top = servicePortCounts(packets)
-    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0 }])
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0, flows: 1, confirmedFlows: 0 }])
   })
 
   it("applies the same rule to UDP (request and reply legs both count toward UDP/443)", () => {
@@ -553,8 +553,8 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
     ]
     const top = servicePortCounts(packets)
     expect(top).toEqual([
-      { protocol: "UDP", port: 443, count: 2, confirmed: 0 },
-      { protocol: "UDP", port: 53, count: 2, confirmed: 0 },
+      { protocol: "UDP", port: 443, count: 2, confirmed: 0, flows: 1, confirmedFlows: 0 },
+      { protocol: "UDP", port: 53, count: 2, confirmed: 0, flows: 1, confirmedFlows: 0 },
     ])
   })
 
@@ -566,7 +566,8 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
       p("1.2.3.4", "10.0.0.6", 443, 14820, "TCP"),
     ]
     const top = servicePortCounts(packets)
-    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0 }])
+    // Two independent client conversations — the flows count must be 2.
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0, flows: 2, confirmedFlows: 0 }])
   })
 
   it("skips port-less packets (ICMP/GRE/ESP have no srcPort/dstPort)", () => {
@@ -575,7 +576,7 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
       { srcIp: "10.0.0.5", dstIp: "1.2.3.4", srcPort: undefined, dstPort: undefined, protocol: "ICMP" },
     ]
     const top = servicePortCounts(packets)
-    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 1, confirmed: 0 }])
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 1, confirmed: 0, flows: 1, confirmedFlows: 0 }])
   })
 
   it("ranks multiple services by total conversation packets", () => {
@@ -585,8 +586,8 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
       p("10.0.0.5", "8.8.8.8", 23061, 53, "UDP"),
     ]
     const top = servicePortCounts(packets)
-    expect(top[0]).toEqual({ protocol: "TCP", port: 443, count: 2, confirmed: 0 })
-    expect(top[1]).toEqual({ protocol: "UDP", port: 53, count: 1, confirmed: 0 })
+    expect(top[0]).toEqual({ protocol: "TCP", port: 443, count: 2, confirmed: 0, flows: 1, confirmedFlows: 0 })
+    expect(top[1]).toEqual({ protocol: "UDP", port: 53, count: 1, confirmed: 0, flows: 1, confirmedFlows: 0 })
   })
 
   it("handles mid-session captures: a flow whose FIRST packet is a server reply still counts under the known service port", () => {
@@ -601,12 +602,12 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
       p("10.0.0.5", "1.2.3.4", 42224, 443, "TCP"),
     ]
     const top = servicePortCounts(packets)
-    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0 }])
+    expect(top).toEqual([{ protocol: "TCP", port: 443, count: 4, confirmed: 0, flows: 1, confirmedFlows: 0 }])
     expect(top.some((e) => e.port === 42224)).toBe(false)
     expect(top.some((e) => e.port >= 49152)).toBe(false)
   })
 
-  it("excludes P2P conversations between two dynamic-range ports (UDP/57621 gone)", () => {
+it("excludes P2P conversations between two dynamic-range ports (UDP/57621 gone)", () => {
     const packets = [
       p("192.168.1.15", "192.168.1.255", 57621, 57621, "UDP"),
       p("192.168.1.15", "192.168.1.255", 57621, 57621, "UDP"),
@@ -614,12 +615,30 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
     expect(servicePortCounts(packets)).toEqual([])
   })
 
+  it("excludes P2P even when the lower dynamic port is 32768..49151 — both sides ephemeral (testing.pcapng 40714 regression)", () => {
+    // The old rule looked for "both ports >= 49152", so this real capture —
+    // 192.168.137.1:49161 <-> 192.168.137.228:40714 (159 pkts) — leaked a
+    // bogus "TCP/40714" service row. 40714 is inside the app's own
+    // "Dynamic/Ephemeral" 32768..49151 band (ephemeralOrKnown), so the rule
+    // now matches on that band (EPHEMERAL_PORT_MIN = 32768): a=min there
+    // means both are dynamic, hence P2P.
+    const packets = [
+      p("192.168.137.1", "192.168.137.228", 49161, 40714, "TCP"),
+      p("192.168.137.228", "192.168.137.1", 40714, 49161, "TCP"),
+    ]
+    expect(servicePortCounts(packets)).toEqual([])
+    // The same two-port pattern where the known port is BELOW 32768 must
+    // still be attributed to it (RDP 12481 to the phone's 40714 → TCP/12481).
+    const mixed = [p("192.168.137.228", "192.168.137.1", 40714, 12481, "TCP")]
+    expect(servicePortCounts(mixed)[0]).toEqual({ protocol: "TCP", port: 12481, count: 1, confirmed: 0, flows: 1, confirmedFlows: 0 })
+  })
+
   it("attributes mDNS (5353) even when the first packet is the response leg", () => {
     const packets = [
       p("192.168.1.255", "192.168.1.15", 5353, 57621, "UDP"),
       p("192.168.1.15", "192.168.1.255", 57621, 5353, "UDP"),
     ]
-    expect(servicePortCounts(packets)).toEqual([{ protocol: "UDP", port: 5353, count: 2, confirmed: 0 }])
+    expect(servicePortCounts(packets)).toEqual([{ protocol: "UDP", port: 5353, count: 2, confirmed: 0, flows: 1, confirmedFlows: 0 }])
   })
 
   it("prefers the lower port when both endpoints use known service ports", () => {
@@ -627,7 +646,7 @@ describe("servicePortCounts \u2014 conversation-based service-side attribution",
       p("10.0.0.5", "1.2.3.4", 8443, 443, "TCP"),
       p("1.2.3.4", "10.0.0.5", 443, 8443, "TCP"),
     ]
-    expect(servicePortCounts(packets)).toEqual([{ protocol: "TCP", port: 443, count: 2, confirmed: 0 }])
+    expect(servicePortCounts(packets)).toEqual([{ protocol: "TCP", port: 443, count: 2, confirmed: 0, flows: 1, confirmedFlows: 0 }])
   })
 })
 
@@ -719,8 +738,12 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     expect(buildFlowsCsv([flow]).split("\n")[1].split(",")[16]).toBe("DHCPv6")
   })
 
-  it("serviceEvidenceLabel: fully confirmed stays plain, partial carries the verified count, none says port-inferred", () => {
-    expect(serviceEvidenceLabel("STUN", 26, 622)).toBe("STUN (26 of 622 payload-confirmed)")
+  it("serviceEvidenceLabel: fully confirmed stays plain, partial carries the flow counts, none says port-inferred", () => {
+    // Flows — not packets — are the evidence unit: a conversation is
+    // payload-confirmed if ANY of its packets was protocol-verified, so
+    // "N of M flows" is the honest wording next to packet counts (QA:
+    // "8 of 17" vs "17 of 40,864 packets" mixed radixes).
+    expect(serviceEvidenceLabel("STUN", 26, 622)).toBe("STUN (26 of 622 flows payload-confirmed)")
     expect(serviceEvidenceLabel("HTTP-Alt", 0, 20)).toBe("HTTP-Alt (port-inferred)")
     expect(serviceEvidenceLabel("STUN", 622, 622)).toBe("STUN")
   })
@@ -734,9 +757,9 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
       { srcIp: "fe80::1", dstIp: "ff02::1:2", srcPort: 546, dstPort: 547, protocol: "UDP", appProtocol: "DHCPv6" },
     ]
     const top = servicePortCounts(packets)
-    expect(top.find((e) => e.port === 3478)).toEqual({ protocol: "UDP", port: 3478, count: 3, confirmed: 1 })
-    expect(top.find((e) => e.port === 8001)).toEqual({ protocol: "UDP", port: 8001, count: 1, confirmed: 0 })
-    expect(top.find((e) => e.port === 546)).toEqual({ protocol: "UDP", port: 546, count: 1, confirmed: 0 })
+    expect(top.find((e) => e.port === 3478)).toEqual({ protocol: "UDP", port: 3478, count: 3, confirmed: 1, flows: 1, confirmedFlows: 1 })
+    expect(top.find((e) => e.port === 8001)).toEqual({ protocol: "UDP", port: 8001, count: 1, confirmed: 0, flows: 1, confirmedFlows: 0 })
+    expect(top.find((e) => e.port === 546)).toEqual({ protocol: "UDP", port: 546, count: 1, confirmed: 0, flows: 1, confirmedFlows: 0 })
   })
 
   it("buildFlowsCsv: service column uses the canonical known-port rule and port-less N/A", () => {
@@ -753,6 +776,54 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     const lines = csv.split("\n")
     expect(lines[1].split(",")[16]).toBe("STUN")
     expect(lines[2].split(",")[16]).toBe("N/A")
+  })
+
+  it("buildFlowsCsv: rows are initiator-first — a resolver-sorted flow flips to the querying client (DNS QA)", () => {
+    // The flow record is canonical (endpoints sorted), so a DNS conversation
+    // lists the resolver first (192.168.137.1:53 < 192.168.137.228:47942),
+    // but the CSV's Source header must carry the conversation initiator —
+    // the client that sent the first observed query (QA: CSV showed the
+    // resolver as "source").
+    const flows: Flow[] = [
+      { id: "f1", srcIp: "192.168.137.1", dstIp: "192.168.137.228", srcPort: 53, dstPort: 47942, protocol: "UDP", packets: 3, bytesTotal: 300, bytesSent: 100, bytesRecv: 200, duration: 1, startTime: "", endTime: "" },
+    ]
+    const packets = [
+      { srcIp: "192.168.137.228", dstIp: "192.168.137.1", srcPort: 47942, dstPort: 53, protocol: "UDP" },
+      { srcIp: "192.168.137.1", dstIp: "192.168.137.228", srcPort: 53, dstPort: 47942, protocol: "UDP" },
+      { srcIp: "192.168.137.228", dstIp: "192.168.137.1", srcPort: 47942, dstPort: 53, protocol: "UDP" },
+    ]
+    const csv = buildFlowsCsv(flows, new Map(), packets)
+    const cols = csv.split("\n")[1].split(",")
+    expect(cols[0]).toBe("192.168.137.228") // client, the initiator
+    expect(cols[2]).toBe("192.168.137.1")   // resolver
+    expect(cols[6]).toBe("200")             // bytesSent = flow bytesRecv (client leg)
+    expect(cols[7]).toBe("100")             // bytesRecv = flow bytesSent (server leg)
+  })
+
+  it("buildFlowsCsv: TCP initiator comes from the SYN packet, not record order (mid-session server-first QA)", () => {
+    const flows: Flow[] = [
+      { id: "f1", srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", packets: 4, bytesTotal: 400, bytesSent: 250, bytesRecv: 150, duration: 1, startTime: "", endTime: "" },
+    ]
+    // Capture began mid-session: server replies first, then the client's
+    // SYN/SYN-ACK handshake — the SYN's source must win over first-packet.
+    const packets = [
+      { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "ACK" },
+      { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "SYN" },
+      { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "SYN-ACK" },
+      { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "ACK" },
+    ]
+    const cols = buildFlowsCsv(flows, new Map(), packets).split("\n")[1].split(",")
+    expect(cols[0]).toBe("10.0.0.5")        // the SYN sender
+    expect(cols[1]).toBe("42224")
+    expect(cols[2]).toBe("198.51.100.7")
+    expect(cols[6]).toBe("150")             // sent-by-source = flow bytesRecv
+    // Without any SYN the initiator falls back to the first packet's source:
+    // if the capture opens with a server reply (canonical order), the row
+    // keeps canonical order; with NO packets at all there is nothing to
+    // detect, so the canonical order stands unchanged.
+    const noSyn = buildFlowsCsv(flows, new Map(), [{ srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP" }])
+    expect(noSyn.split("\n")[1].split(",")[0]).toBe("198.51.100.7")
+    expect(buildFlowsCsv(flows).split("\n")[1].split(",")[0]).toBe("198.51.100.7")
   })
 
   it("buildFlowsCsv: formula-prefixed cells are defused and embedded commas/quotes are quoted", () => {

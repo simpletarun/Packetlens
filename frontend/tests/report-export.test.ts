@@ -157,8 +157,28 @@ describe("flows CSV artifact — the exported file must mirror the engine flows 
       const f = flows[i]
       const r = rows[i + 1]
       const idx = (ip: string) => (ip === "\u2014" ? "Undecoded/unknown endpoint" : ip)
-      expect.soft(r[0], `${name}: row ${i + 1} srcIp`).toBe(idx(f.srcIp))
-      expect.soft(r[2], `${name}: row ${i + 1} dstIp`).toBe(idx(f.dstIp))
+      // CSV rows are direction-normalized to the conversation INITIATOR
+      // (SYN sender for TCP, else first observed packet; canonical order kept
+      // when the capture began mid-session and the first packet is a reply).
+      // The flow record is canonical (sorted endpoints), so re-derive the
+      // initiator exactly like buildFlowsCsv does.
+      const flowKey = (x: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string }) => {
+        const [a, b] = [x.srcIp, x.dstIp].sort()
+        const pa = x.srcPort !== undefined && x.dstPort !== undefined ? Math.min(x.srcPort, x.dstPort) : undefined
+        const pb = x.srcPort !== undefined && x.dstPort !== undefined ? Math.max(x.srcPort, x.dstPort) : undefined
+        return `${x.protocol}|${a}|${b}|${pa ?? ""}|${pb ?? ""}`
+      }
+      const pkts = a.packets.filter((p) => flowKey(p) === flowKey(f))
+      let flip = false
+      if (!f.directionUnknown) {
+        const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
+        const init = syn ? syn.srcIp : pkts[0]?.srcIp
+        flip = init !== undefined && init !== f.srcIp && init === f.dstIp
+      }
+      const srcIp = flip ? f.dstIp : f.srcIp
+      const dstIp = flip ? f.srcIp : f.dstIp
+      expect.soft(r[0], `${name}: row ${i + 1} srcIp`).toBe(idx(srcIp))
+      expect.soft(r[2], `${name}: row ${i + 1} dstIp`).toBe(idx(dstIp))
       expect.soft(r[4], `${name}: row ${i + 1} protocol`).toBe(f.protocol)
       expect.soft(Number(r[5]), `${name}: row ${i + 1} packets`).toBe(f.packets)
       expect.soft(Number(r[8]), `${name}: row ${i + 1} bytesTotal`).toBe(f.bytesTotal)
@@ -168,8 +188,8 @@ describe("flows CSV artifact — the exported file must mirror the engine flows 
       if (f.directionUnknown) {
         expect.soft(r[6] === "" && r[7] === "" && r[16] === "", `${name}: row ${i + 1} directionUnknown blanks`).toBe(true)
       } else {
-        expect.soft(Number(r[6]), `${name}: row ${i + 1} bytesSent`).toBe(f.bytesSent)
-        expect.soft(Number(r[7]), `${name}: row ${i + 1} bytesRecv`).toBe(f.bytesRecv)
+        expect.soft(Number(r[6]), `${name}: row ${i + 1} bytesSent`).toBe(flip ? f.bytesRecv : f.bytesSent)
+        expect.soft(Number(r[7]), `${name}: row ${i + 1} bytesRecv`).toBe(flip ? f.bytesSent : f.bytesRecv)
         expect.soft(r[16].length > 0, `${name}: row ${i + 1} service`).toBe(true)
       }
       csvBytes += f.bytesTotal

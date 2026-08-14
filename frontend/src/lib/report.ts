@@ -100,13 +100,53 @@ export function countryCountsByDst(
   return counts
 }
 
-// TCP Health RTT caption: rtts empty with TCP flows present means the capture
-// joined mid-session — no SYN-ACK was seen in-window, so no handshake delay
-// could be measured. Say that, not "RTT unavailable".
+// The app's ephemeral/dynamic band. Ports ≥ 32768 are labelled
+// "Dynamic/Ephemeral" (portServiceName); a conversation whose BOTH endpoints
+// sit in this band is P2P between two ephemeral endpoints and is excluded
+// from service attribution (servicePortOf rule 3) — the label band and the
+// exclusion rule must use the SAME threshold or the note ("conversations
+// between two dynamic-range ports are excluded") and the table disagree
+// (QA: UDP/40714 kept 159 pkts from 49161→40714 while both were labelled
+// "Dynamic/Ephemeral").
+const EPHEMERAL_PORT_MIN = 32768
+
+// TCP health RTT summary: median/p95 over the flows that actually produced an
+// rttMs (a SYN/SYN-ACK pair was captured in-window). NOT the mean — a raw
+// mean is dragged up by retransmit-backoff flows (F-04 QA: 428 ms avg was
+// implausible). Nearest-rank percentiles, the SAME algorithm as the Flows
+// page strip so the two surfaces can never disagree. The subset definition
+// is the published contract: flows with a measured handshake only — the
+// report's caption states the count so any reader can reproduce it from the
+// CSV's rttMs column (QA: "avg handshake RTT 362 ms" was not reproducible —
+// the mean over the 15 measured flows IS 362, but no subset was defined).
+export function handshakeRttSummary(rtts: number[]): { median: number | null; p95: number | null; count: number } {
+  const sorted = [...rtts].sort((a, b) => a - b)
+  const pct = (p: number) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)] : null
+  return { median: pct(0.5), p95: pct(0.95), count: sorted.length }
+}
+
 export function tcpHealthRttCaption(rtts: number[]): string {
   if (rtts.length === 0) return "no handshakes captured (mid-session flows)"
-  const avg = Math.round(rtts.reduce((s, v) => s + v, 0) / rtts.length)
-  return `avg handshake RTT ${avg} ms`
+  const { median, p95, count } = handshakeRttSummary(rtts)
+  return `handshake RTT: median ${median} ms / p95 ${p95} ms over ${count} flow${count === 1 ? "" : "s"} with a measured handshake`
+}
+
+// Consecutive duplicate frames — the double-capture signature (QA: identical
+// ACK Seq=0 pairs at frames #1/#3 and #2/#4). Two frames are duplicates when
+// their 5-tuple, length, TCP sequence and flags are identical AND they are
+// adjacent in capture order; such pairs are otherwise invisible to every
+// flow-level count. Returns the number of adjacent duplicate pairs.
+export function countDuplicateFrames(packets: { srcIp?: string; dstIp?: string; srcPort?: number; dstPort?: number; protocol?: string; length?: number; tcpSeq?: number; flags?: string }[]): number {
+  let n = 0
+  for (let i = 1; i < packets.length; i++) {
+    const a = packets[i - 1]
+    const b = packets[i]
+    if (a.srcIp === b.srcIp && a.dstIp === b.dstIp &&
+        a.srcPort === b.srcPort && a.dstPort === b.dstPort &&
+        a.protocol === b.protocol && a.length === b.length &&
+        a.tcpSeq === b.tcpSeq && a.flags === b.flags) n++
+  }
+  return n
 }
 
 // Endpoint table rows: unspecified/multicast placeholders (::, ::1, ff00::/8)
@@ -811,10 +851,14 @@ function evidenceAppProtocols(service: string): Set<string> | undefined {
 
 // Service label with its evidence qualifier, for report tables: a label that
 // is fully payload-confirmed stays plain; a partially confirmed one carries
-// the verified count; an entirely port-inferred one says so.
+// the verified count; an entirely port-inferred one says so. `count` is the
+// FLOW count and `confirmed` the flow count with verified payload — both
+// numbers are the same unit, so "8 of 17 flows payload-confirmed" can never
+// read as 8 packets of 40,864 (QA: the old label mixed an 8-flow count with
+// the TCP/443 packet total).
 export function serviceEvidenceLabel(service: string, confirmed: number, count: number): string {
   if (confirmed >= count) return service
-  if (confirmed > 0) return `${service} (${confirmed.toLocaleString()} of ${count.toLocaleString()} payload-confirmed)`
+  if (confirmed > 0) return `${service} (${confirmed.toLocaleString()} of ${count.toLocaleString()} flows payload-confirmed)`
   return `${service} (port-inferred)`
 }
 
@@ -830,9 +874,12 @@ export function serviceEvidenceLabel(service: string, confirmed: number, count: 
 //      (443, 80, 53, 3478…) wins;
 //   2. otherwise the LOWER port wins (both known — 443 vs 8443 — or both
 //      unknown registered-range ports, e.g. a custom app);
-//   3. a conversation whose lower port is in the IANA dynamic range
-//      (≥ 49152) is P2P between two ephemeral endpoints and is skipped
-//      (its volume still shows under Top Protocols).
+//   3. a conversation whose BOTH ports are in the app's dynamic band
+//      (≥ EPHEMERAL_PORT_MIN — the same band portServiceName labels
+//      "Dynamic/Ephemeral") is P2P between two ephemeral endpoints and is
+//      skipped (its volume still shows under Top Protocols). The band and
+//      the exclusion must match, or a 49161↔40714 conversation stays under
+//      "UDP/40714" while both ports read "Dynamic/Ephemeral" (QA).
 // Every packet of a conversation (both legs) counts under that service
 // port, so TCP/443 sums to all 1,175 packets. Port-less packets (ICMP,
 // GRE, ESP) are skipped.
@@ -843,6 +890,12 @@ export interface ServicePortCount {
   // Packets in the conversation whose app layer was payload-verified as the
   // service (see SERVICE_EVIDENCE). count - confirmed is port-inferred.
   confirmed: number
+  // Conversations (flows) attributed to this service port — the evidence
+  // label's denominator, so "8 of 17 payload-confirmed" counts flows on both
+  // sides instead of mixing an 8-flow count with a 40,864-packet total (QA).
+  flows: number
+  // Conversations with at least one payload-verified packet for the service.
+  confirmedFlows: number
 }
 const knownServicePort = (port: number): boolean => port < 1024 || PORT_SERVICES[port] !== undefined
 function servicePortOf(a: number, b: number): number | undefined {
@@ -852,25 +905,43 @@ function servicePortOf(a: number, b: number): number | undefined {
   // port is dynamic, so dropping known ports at the ephemeral threshold
   // mislabels the service as "Dynamic/Ephemeral" (QA).
   if (ka || kb) return ka ? a : b
-  if (a >= 49152) return undefined
+  // Both ports dynamic (a is the min, so a >= EPHEMERAL_PORT_MIN implies
+  // b >= a >= EPHEMERAL_PORT_MIN) → P2P between two ephemeral endpoints.
+  if (a >= EPHEMERAL_PORT_MIN) return undefined
   return a
 }
 export function servicePortCounts(packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string }[]): ServicePortCount[] {
-  const counts = new Map<string, ServicePortCount>()
+  // Per-conversation pass first: decide the service port ONCE per
+  // conversation (deterministic per port pair), counting its packets and
+  // payload-verified packets. The second pass aggregates conversations into
+  // per-port rows, adding FLOW counts so the report label can quote
+  // "N of M flows payload-confirmed" in like units (QA).
+  const convs = new Map<string, { protocol: string; port: number; count: number; confirmed: number }>()
   for (const p of packets) {
     if (!p.srcPort || !p.dstPort) continue
     const s = p.srcPort
     const d = p.dstPort
     const port = servicePortOf(Math.min(s, d), Math.max(s, d))
     if (!port) continue
-    const key = `${p.protocol}/${port}`
-    const e = counts.get(key) || { protocol: p.protocol, port, count: 0, confirmed: 0 }
+    const [a, b] = [p.srcIp, p.dstIp].sort()
+    const key = `${p.protocol}|${a}|${b}|${Math.min(s, d)}|${Math.max(s, d)}`
+    const e = convs.get(key) ?? { protocol: p.protocol, port, count: 0, confirmed: 0 }
     e.count += 1
     const evidence = evidenceAppProtocols(portServiceName(port, p.protocol))
     if (evidence && p.appProtocol && evidence.has(p.appProtocol)) e.confirmed += 1
+    convs.set(key, e)
+  }
+  const counts = new Map<string, ServicePortCount>()
+  for (const c of convs.values()) {
+    const key = `${c.protocol}/${c.port}`
+    const e = counts.get(key) ?? { protocol: c.protocol, port: c.port, count: 0, confirmed: 0, flows: 0, confirmedFlows: 0 }
+    e.count += c.count
+    e.confirmed += c.confirmed
+    e.flows += 1
+    if (c.confirmed > 0) e.confirmedFlows += 1
     counts.set(key, e)
   }
-  return [...counts.values()].sort((a, b) => b.count - a.count)
+  return [...counts.values()].sort((x, y) => y.count - x.count)
 }
 
 // DLT (link type) number → friendly encapsulation name, for the decode
@@ -1170,7 +1241,7 @@ function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; s
 export function buildFlowsCsv(
   flows: Flow[],
   geo: Map<string, GeoLocation> = new Map(),
-  packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string }[] = [],
+  packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; flags?: string }[] = [],
 ): string {
   const header = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,lossPct"
   // Undecodable endpoints (unsupported encapsulation) keep a visible label
@@ -1199,24 +1270,49 @@ export function buildFlowsCsv(
     if (arr) arr.push(p)
     else flowPackets.set(k, [p])
   }
-  const rows = flows.map((f) => [
-    ipCell(f.srcIp), f.srcPort,
-    ipCell(f.dstIp), f.dstPort,
-    f.protocol,
-    f.packets,
-    f.directionUnknown ? "" : f.bytesSent,
-    f.directionUnknown ? "" : f.bytesRecv,
-    f.bytesTotal,
-    f.startTime, f.endTime,
-    f.duration,
-    cc(f.srcIp), cc(f.dstIp),
-    asn(f.srcIp), asn(f.dstIp),
-    f.directionUnknown ? "" : flowServiceName(f.srcPort, f.dstPort, f.protocol),
-    flowServiceEvidence(f, flowPackets.get(flowKey(f)) ?? []),
-    f.rttMs ?? "",
-    f.retrans ?? "",
-    f.lossPct ?? "",
-  ].map(csvCell).join(","))
+  const rows = flows.map((f) => {
+    // EXPORT direction normalization: the flow record is canonical
+    // (endpoints sorted — a mid-session capture can list the server first),
+    // but the CSV's "Source/Destination" headers promise the conversation
+    // INITIATOR on the left (QA: DNS listed the resolver 192.168.137.1:53 as
+    // source, Echo listed :7, XMPP listed the server). The initiator is the
+    // endpoint that sent the conversation's SYN (TCP) or its first observed
+    // packet (UDP/other). When the capture began mid-session and no SYN is
+    // captured, the first observed packet can be a reply — the sorted order
+    // is kept for that corner (nothing better exists) and the row's
+    // bytesSent/bytesRecv swap together with the endpoints, so "sent" always
+    // means "sent by the row's source".
+    const pkts = flowPackets.get(flowKey(f)) ?? []
+    let flip = false
+    if (!f.directionUnknown) {
+      const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
+      const init = syn ? syn.srcIp : pkts[0]?.srcIp
+      flip = init !== undefined && init !== f.srcIp && init === f.dstIp
+    }
+    const srcIp = flip ? f.dstIp : f.srcIp
+    const dstIp = flip ? f.srcIp : f.dstIp
+    const srcPort = flip ? f.dstPort : f.srcPort
+    const dstPort = flip ? f.srcPort : f.dstPort
+    const sent = f.directionUnknown ? "" : (flip ? f.bytesRecv : f.bytesSent)
+    const recv = f.directionUnknown ? "" : (flip ? f.bytesSent : f.bytesRecv)
+    return [
+      ipCell(srcIp), srcPort,
+      ipCell(dstIp), dstPort,
+      f.protocol,
+      f.packets,
+      sent, recv,
+      f.bytesTotal,
+      f.startTime, f.endTime,
+      f.duration,
+      cc(srcIp), cc(dstIp),
+      asn(srcIp), asn(dstIp),
+      f.directionUnknown ? "" : flowServiceName(srcPort, dstPort, f.protocol),
+      flowServiceEvidence(f, pkts),
+      f.rttMs ?? "",
+      f.retrans ?? "",
+      f.lossPct ?? "",
+    ].map(csvCell).join(",")
+  })
   return "\uFEFF" + [header, ...rows].join("\n")
 }
 

@@ -38,8 +38,8 @@ describe("flow byte invariants (sessions = flows = capture)", () => {
   }, 60000)
 
   it("formatBytes keeps the decimal in the KB range (92.1, never 921)", () => {
-    expect(formatBytes(94_310)).toBe("92.1 KB")
-    expect(formatBytes(943_104)).toBe("921.0 KB")
-    expect(formatBytes(943_104)).not.toBe("921 KB")
+    expect(formatBytes(94_310)).toBe("92.1 KiB")
+    expect(formatBytes(943_104)).toBe("921.0 KiB")
+    expect(formatBytes(943_104)).not.toBe("921 KiB")
   })
 })

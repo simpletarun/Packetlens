@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Search, ArrowRight, Inbox } from "lucide-react"
 import { formatBytes, formatEndpoint } from "@/lib/map-data"
+import { handshakeRttSummary } from "@/lib/report"
 
 // One shared template so header and rows can never drift out of sync.
 const GRID = "grid-cols-[1fr_auto_1fr_70px_70px_70px_70px_70px_70px] min-w-[880px]"
@@ -36,6 +37,9 @@ export default function FlowsPage() {
   // card would be pure zeros on UDP-only captures. RTT is reported as
   // median/p95 of per-flow handshake RTTs — a raw mean is dragged up by a
   // few retransmit-backoff flows (F-04 QA: 428 ms avg was implausible).
+  // Shared handshakeRttSummary with the report so the two surfaces can never
+  // disagree on the subset (flows with a measured handshake) or the
+  // percentile algorithm (nearest-rank).
   // Memoized filter: an inline flows.filter() would hand the memo a fresh
   // array every render, defeating it (QA).
   const tcpFlows = useMemo(() => flows.filter((f) => f.protocol === "TCP"), [flows])
@@ -50,14 +54,9 @@ export default function FlowsPage() {
       if ((f.lossPct ?? 0) > 0) lossy++
       if (typeof f.rttMs === "number") rtts.push(f.rttMs)
     }
-    const sorted = [...rtts].sort((a, b) => a - b)
-    // Nearest-rank percentile: ceil(p·n)−1 gives the LOWER middle for even n
-    // (a 2-sample median is the smaller RTT, not the max — the old floor
-    // landed on the upper-middle element, QA).
-    const pct = (p: number) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)] : null
     return {
       retrans, ooo, zeroWindow, rst, lossy,
-      rttMedian: pct(0.5), rttP95: pct(0.95),
+      ...handshakeRttSummary(rtts),
     }
   }, [tcpFlows])
 
@@ -67,7 +66,7 @@ export default function FlowsPage() {
     { label: ["Zero-window", "Zero-window"], value: tcpHealth.zeroWindow },
     { label: ["Resets", "Reset"], value: tcpHealth.rst },
     { label: ["Lossy flows", "Lossy flow"], value: tcpHealth.lossy },
-    { label: ["RTT med/p95", "RTT med/p95"], value: tcpHealth.rttMedian === null ? "N/A" : `${tcpHealth.rttMedian}/${tcpHealth.rttP95}ms` },
+    { label: ["RTT med/p95", "RTT med/p95"], value: tcpHealth.median === null ? "N/A" : `${tcpHealth.median}/${tcpHealth.p95}ms` },
   ]
 
   return (
@@ -91,7 +90,7 @@ export default function FlowsPage() {
                   <span className="text-foreground font-semibold">{h.value}</span> {typeof h.value === "number" && h.value === 1 ? h.label[1] : h.label[0]}
                 </span>
               ))}
-              {tcpHealth.rttMedian === null && <span className="text-warning" title="No SYN/SYN-ACK pair was captured in-window (capture started mid-session)">RTT N/A — no TCP handshake captured</span>}
+              {tcpHealth.median === null && <span className="text-warning" title="No SYN/SYN-ACK pair was captured in-window (capture started mid-session)">RTT N/A — no TCP handshake captured</span>}
             </div>
           )}
           <div className="flex-1 overflow-auto">

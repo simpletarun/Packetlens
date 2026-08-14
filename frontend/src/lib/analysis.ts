@@ -37,6 +37,10 @@ export interface AnalysisPacket {
   num: number; timestamp: string; srcIp: string; dstIp: string
   srcPort: number; dstPort: number; protocol: string
   length: number; flags: string; ttl: number; info: string
+  // TCP sequence number (TCP packets only) — needed to tell adjacent
+  // double-captured frames apart: two distinct same-length ACKs with
+  // different seqs are NOT duplicates.
+  tcpSeq?: number
   // On-wire frame size (captured length when snaplen truncated the frame).
   origLength?: number
   // App-layer label when the parser identified one (HTTPS/STUN/mDNS…).
@@ -376,8 +380,9 @@ function pktToAnalysis(p: ParsedPacket, seqBase: number | undefined): AnalysisPa
     srcPort: p.srcPort || 0,
     dstPort: p.dstPort || 0,
     protocol: p.protocol || 'OTHER',
-length: p.length,
+    length: p.length,
     origLength: p.origLength,
+    tcpSeq: p.tcpSeq,
     flags,
     // Real IP TTL from the header — the previous hardcoded 64 made the TTL
     // column useless and OS fingerprinting impossible.

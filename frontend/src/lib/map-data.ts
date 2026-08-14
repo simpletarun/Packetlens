@@ -76,11 +76,15 @@ export function formatBytes(b: number): string {
   // Round sub-KB values: a rate like 832.2682926829268 B/s printed raw would
   // leak floating-point noise into every table that reuses this formatter.
   if (b < 1024) return Math.round(b) + " B"
-  if (b < 1048576) return (b / 1024).toFixed(1) + " KB"
-  if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB"
-  // GB/TB tiers: a multi-GB capture rendered "3174.4 MB" on the file card (QA).
-  if (b < 1099511627776) return (b / 1073741824).toFixed(1) + " GB"
-  return (b / 1099511627776).toFixed(1) + " TB"
+  // IEC labels (KiB/MiB/GiB/TiB) for the 1024 divisors — "MB" next to a
+  // 1024-based value conflated radixes with decimal byte counts (e.g. the
+  // flows total 36.4 MB decimal read as "34.6 MB" MiB, beside a file size in
+  // decimal MB) (QA). The values are unchanged, only the suffix is honest.
+  if (b < 1048576) return (b / 1024).toFixed(1) + " KiB"
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + " MiB"
+  // GiB/TiB tiers: a multi-GB capture rendered "3174.4 MB" on the file card (QA).
+  if (b < 1099511627776) return (b / 1073741824).toFixed(1) + " GiB"
+  return (b / 1099511627776).toFixed(1) + " TiB"
 }
 
 // UI tables and the CSV/report exporters must render endpoints identically:

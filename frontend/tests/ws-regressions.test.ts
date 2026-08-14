@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest"
 import { deriveMapData, mapPanels, isPrivateIP, clusterByCity, isLanFlow, slaacPrefixesOf } from "@/lib/map-data"
 import { isNonUnicast, packetProtocolCounts } from "@/lib/analysis"
-import { ownerOfDevices, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, localOwnedAddresses } from "@/lib/report"
+import { ownerOfDevices, endpointRowsOf, tcpHealthRttCaption, handshakeRttSummary, countDuplicateFrames, countryCountsByDst, localOwnedAddresses } from "@/lib/report"
 import { computeStats } from "@/lib/stats"
 
 const mk = (n: number, src: string, dst: string, len = 64) => ({
@@ -44,9 +44,33 @@ describe("endpointRowsOf", () => {
 })
 
 describe("tcpHealthRttCaption", () => {
-  it("measured RTTs → average; none → mid-session flows, not 'unavailable'", () => {
-    expect(tcpHealthRttCaption([250, 150])).toBe("avg handshake RTT 200 ms")
+  it("measured RTTs → median/p95 over the measured-handshake subset with its count; none → mid-session flows", () => {
+    // The subset definition is the published contract: flows with a measured
+    // handshake only. The testing.pcapng CSV has exactly these 15 rttMs
+    // values — mean 361.5 (the old "362 ms" was reproducible only if you
+    // guessed the subset; the caption now states it) (QA).
+    const testing = [37, 205, 34, 747, 38, 16, 888, 380, 146, 365, 222, 33, 366, 988, 958]
+    expect(tcpHealthRttCaption(testing)).toBe("handshake RTT: median 222 ms / p95 988 ms over 15 flows with a measured handshake")
+    expect(handshakeRttSummary([250, 150])).toEqual({ median: 150, p95: 250, count: 2 })
+    expect(handshakeRttSummary([])).toEqual({ median: null, p95: null, count: 0 })
     expect(tcpHealthRttCaption([])).toBe("no handshakes captured (mid-session flows)")
+  })
+})
+
+describe("countDuplicateFrames", () => {
+  it("flags adjacent identical frames (double-capture signature) and ignores single occurrences", () => {
+    const base = { srcIp: "192.168.137.228", dstIp: "172.64.190.1", srcPort: 47942, dstPort: 443, protocol: "TCP", length: 54 }
+    const packets = [
+      { ...base, tcpSeq: 0, flags: "ACK" },   // #1
+      { ...base, tcpSeq: 0, flags: "ACK" },   // #2 — duplicate of #1
+      { ...base, tcpSeq: 1238, flags: "ACK-PSH" }, // #3
+      { ...base, tcpSeq: 1238, flags: "ACK-PSH" }, // #4 — duplicate of #3
+      { ...base, tcpSeq: 0, flags: "ACK" },   // #5 — same as #1 but not adjacent
+      { srcIp: "8.8.8.8", dstIp: "192.168.137.228", srcPort: 53, dstPort: 53000, protocol: "UDP", length: 400 }, // different tuple
+    ]
+    expect(countDuplicateFrames(packets)).toBe(2)
+    expect(countDuplicateFrames([packets[0]])).toBe(0)
+    expect(countDuplicateFrames([])).toBe(0)
   })
 })
 

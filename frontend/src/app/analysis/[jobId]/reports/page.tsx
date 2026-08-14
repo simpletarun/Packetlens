@@ -8,7 +8,7 @@ import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
+import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_STAMP } from "@/lib/build-stamp"
@@ -250,6 +250,12 @@ export default function ReportsPage() {
   const allPorts = useMemo(() => servicePortCounts(packets), [packets])
   const topPorts = allPorts.slice(0, 8)
   const portTotal = allPorts.reduce((s, e) => s + e.count, 0)
+  // P2P volume excluded from port attribution (conversations between two
+  // dynamic-range ports) — stated in the Top Ports note so the rule's effect
+  // is visible, not hidden (QA: rule text promised exclusion while UDP/40714
+  // kept 159 pkts from 49161→40714).
+  const p2pExcluded = useMemo(() => packets.reduce((s, p) => s + ((p.srcPort && p.dstPort) ? 1 : 0), 0) - portTotal, [packets, portTotal])
+  const duplicateFrames = useMemo(() => countDuplicateFrames(packets), [packets])
 
   const allCountries = useMemo(() =>
     [...countryCountsByDst(packets, geoMap, localOwned).entries()].sort((a, b) => b[1] - a[1]),
@@ -492,8 +498,25 @@ export default function ReportsPage() {
     if (tls.some((t) => /(^|\.)ctldl\.windowsupdate\.com$|\.c\.lencr\.org$|(^|\.)crl\d*\.digicert\.com$|ocsp\.\w+\.(digicert\.com|pki\.goog|msocsp\.com)/i.test(t.sni || ""))) {
       obs.push("Windows certificate/CRL validation traffic (ctldl.windowsupdate.com, DigiCert/GlobalSign CRL & OCSP endpoints)")
     }
+    // Network health must surface even when no detection rule fired: a SAFE
+    // verdict next to 66.7% loss reads as "loss is fine" (QA). These are
+    // observations, not findings — the verdict stays risk-based.
+    const tcpFlowsAll = flows.filter((f) => f.protocol === "TCP")
+    const lossyFlows = tcpFlowsAll.filter((f) => (f.retrans ?? 0) > 0)
+    if (lossyFlows.length > 0) {
+      const worst = [...lossyFlows].sort((a, b) => (b.lossPct ?? 0) - (a.lossPct ?? 0))[0]
+      const rsts = tcpFlowsAll.filter((f) => (f.rstCount ?? 0) > 0).length
+      const high = lossyFlows.filter((f) => (f.lossPct ?? 0) >= 20).length
+      obs.push(`Network health: ${lossyFlows.length} of ${tcpFlowsAll.length} TCP flows show packet loss or retransmission (worst ${worst.lossPct}% to ${worst.dstIp}${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} flow${rsts === 1 ? "" : "s"} reset by RST` : ""}) — no detection rule triggered`)
+    }
+    // Consecutive identical frames are the double-capture signature — flow
+    // counts can't see them (every packet is counted once) so the report
+    // must (QA: frames #1/#3 and #2/#4 identical ACKs went unmentioned).
+    if (duplicateFrames > 0) {
+      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} (identical source/destination/length/sequence) — consistent with a double-capture artifact; consider de-duplicating the capture before re-analysis`)
+    }
     return obs
-  }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes])
+  }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames])
   const recs = useMemo(() => {
     const groups = { High: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[], Medium: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[], Low: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[] }
     for (const r of report.recommendations.sort((a, b) => b.severity - a.severity)) {
@@ -597,6 +620,7 @@ export default function ReportsPage() {
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
+      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow rows are direction-normalized per conversation: the CSV export lists the conversation initiator as source, the flows table keeps canonical endpoint order — so summing distinct CSV endpoints yields different numbers by design.`,
       `- DNS queries: ${dnsQueries} (${dnsLookupCount(dns)} distinct lookups) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- Files extracted: ${files.length} · Credentials: ${credentials.length} · Certificates: ${certificates.length}`,
@@ -613,9 +637,9 @@ export default function ReportsPage() {
       "## Top Ports",
       "| Protocol/Port | Service | Packets |",
       "| --- | --- | --- |",
-      ...topPorts.map(({ protocol, port, count, confirmed }) => `| ${protocol}/${port} | ${serviceEvidenceLabel(portServiceName(port, protocol), confirmed, count)} | ${count.toLocaleString()} |`),
+      ...topPorts.map(({ protocol, port, count, confirmedFlows, flows }) => `| ${protocol}/${port} | ${serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)} | ${count.toLocaleString()} |`),
       ...(topPorts.length < allPorts.length ? [`- *(+${allPorts.length - topPorts.length} more services — top ${topPorts.length} shown)*`, ""] : [""]),
-      "_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded; port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload (e.g. the STUN magic cookie); otherwise they are port-inferred._",
+      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded (${p2pExcluded.toLocaleString()} pkts); port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Packets column holds packet totals._`,
       "",
       ...(observations.length ? ["## Observations", ...observations.map((o) => `- ${o}`), ""] : []),
       "## Top Talkers (source)",
@@ -648,7 +672,7 @@ export default function ReportsPage() {
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: ${BUILD_STAMP}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: ${BUILD_STAMP}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames (double-capture artifact)` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
 
@@ -723,7 +747,10 @@ export default function ReportsPage() {
                   {undecodable ? (
                     <p><strong>{stats.totalFlows}</strong> undecodable traffic bucket{stats.totalFlows === 1 ? "" : "s"} — no endpoints were parsed (unsupported encapsulation).</p>
                   ) : (
+                    <>
                     <p><strong>{stats.totalFlows}</strong> flows, <strong>{stats.sessions}</strong> sessions, <strong>{stats.devices}</strong> local devices ({devices.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
+                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow rows are direction-normalized per conversation: the CSV export lists the conversation initiator as source, while the flows table keeps canonical endpoint order — so summing distinct CSV endpoints yields different numbers from these counts by design.</p>
+                    </>
                   )}
                   {undecodable && (
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
@@ -902,7 +929,7 @@ export default function ReportsPage() {
                     const lossy = tcp.filter((f) => (f.retrans ?? 0) > 0).length
                     return (
                       <div className="mt-4">
-                        <p className="text-xs font-medium mb-2">
+                        <p className="text-xs font-medium mb-2" title="Subset: flows with a measured handshake (SYN/SYN-ACK captured in-window). Median/p95 — not the mean, which retransmit-backoff flows drag up.">
                           TCP Health — {tcp.length} flows with measurements · {lossy} with retransmissions · {tcpHealthRttCaption(rtts)}
                         </p>
                         <div className="overflow-x-auto">
@@ -1648,7 +1675,7 @@ export default function ReportsPage() {
                 <Card>
                   <CardHeader><CardTitle className="text-sm">Top Ports</CardTitle></CardHeader>
                   <CardContent className="space-y-2">
-                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded. Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload (e.g. the STUN magic cookie); otherwise they are port-inferred.</p>}
+                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Count column holds packet totals.</p>}
                     {topPorts.length === 0 && (
                       <p className="text-xs text-muted-foreground">{undecodable ? `No port data — payloads undecodable (${dltName(linkTypes)}), so ports were not parsed` : "No port data"}</p>
                     )}
@@ -1668,11 +1695,11 @@ export default function ReportsPage() {
                           </tr>
                         </thead>
                         <tbody>
-                          {topPorts.map(({ protocol, port, count, confirmed }) => (
+                          {topPorts.map(({ protocol, port, count, confirmedFlows, flows }) => (
                             <tr key={protocol + "/" + port} className="border-b border-border/30">
                               <td className="py-1.5 pr-2 font-mono whitespace-nowrap">{protocol}/{port}</td>
                               <td className="py-1.5 pr-2 text-muted-foreground">
-                                {serviceEvidenceLabel(portServiceName(port, protocol), confirmed, count)}
+                                {serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)}
                               </td>
                               <td className="py-1.5 pr-2 whitespace-nowrap">
                                 <span className="text-[10px] text-muted-foreground mr-1">{((count / portTotal) * 100).toFixed(0)}%</span>
@@ -1894,7 +1921,7 @@ export default function ReportsPage() {
                       {job.md5 && <p><strong>MD5:</strong> <span className="font-mono text-xs">{job.md5}</span></p>}
                       <p><strong>Packets:</strong> {stats.totalPackets.toLocaleString()} · <strong>Flows:</strong> {stats.totalFlows.toLocaleString()} · <strong>Sessions:</strong> {stats.sessions.toLocaleString()} · <strong>Local Devices:</strong> {stats.devices.toLocaleString()}</p>
                       <p><strong>Duration:</strong> {durLabel(durationSec)} · <strong>External IPs:</strong> {stats.externalIps} · <strong>Countries:</strong> {countriesLabel(stats.countries, stats.externalIps)}</p>
-                      <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"}</p>
+                      <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"}{duplicateFrames > 0 ? <> · <strong>{duplicateFrames.toLocaleString()} consecutive duplicate frames</strong> (double-capture artifact)</> : null} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"}</p>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
                           <h4 className="font-semibold mb-2">Report Metadata</h4>

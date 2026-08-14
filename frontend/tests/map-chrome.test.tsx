@@ -60,7 +60,7 @@ describe("MapChrome KPI bar", () => {
     expect(text).toContain("7")
     expect(text).toContain("one arc per peer, per direction")
     expect(text).toContain("Total Traffic")
-    expect(text).toContain("10.6 KB")
+    expect(text).toContain("10.6 KiB")
     expect(text).toContain("sum across drawn arcs")
     expect(text).toContain("Home Network")
     expect(text).toContain("Not set")
