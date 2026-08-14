@@ -114,6 +114,11 @@ const RULE_CATEGORIES: Record<string, string> = {
 
 export const RISK_PARAMS = spec.rule_params
 
+// Curve constant for the normalization 100 × (1 − exp(−raw / K)). Exported so
+// the UI can show the ACTUAL substituted computation (raw 40 → 39.3 → 39),
+// instead of a formula template that leaves the raw→normalized jump opaque.
+export const RISK_CURVE_K = spec.normalization.curve_k as number
+
 export function computeRisk(alerts: RiskAlertInput[], burstDetected = false): number {
   const seen = new Set<string>()
   let raw = 0

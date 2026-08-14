@@ -652,22 +652,41 @@ function deriveDns(packets: ParsedPacket[]): AnalysisDnsEntry[] {
 }
 
 function deriveHttp(packets: ParsedPacket[]): AnalysisHttpEntry[] {
-  // Response side first: index by reversed flow so each request row shows the
-  // real status + Content-Type the server sent back (QA: was faked 200 / "").
-  // When several responses exist for one flow, the LATEST BY TIMESTAMP wins —
-  // file order can be out-of-order in pcapng, and the last file-order response
-  // would otherwise be an arbitrary one.
-  const responseByFlow = new Map<string, ParsedPacket>()
+  // Response side first, indexed per flow (reversed key) and sorted by
+  // timestamp. The old "LATEST response per flow" map handed the SAME
+  // response to EVERY request on a connection (QA: a POST /submit/ showed the
+  // text/css Content-Type of a later GET /style.css exchange on the same
+  // flow). HTTP/1.1 answers requests sequentially, so responses are consumed
+  // FIFO — each request gets the next response that arrives after it.
+  const responsesByFlow = new Map<string, ParsedPacket[]>()
   for (const p of packets) {
     if (p.httpStatus === undefined || !p.srcIp || !p.dstIp) continue
     const key = `${p.srcIp}:${p.srcPort}:${p.dstIp}:${p.dstPort}`
-    const prev = responseByFlow.get(key)
-    if (!prev || p.timestamp > prev.timestamp) responseByFlow.set(key, p)
+    const arr = responsesByFlow.get(key)
+    if (arr) arr.push(p)
+    else responsesByFlow.set(key, [p])
   }
-  return packets.filter(p => p.httpMethod).map((p, i) => {
-    const res = p.srcIp && p.dstIp
-      ? responseByFlow.get(`${p.dstIp}:${p.dstPort}:${p.srcIp}:${p.srcPort}`)
-      : undefined
+  for (const arr of responsesByFlow.values()) arr.sort((a, b) => a.timestamp - b.timestamp)
+  const consumed = new Map<string, number>()
+  // Timestamp order, not file order: pcapng can store packets out of order.
+  return packets.filter(p => p.httpMethod).sort((a, b) => a.timestamp - b.timestamp).map((p, i) => {
+    let res: ParsedPacket | undefined
+    if (p.srcIp && p.dstIp) {
+      const key = `${p.dstIp}:${p.dstPort}:${p.srcIp}:${p.srcPort}`
+      const arr = responsesByFlow.get(key)
+      if (arr) {
+        let j = consumed.get(key) ?? 0
+        // Responses that arrived before the request — or interim 1xx ones
+        // (100 Continue is a real wire packet but not a terminal status;
+        // it and the final response belong to the SAME exchange, so the
+        // final 200 must pair onto this request, not the next one).
+        while (j < arr.length && (arr[j].timestamp <= p.timestamp || (arr[j].httpStatus ?? 0) < 200)) j++
+        if (j < arr.length) {
+          res = arr[j]
+          consumed.set(key, j + 1)
+        }
+      }
+    }
     return {
       id: `http-${i + 1}`,
       timestamp: safeIso(p.timestamp * 1000),

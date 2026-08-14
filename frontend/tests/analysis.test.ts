@@ -1255,6 +1255,31 @@ describe("Analysis engine", () => {
     expect(unanswered?.contentType).toBe("")
   })
 
+  it("pairs each request on a shared flow with ITS OWN response (FIFO)", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, srcIp: "10.0.0.5", dstIp: "93.184.216.34", srcPort: 52000, dstPort: 80, timestamp: 1000, protocol: "TCP", tcpFlags: "PSH ACK", httpMethod: "POST", httpUri: "/submit/", httpHost: "login.badssl.com", httpUa: "curl/8.0" }),
+      makePacket({ num: 2, srcIp: "10.0.0.5", dstIp: "93.184.216.34", srcPort: 52000, dstPort: 80, timestamp: 1005, protocol: "TCP", tcpFlags: "PSH ACK", httpMethod: "GET", httpUri: "/style.css", httpHost: "login.badssl.com" }),
+      // POST's own response (the server answers requests sequentially).
+      makePacket({ num: 3, srcIp: "93.184.216.34", dstIp: "10.0.0.5", srcPort: 80, dstPort: 52000, timestamp: 1010, protocol: "TCP", tcpFlags: "PSH ACK", httpStatus: 200, httpContentType: "text/html" }),
+      // The LATER GET's response — must not leak onto the POST row.
+      makePacket({ num: 4, srcIp: "93.184.216.34", dstIp: "10.0.0.5", srcPort: 80, dstPort: 52000, timestamp: 1020, protocol: "TCP", tcpFlags: "PSH ACK", httpStatus: 200, httpContentType: "text/css" }),
+    ]
+    const result: PCAPResult = {
+      packets,
+      stats: { totalPackets: 4, totalBytes: 256, duration: 2, startTime: 1000, endTime: 1020, protocols: { TCP: 4 } },
+    }
+    const analysis = analyzePcap(result)
+    expect(analysis.http).toHaveLength(2)
+    const post = analysis.http.find((h) => h.uri === "/submit/")
+    expect(post?.status).toBe(200)
+    // The latest response in the flow (text/css) belongs to the GET — the
+    // POST must keep its own text/html answer.
+    expect(post?.contentType).toBe("text/html")
+    const get = analysis.http.find((h) => h.uri === "/style.css")
+    expect(get?.status).toBe(200)
+    expect(get?.contentType).toBe("text/css")
+  })
+
   it("derives the certificates list from parsed TLS Certificate handshakes (deduped)", () => {
     const cert = {
       subject: "example.com", issuer: "Test Issuer CA", serial: "01020304",

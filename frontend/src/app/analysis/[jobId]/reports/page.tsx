@@ -6,7 +6,7 @@ import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
-import { riskLevel, riskColorClass } from "@/lib/risk"
+import { riskLevel, riskColorClass, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
 import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
@@ -316,6 +316,10 @@ export default function ReportsPage() {
 
   const risk = report.risk
   const mitre = report.mitre
+  // The curve evaluated at the ACTUAL raw score, so the breakdown shows the
+  // raw → normalized jump with the real numbers (raw 40 → 39.3 → 39/100),
+  // instead of a template that hides the rounding.
+  const riskCurve = risk ? 100 * (1 - Math.exp(-risk.rawScore / RISK_CURVE_K)) : null
 
   // Capture window from the actual packet timestamps (min/max — pcap files can
   // hold out-of-order packets), normalized from ISO or epoch-second shapes.
@@ -1575,8 +1579,8 @@ export default function ReportsPage() {
                         <div className="space-y-3">
                           <div className="border rounded p-3 bg-muted/30">
                             <div className="font-mono text-xs space-y-1">
-                              <div className="flex justify-between"><span className="text-muted-foreground">Raw score</span><span className="font-medium">{risk.rawScore}</span></div>
-                              <div className="flex justify-between"><span className="text-muted-foreground">Normalization formula</span><span className="font-medium">100 × (1 − exp(−raw / 80))</span></div>
+                              <div className="flex justify-between"><span className="text-muted-foreground">Raw score</span><span className="font-medium">{Math.round(risk.rawScore * 10) / 10}</span></div>
+                              <div className="flex justify-between"><span className="text-muted-foreground">Normalization formula</span><span className="font-medium whitespace-nowrap">100 × (1 − exp(−{risk.rawScore} / {RISK_CURVE_K})) ≈ {riskCurve !== null ? riskCurve.toFixed(1) : "—"} → {risk.normalizedScore}/100</span></div>
                               <div className="flex justify-between"><span className="text-muted-foreground">Burst bonus applied <span title="Only C2-beacon, exfil and DNS-tunnel rules receive the burst confidence bonus; a bare burst with nothing to boost shows No.">(C2/exfil/DNS rules only)</span></span><span className="font-medium">{risk.burstApplied ? "Yes" : "No"}</span></div>
                               <div className="flex justify-between"><span className="text-muted-foreground">Normalized score</span><span className="text-foreground font-bold">{undecodable ? "N/A — insufficient data" : `${risk.normalizedScore}/100 ${risk.levelLabel}`}</span></div>
                               <div className="border-t border-border/30 pt-2 mt-2">
@@ -1893,7 +1897,7 @@ export default function ReportsPage() {
                           <p><strong>IOCs:</strong> {report.iocs.length} ({report.iocs.filter((i) => i.source === "CONFIRMED_ALERT").length} confirmed, {report.iocs.filter((i) => i.source === "BEHAVIORAL_METRIC").length} behavioral)</p>
                           <p><strong>MITRE Mappings:</strong> {report.mitre.length}</p>
                           <p><strong>Risk Score:</strong> {riskValue()}</p>
-                          {risk && <p><strong>Raw Score:</strong> {risk.rawScore}</p>}
+                          {risk && <p><strong>Raw Score:</strong> {Math.round(risk.rawScore * 10) / 10}</p>}
                           {burst && <p><strong>Burst Detected:</strong> {formatBytes(burst.peakThroughput)}/s peak</p>}
                         </div>
                       </div>

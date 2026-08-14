@@ -339,6 +339,10 @@ body {
   /* Table headers must never wrap per-character in narrow columns ("Packets"
      rendering vertically); let columns size to the header word instead. */
   th { white-space: nowrap !important; }
+  /* Belt-and-braces: some Chrome print-to-PDF versions still break words in
+     fixed-narrow cells; forbid any character-level breaking outright. */
+  th, td { word-break: normal !important; overflow-wrap: normal !important; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
 }
 
 @media print {
