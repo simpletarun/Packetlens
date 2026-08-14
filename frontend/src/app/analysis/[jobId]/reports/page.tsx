@@ -301,7 +301,7 @@ export default function ReportsPage() {
       threats: alerts,
       timeline,
       bandwidth,
-      advancedMetrics: advancedMetrics ?? { rates: { quality: "EMPTY", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, bucketCount: 0, avgExceedsPeak: false } },
+      advancedMetrics: advancedMetrics ?? { rates: { quality: "EMPTY", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, peakBps100ms: null, bucketCount: 0, avgExceedsPeak: false } },
       fileInfo: fileInfo ?? { sha256: "", sha1: "", md5: "" },
       validator,
       decode: decode ?? { decoded: 0, total: 0, linkTypes: [] },
@@ -639,7 +639,7 @@ export default function ReportsPage() {
       "| --- | --- | --- |",
       ...topPorts.map(({ protocol, port, count, confirmedFlows, flows }) => `| ${protocol}/${port} | ${serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)} | ${count.toLocaleString()} |`),
       ...(topPorts.length < allPorts.length ? [`- *(+${allPorts.length - topPorts.length} more services — top ${topPorts.length} shown)*`, ""] : [""]),
-      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded (${p2pExcluded.toLocaleString()} pkts); port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Packets column holds packet totals._`,
+      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded (${p2pExcluded.toLocaleString()} pkts); port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Packets column holds packet totals. A conversation counts as confirmed when at least one of its packets was payload-verified, so a partially verified conversation still counts (the CSV's "mixed" rows)._`,
       "",
       ...(observations.length ? ["## Observations", ...observations.map((o) => `- ${o}`), ""] : []),
       "## Top Talkers (source)",
@@ -918,6 +918,7 @@ export default function ReportsPage() {
                     </table>
                   </div>
                   {flows.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest flows of {flows.length.toLocaleString()} — the CSV export lists all flows.</div>}
+                  <p className="text-[10px] text-muted-foreground mt-1">Endpoint order here is canonical (service-side first); the CSV export lists the conversation initiator as source — the same conversation therefore reads mirrored across the two artifacts.</p>
                   {/* TCP health mirrors the CSV export: per-flow RTT, retrans,
                       loss, OoO, zero-window and RST. Shows the worst flows —
                       a summary without rows reads as "nothing measured". */}
@@ -998,6 +999,7 @@ export default function ReportsPage() {
                     </table>
                   </div>
                   {sessions.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest sessions of {sessions.length.toLocaleString()} — the Analysis page lists all sessions.</div>}
+                  <p className="text-[10px] text-muted-foreground mt-1">Endpoint order here is canonical (service-side first); the CSV export lists the conversation initiator as source — the same conversation therefore reads mirrored across the two artifacts.</p>
                   <p className="text-xs text-muted-foreground mt-3">Sessions mirror flows one-to-one (one session per direction-normalized conversation; states come from the observed handshake — INITIATED = SYN seen but no completion, HALF_OPEN = SYN-ACK replied but never completed, ESTABLISHED = full handshake or mid-stream capture, RESET/CLOSED, STATELESS = non-TCP). Higher-level, multi-flow session reconstruction is not implemented.</p>
                 </CardContent>
               </Card>
@@ -1574,7 +1576,7 @@ export default function ReportsPage() {
                     {[
                       { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle },
                       { label: "Throughput Avg", value: rateLabel(advancedMetrics.throughputAvg), color: "text-info", icon: BarChart3 },
-                      { label: "Throughput Peak (instantaneous)", value: rateLabel(advancedMetrics.throughputPeak), color: "text-chart-2", icon: BarChart3 },
+                      { label: "Throughput Peak (100 ms window)", value: rateLabel(advancedMetrics.throughputPeak100ms ?? null), color: "text-chart-2", icon: BarChart3 },
                        { label: "Burst", value: advancedMetrics.burst?.detected ? "Detected" : "Not Detected", color: advancedMetrics.burst?.detected ? "text-danger" : "text-success", icon: Zap, sub: advancedMetrics.burst?.detected ? `${advancedMetrics.burst.ratio.toFixed(1)}× average · ${advancedMetrics.burst.duration.toFixed(1)} s` : undefined },
                     ].map(({ label, value, color, icon: Icon, sub }) => (
                       <Card key={label}>
@@ -1604,7 +1606,7 @@ export default function ReportsPage() {
                     <CardContent className="space-y-1 text-xs">
                       {[
                         { label: "Average", value: rateLabel(advancedMetrics.throughputAvg) },
-                        { label: "Peak", value: rateLabel(advancedMetrics.throughputPeak) },
+                        { label: "Peak (1 s interval)", value: rateLabel(advancedMetrics.throughputPeak) },
                         { label: `Minimum (${bwIntervalLabel} interval)`, value: bwStats.min === null ? "—" : formatBytes(bwStats.min) + "/s" },
                         { label: `Median (${bwIntervalLabel} interval)`, value: bwStats.median === null ? "—" : formatBytes(bwStats.median) + "/s" },
                         { label: `95th percentile (${bwIntervalLabel} interval)`, value: bwStats.p95 === null ? "—" : formatBytes(bwStats.p95) + "/s" },
@@ -1675,7 +1677,7 @@ export default function ReportsPage() {
                 <Card>
                   <CardHeader><CardTitle className="text-sm">Top Ports</CardTitle></CardHeader>
                   <CardContent className="space-y-2">
-                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Count column holds packet totals.</p>}
+                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Count column holds packet totals. A conversation counts as confirmed when at least one of its packets was payload-verified, so a partially verified conversation still counts (the CSV's "mixed" rows).</p>}
                     {topPorts.length === 0 && (
                       <p className="text-xs text-muted-foreground">{undecodable ? `No port data — payloads undecodable (${dltName(linkTypes)}), so ports were not parsed` : "No port data"}</p>
                     )}

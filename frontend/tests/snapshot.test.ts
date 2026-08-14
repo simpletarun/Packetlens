@@ -72,7 +72,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
     }
     expect(JSON.stringify(model, null, 2)).toMatchInlineSnapshot(`
       "{
-        "schemaVersion": "1.1.0",
+        "schemaVersion": "1.2.0",
         "analyzerVersion": "3.4.0",
         "job": {
           "totalPackets": 4,
@@ -83,7 +83,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
           "captureDuration": 3
         },
         "validator": {
-          "schemaVersion": "1.1.0",
+          "schemaVersion": "1.2.0",
           "captureQuality": "VALID",
           "durationSec": 3,
           "decode": {

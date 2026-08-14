@@ -161,6 +161,9 @@ export interface AdvancedMetrics {
   rates?: CaptureRates
   throughputAvg: number | null
   throughputPeak: number | null
+  /** Largest 100 ms bucket — the honest "instantaneous" peak (>= the 1 s
+   *  peak). Absent on legacy pre-1.2.0 jobs; renderers show N/A. */
+  throughputPeak100ms?: number | null
   burst: BurstInfo | null
   beaconDetected: boolean
   dnsTunnelingSuspected: boolean

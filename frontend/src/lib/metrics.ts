@@ -31,6 +31,13 @@ export interface CaptureRates {
   avgPacketsSec: number | null
   avgBps: number | null
   peakBps: number | null
+  /** Largest 100-millisecond bucket, bytes/sec. A finer window than peakBps
+   *  (the largest 1-second bucket), so it is mathematically guaranteed to be
+   *  >= the 1-second peak — the honest "instantaneous" reading a report can
+   *  label as such (QA: the old "Throughput Peak (instantaneous)" card showed
+   *  the 1-second peak under an instantaneous name). Null when no time
+   *  interval exists, exactly like peakBps. */
+  peakBps100ms: number | null
   /** Number of non-empty 1-second buckets (burst detection needs >= 2). */
   bucketCount: number
   /** True when the honest average exceeds the largest 1-second bucket —
@@ -43,10 +50,10 @@ export function captureRates(
   packets: Array<{ timestamp: number; length: number }>
 ): CaptureRates {
   if (packets.length === 0) {
-    return { quality: "EMPTY", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, bucketCount: 0, avgExceedsPeak: false }
+    return { quality: "EMPTY", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, peakBps100ms: null, bucketCount: 0, avgExceedsPeak: false }
   }
   if (packets.length === 1) {
-    return { quality: "SINGLE_PACKET", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, bucketCount: 1, avgExceedsPeak: false }
+    return { quality: "SINGLE_PACKET", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, peakBps100ms: null, bucketCount: 1, avgExceedsPeak: false }
   }
   let first = Number.POSITIVE_INFINITY
   let last = Number.NEGATIVE_INFINITY
@@ -59,15 +66,24 @@ export function captureRates(
   const span = last - first
   if (!(span > 0)) {
     // Identical timestamps (or NaN timestamps): no measurable interval.
-    return { quality: "ZERO_DURATION", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, bucketCount: 1, avgExceedsPeak: false }
+    return { quality: "ZERO_DURATION", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, peakBps100ms: null, bucketCount: 1, avgExceedsPeak: false }
   }
   const buckets = new Map<number, number>()
+  // 100ms buckets share the same zero base as the 1s buckets, so each 1s
+  // bucket is the exact union of ten 100ms buckets: the finer peak is
+  // guaranteed >= the coarser one, never an independent re-window.
+  const msBuckets = new Map<number, number>()
   for (const p of packets) {
     const sec = Math.floor(p.timestamp - first)
     buckets.set(sec, (buckets.get(sec) ?? 0) + p.length)
+    const ms = Math.floor((p.timestamp - first) * 10)
+    msBuckets.set(ms, (msBuckets.get(ms) ?? 0) + p.length)
   }
   let peakBps = 0
   for (const b of buckets.values()) if (b > peakBps) peakBps = b
+  let peakBps100ms = 0
+  for (const b of msBuckets.values()) if (b > peakBps100ms) peakBps100ms = b
+  peakBps100ms *= 10
   const avgBps = bytes / span
   return {
     quality: "VALID",
@@ -75,6 +91,7 @@ export function captureRates(
     avgPacketsSec: packets.length / span,
     avgBps,
     peakBps,
+    peakBps100ms,
     bucketCount: buckets.size,
     avgExceedsPeak: avgBps > peakBps,
   }

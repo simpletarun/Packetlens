@@ -414,6 +414,31 @@ describe("Analysis engine", () => {
     expect(analysis.validator.integrity.malformedPackets).toBe(0)
     expect(analysis.validator.integrity.fileTruncated).toBe(false)
     expect(analysis.validator.decode.decodeRatePct).toBe(100)
+    // EMPTY capture: no time interval -> no rates at all, including the
+    // 100 ms instantaneous peak (never a fabricated sub-second number).
+    expect(analysis.advancedMetrics.throughputPeak100ms).toBeNull()
+  })
+
+  it("advancedMetrics: the 100 ms instantaneous peak >= the 1 s peak", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000 }),
+      makePacket({ num: 2, timestamp: 1000200 }),
+      makePacket({ num: 3, timestamp: 1000400 }),
+      makePacket({ num: 4, timestamp: 1000600 }),
+      makePacket({ num: 5, timestamp: 1002000 }),
+    ]
+    const analysis = analyzePcap({
+      packets,
+      stats: {
+        totalPackets: 5, totalBytes: 320, duration: 2, startTime: 1000000, endTime: 1002000, protocols: { TCP: 5 },
+      },
+    })
+    expect(analysis.advancedMetrics.rates.quality).toBe("VALID")
+    const peak1s = analysis.advancedMetrics.throughputPeak
+    const peak100ms = analysis.advancedMetrics.throughputPeak100ms
+    expect(peak1s).not.toBeNull()
+    expect(peak100ms).not.toBeNull()
+    expect(peak100ms!).toBeGreaterThanOrEqual(peak1s!)
   })
 
   it("validator: truncated integrity status wins over decode issues", () => {

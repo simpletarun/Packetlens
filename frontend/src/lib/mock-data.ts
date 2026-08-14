@@ -428,6 +428,7 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
   const duration = Math.max((Math.max(...times) - firstTs) / 1000, 1)
   const talkerMap = new Map<string, { bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }>()
   const buckets = new Map<number, number>()
+  const msBuckets = new Map<number, number>()
   const localIps = new Set(SRC_IPS)
   let totalBytes = 0
   for (const p of _mockPackets) {
@@ -444,10 +445,15 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
     }
     const sec = Math.floor((Date.parse(p.timestamp) - firstTs) / 1000)
     buckets.set(sec, (buckets.get(sec) ?? 0) + bytes)
+    const ms = Math.floor((Date.parse(p.timestamp) - firstTs) / 100)
+    msBuckets.set(ms, (msBuckets.get(ms) ?? 0) + bytes)
   }
   const throughputAvg = totalBytes / duration
   let throughputPeak = 0
   for (const b of buckets.values()) if (b > throughputPeak) throughputPeak = b
+  let throughputPeak100ms = 0
+  for (const b of msBuckets.values()) if (b > throughputPeak100ms) throughputPeak100ms = b
+  throughputPeak100ms *= 10
   // Same burst rule as the real analyzer: a contiguous run above 2× average.
   // The mock's synthetic capture mixes upload/download traffic, so the burst
   // is direction-neutral (outboundDominant: true keeps the curated score).
@@ -467,9 +473,10 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
   return {
     // Canonical capture metrics (same shape the real engine emits): the mock
     // has real timestamps, so it is always VALID with numeric rates.
-    rates: { quality: "VALID", durationSec: duration, avgPacketsSec: _mockPackets.length / duration, avgBps: throughputAvg, peakBps: throughputPeak, bucketCount: buckets.size, avgExceedsPeak: throughputAvg > throughputPeak },
+    rates: { quality: "VALID", durationSec: duration, avgPacketsSec: _mockPackets.length / duration, avgBps: throughputAvg, peakBps: throughputPeak, peakBps100ms: throughputPeak100ms, bucketCount: buckets.size, avgExceedsPeak: throughputAvg > throughputPeak },
     throughputAvg,
     throughputPeak,
+    throughputPeak100ms,
     burst,
     beaconDetected: false,
     dnsTunnelingSuspected: false,

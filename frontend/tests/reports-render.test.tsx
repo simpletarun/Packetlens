@@ -56,10 +56,10 @@ function seedStore() {
       { time: "00:00", in: 64, out: 0 },
       { time: "00:30", in: 60, out: 0 },
     ],
-    advancedMetrics: {
-      rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 2, avgBps: 124, peakBps: 124, bucketCount: 1, avgExceedsPeak: false },
-      burst: null,
-      throughputAvg: 124, throughputPeak: 124,
+advancedMetrics: {
+        rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 2, avgBps: 124, peakBps: 124, peakBps100ms: 124, bucketCount: 1, avgExceedsPeak: false },
+        burst: null,
+        throughputAvg: 124, throughputPeak: 124, throughputPeak100ms: 124,
       beaconDetected: false, dnsTunnelingSuspected: false, dataExfiltrationSuspected: false,
       torVpnProxyDetected: false, portScanEnhanced: false, ja3Suspicious: false,
       topTalkers: [], iocs: [], mitreMappings: [],
@@ -339,9 +339,9 @@ describe("Reports page render", () => {
       timeline: [{ time: "00:00", packets: 8, bytes: 1000, tcp: 8, udp: 0, dns: 0, tls: 0 }],
       bandwidth: [{ time: "00:00", in: 400, out: 600 }],
       advancedMetrics: {
-        rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 8, avgBps: 1000, peakBps: 1000, bucketCount: 1, avgExceedsPeak: false },
+        rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 8, avgBps: 1000, peakBps: 1000, peakBps100ms: 1000, bucketCount: 1, avgExceedsPeak: false },
         burst: null,
-        throughputAvg: 1000, throughputPeak: 1000,
+        throughputAvg: 1000, throughputPeak: 1000, throughputPeak100ms: 1000,
         beaconDetected: false, dnsTunnelingSuspected: false, dataExfiltrationSuspected: false,
         torVpnProxyDetected: false, portScanEnhanced: false, ja3Suspicious: false,
         topTalkers: [], iocs: [], mitreMappings: [],

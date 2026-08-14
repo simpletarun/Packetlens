@@ -18,6 +18,7 @@ describe("captureRates edge cases", () => {
     expect(r.avgPacketsSec).toBeNull()
     expect(r.avgBps).toBeNull()
     expect(r.peakBps).toBeNull()
+    expect(r.peakBps100ms).toBeNull()
     expect(r.bucketCount).toBe(0)
   })
 
@@ -28,6 +29,7 @@ describe("captureRates edge cases", () => {
     expect(r.avgPacketsSec).toBeNull()
     expect(r.avgBps).toBeNull()
     expect(r.peakBps).toBeNull()
+    expect(r.peakBps100ms).toBeNull()
     expect(r.bucketCount).toBe(1)
   })
 
@@ -37,6 +39,7 @@ describe("captureRates edge cases", () => {
     expect(r.durationSec).toBeNull()
     expect(r.avgBps).toBeNull()
     expect(r.peakBps).toBeNull()
+    expect(r.peakBps100ms).toBeNull()
   })
 
   it("zero-duration must never fabricate a 1s fallback denominator", () => {
@@ -107,5 +110,30 @@ describe("captureRates valid captures", () => {
     // 6500 bytes over the 3s span = 2166.67 B/s (honest total/span).
     expect(r.avgBps).toBeCloseTo(6500 / 3, 5)
     expect(r.avgExceedsPeak).toBe(false)
+  })
+})
+
+describe("peakBps100ms — the honest instantaneous peak", () => {
+  it("is the largest 100 ms bucket scaled to bytes/sec", () => {
+    // Second 0 holds 900 B spread 200ms apart: the whole second (peakBps) is
+    // 900 B/s, but the tightest 100 ms window holds 500 B -> 5000 B/s.
+    const r = rates([[0, 200], [0.2, 300], [0.2, 200], [0.6, 200], [1, 100], [2, 100]])
+    expect(r.quality).toBe("VALID")
+    expect(r.peakBps).toBe(900)
+    expect(r.peakBps100ms).toBe(5000)
+  })
+
+  it("is always >= the 1-second peak (same zero base, ten windows per second)", () => {
+    const r = rates([[0, 100], [0.5, 100], [0.9, 100], [1.2, 700], [1.8, 100], [2.4, 100], [3.3, 50]])
+    expect(r.peakBps100ms!).toBeGreaterThanOrEqual(r.peakBps!)
+  })
+
+  it("dense flat traffic: 100 ms peak equals the 1 s peak (all windows full)", () => {
+    // 10 equally-spaced 150 B packets per second -> every window sees 1500 B.
+    const pkts: Array<[number, number]> = []
+    for (let s = 0; s < 3; s++) for (let i = 0; i < 10; i++) pkts.push([s + i * 0.1, 150])
+    const r = rates(pkts)
+    expect(r.peakBps).toBe(1500)
+    expect(r.peakBps100ms).toBe(1500)
   })
 })

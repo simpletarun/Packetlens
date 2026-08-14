@@ -86,6 +86,15 @@ async function audit(file: string, display: string) {
   expect.soft(a1.validator.schemaVersion, `${display}: validator.schemaVersion`).toBe(a1.schemaVersion)
   expect.soft(a1.validator.captureQuality, `${display}: validator quality`).toBe(a1.advancedMetrics.rates.quality)
   expect.soft(a1.validator.durationSec, `${display}: validator durationSec`).toBe(a1.advancedMetrics.rates.durationSec)
+  // 100 ms instantaneous peak: null whenever no time interval exists, and
+  // otherwise >= the 1-second peak (same zero base, ten windows per second).
+  const m = a1.advancedMetrics
+  if (m.rates.quality === "VALID") {
+    expect.soft(m.throughputPeak100ms, `${display}: 100ms peak present`).not.toBeNull()
+    expect.soft(m.throughputPeak100ms!, `${display}: 100ms peak >= 1s peak`).toBeGreaterThanOrEqual(m.throughputPeak!)
+  } else {
+    expect.soft(m.throughputPeak100ms, `${display}: 100ms peak null without interval`).toBeNull()
+  }
   expect.soft(a1.validator.decode.decoded, `${display}: validator decoded`).toBe(a1.decode.decoded)
   expect.soft(a1.validator.decode.total, `${display}: validator total`).toBe(a1.decode.total)
   expect.soft(a1.validator.decode.linkTypes, `${display}: validator linkTypes`).toEqual(a1.decode.linkTypes)

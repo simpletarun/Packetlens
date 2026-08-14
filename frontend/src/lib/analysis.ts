@@ -24,7 +24,7 @@ export function safeIso(ms: number): string {
 // protocolSource enum rename (payload/port_inferred/transport_only →
 // PAYLOAD_CONFIRMED/PORT_INFERRED/UNKNOWN) + new job fields
 // (highestSeverity, metricSpecVersion, detectionRuleVersion).
-export const ANALYSIS_SCHEMA_VERSION = "1.1.0"
+export const ANALYSIS_SCHEMA_VERSION = "1.2.0"
 
 // Semantic contracts are versioned independently of the JSON shape: the
 // metric semantics (rate definitions, capture-quality meaning), the risk
@@ -246,6 +246,9 @@ export interface AnalysisAdvancedMetrics {
   /** null = no time interval (single packet / zero duration) — show N/A. */
   throughputAvg: number | null
   throughputPeak: number | null
+  /** Largest 100 ms bucket (rates.peakBps100ms) — the honest "instantaneous"
+   *  peak, always >= throughputPeak (1 s window). Null like the others. */
+  throughputPeak100ms: number | null
   burst: BurstInfo | null
   beaconDetected: boolean
   dnsTunnelingSuspected: boolean
@@ -1631,6 +1634,7 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
 
   const throughputAvg = rates.avgBps
   const throughputPeak = rates.peakBps
+  const throughputPeak100ms = rates.peakBps100ms
 
   // Per-second throughput buckets — real peak, not the fabricated avg*3.
   // Direction is tracked separately so a download spike can be told apart
@@ -1902,6 +1906,7 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     rates,
     throughputAvg: rates.avgBps === null ? null : Math.round(rates.avgBps),
     throughputPeak: rates.peakBps === null ? null : Math.round(rates.peakBps),
+    throughputPeak100ms: rates.peakBps100ms === null ? null : Math.round(rates.peakBps100ms),
     burst,
     beaconDetected,
     dnsTunnelingSuspected,
