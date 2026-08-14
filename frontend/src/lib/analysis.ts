@@ -1515,9 +1515,23 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     if (wanDir(p.srcIp, p.dstIp) === 1) outBuckets.set(sec, (outBuckets.get(sec) || 0) + p.length)
   }
 
-  // Burst = NOT EVALUABLE (null) when no time interval exists: a single
-  // packet or identical timestamps have no rate to spike against. Never
-  // evaluate a burst over a fabricated 1 s interval (QA: 66 B/s one-packet).
+  // ── Burst detection semantics (documented so the math can't drift) ───────
+  // 1. NOT EVALUABLE (null) when there is no time interval to spike against:
+  //    a single packet, identical timestamps, or fewer than two non-empty
+  //    1-second buckets all produce null — never a fabricated 1 s burst
+  //    (QA: 66 B/s one-packet capture "burst").
+  // 2. Not evaluable below 10 KB total wire bytes: no meaningful spike.
+  // 3. Threshold = 2 × average throughput (peak must EXCEED 2× avg to be a
+  //    burst; average is total/rate-window per metrics.ts).
+  // 4. Ratio = peak / avg (the banner's ×N); window = the contiguous run of
+  //    seconds around the PEAK second that stay above threshold — a spike
+  //    elsewhere in the capture is never labeled with unrelated seconds
+  //    (QA: 42.3× banner over flat 00:00:00–00:00:01 while the burst was at
+  //    00:05).
+  // 5. outboundDominant = ≥ half of the window's bytes cross LAN→WAN; a
+  //    download spike must not tilt the exfil bonus (QA: verylarge.pcapng).
+  // 6. When null, burstConfidenceBoost() is false: risk never treats an
+  //    unevaluable burst as "no burst detected" — no bonus, no reduction.
   const burst = (() => {
     if (rates.durationSec === null || totalBytesOut + totalBytesIn <= 10000 || rates.bucketCount < 2) {
       return null

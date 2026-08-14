@@ -144,6 +144,15 @@ async function audit(file: string, display: string) {
   }
 
   const totalLen = pkts.reduce((s, p) => s + (p.length || 0), 0)
+
+  // Alert dedup: one event fires one alert — the same (rule, src, dst) never
+  // appears twice in the displayed threat list, and risk dedups identically.
+  const threatKeys = a1.threats.map((t) => `${t.ruleId}|${t.srcIp}|${t.dstIp}`)
+  expect.soft(
+    new Set(threatKeys).size === threatKeys.length,
+    `${display}: threats unique by (rule, src, dst) (${threatKeys.length} threats)`,
+  ).toBe(true)
+  expect.soft(a1.job.alerts === a1.threats.length, `${display}: job.alerts mirrors threat count`).toBe(true)
   let flowPkts = 0, flowBytes = 0
   const flowKeys = new Set<string>()
   for (const f of a1.flows) {

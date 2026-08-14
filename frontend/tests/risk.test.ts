@@ -69,6 +69,16 @@ describe("burstConfidenceBoost — a DOWNLOAD burst must not boost exfil/beacon 
     expect(burstConfidenceBoost({ burst: { detected: false } })).toBe(false)
   })
 
+  it("UNEVALUABLE burst (null) -> no boost: absence of burst evidence is not evidence of absence", () => {
+    expect(burstDetected({ burst: null })).toBe(false)
+    expect(burstConfidenceBoost({ burst: null })).toBe(false)
+    expect(burstConfidenceBoost({ burst: undefined })).toBe(false)
+    expect(burstConfidenceBoost(undefined)).toBe(false)
+    const exfil = alert("DATA-EXFIL-001", 5, 70, "10.0.0.5")
+    expect(computeRisk([exfil], burstConfidenceBoost({ burst: null })))
+      .toBe(computeRisk([exfil], false))
+  })
+
   it("outbound-dominant burst -> boost", () => {
     expect(burstConfidenceBoost({ burst: { detected: true, outboundDominant: true } })).toBe(true)
   })
@@ -140,6 +150,60 @@ describe("calibration intent — combined evidence severity (curve_k 80, C2 weig
     const s = computeRisk([beacon(), exfil(), dnsTunnel()]) // 45 + 60 + 60 = 165 raw -> 87
     expect(s).toBeGreaterThanOrEqual(80)
     expect(riskLevel(s).label).toBe("CRITICAL")
+  })
+})
+
+describe("risk monotonicity + boundary properties", () => {
+  const mk = (ruleId: string, severity: number, confidence: number, i: number, dstIp = "10.0.0.9") =>
+    ({ ruleId, severity, confidence, srcIp: `1.1.1.${i}`, dstIp })
+
+  it("adding evidence never lowers the score", () => {
+    const base = [mk("TEST-000", 3, 70, 1)]
+    const baseScore = computeRisk(base)
+    expect(computeRisk([...base, mk("TEST-000", 2, 60, 2)])).toBeGreaterThanOrEqual(baseScore)
+    expect(computeRisk([...base, mk("PORT-SCAN-001", 3, 70, 3)])).toBeGreaterThanOrEqual(baseScore)
+    expect(computeRisk([...base, mk("TEST-000", 5, 95, 4)])).toBeGreaterThanOrEqual(baseScore)
+  })
+
+  it("higher confidence never lowers the score", () => {
+    for (const c1 of [10, 40, 60, 70, 85, 95]) {
+      for (const c2 of [10, 40, 60, 70, 85, 95]) {
+        const s1 = computeRisk([mk("TEST-000", 4, c1, 1)])
+        const s2 = computeRisk([mk("TEST-000", 4, c2, 1)])
+        if (c2 >= c1) expect(s2).toBeGreaterThanOrEqual(s1)
+      }
+    }
+  })
+
+  it("higher severity never lowers the score", () => {
+    for (let sev1 = 1; sev1 <= 5; sev1++) {
+      for (let sev2 = 1; sev2 <= 5; sev2++) {
+        const s1 = computeRisk([mk("TEST-000", sev1, 70, 1)])
+        const s2 = computeRisk([mk("TEST-000", sev2, 70, 1)])
+        if (sev2 >= sev1) expect(s2).toBeGreaterThanOrEqual(s1)
+      }
+    }
+  })
+
+  it("duplicates never change the score (dedup key rule|src|dst)", () => {
+    const one = [mk("DATA-EXFIL-001", 5, 70, 5)]
+    const duped = [...one, { ...one[0] }, { ...one[0], dstIp: "10.0.0.9" }]
+    expect(computeRisk(duped)).toBe(computeRisk(one))
+  })
+
+  it("score is always within [0, 100] across a confidence/severity sweep", () => {
+    for (let i = 0; i < 20; i++) {
+      const alerts = Array.from({ length: 3 }, (_, k) =>
+        mk("TEST-000", (i + k) % 5 + 1, (i * 17 + k * 23) % 100, k))
+      const s = computeRisk(alerts)
+      expect(s).toBeGreaterThanOrEqual(0)
+      expect(s).toBeLessThanOrEqual(100)
+      expect(Number.isInteger(s)).toBe(true)
+    }
+  })
+
+  it("single minimal alert still scores > 0", () => {
+    expect(computeRisk([mk("TEST-000", 1, 10, 1)])).toBeGreaterThan(0)
   })
 })
 

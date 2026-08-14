@@ -43,6 +43,8 @@ export function burstDetected(anomalies?: RiskAnomalies & { burst?: { detected?:
 // (QA: verylarge.pcapng — 86 CRITICAL driven by an inbound burst boosting
 // an upload-style exfil alert to the ×1.5 band). Absent direction data
 // (parity fixtures, older captures) the bonus applies as before.
+// A null/unevaluable burst reads as false — absence of burst evidence never
+// boosts, and never lowers, the score (see the burst math in analysis.ts).
 export function burstConfidenceBoost(anomalies?: RiskAnomalies & { burst?: { detected?: boolean; outboundDominant?: boolean } | null }): boolean {
   if (!burstDetected(anomalies)) return false
   return (anomalies?.burst?.outboundDominant ?? true)

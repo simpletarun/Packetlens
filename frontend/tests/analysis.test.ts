@@ -158,6 +158,104 @@ describe("TCP state machine — honest handshake states on flows and sessions", 
   })
 })
 
+describe("burst semantics — unevaluable bursts stay null and never boost risk", () => {
+  function run(packets: ParsedPacket[]) {
+    return analyzePcap({
+      packets,
+      stats: {
+        totalPackets: packets.length,
+        totalBytes: packets.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { TCP: packets.length },
+        linkTypes: [1], decodedPackets: packets.length,
+      },
+    })
+  }
+
+  it("many packets inside one second = one bucket -> burst null (no interval to spike)", () => {
+    const packets: ParsedPacket[] = Array.from({ length: 200 }, (_, i) =>
+      makePacket({ num: i + 1, timestamp: 1000000 + i / 1000, length: 500 }),
+    )
+    const a = run(packets)
+    expect(a.advancedMetrics.rates.durationSec).toBeCloseTo(0.199, 3)
+    expect(a.advancedMetrics.rates.bucketCount).toBe(1)
+    expect(a.advancedMetrics.burst).toBeNull()
+  })
+
+  it("sparse sub-second traffic stays null even with 2+ buckets", () => {
+    // Two buckets but only 2 packets: too little traffic to call a spike.
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000, length: 5000 }),
+      makePacket({ num: 2, timestamp: 1001000, length: 5000 }),
+    ]
+    expect(run(packets).advancedMetrics.burst).toBeNull()
+  })
+})
+
+describe("alert deduplication — one event, one alert, counts kept as evidence", () => {
+  const hex = (s: string) => Buffer.from(s, "latin1").toString("hex")
+  const synPkt = (i: number, dstPort: number) =>
+    makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp: "10.0.0.5", dstIp: "8.8.8.8", dstPort, tcpFlags: "SYN" })
+  const httpPacket = (payload: string, overrides: Partial<ParsedPacket> = {}): ParsedPacket =>
+    makePacket({
+      num: 1,
+      srcIp: "192.168.1.5",
+      dstIp: "100.101.45.41",
+      srcPort: 52000,
+      dstPort: 80,
+      protocol: "TCP",
+      tcpFlags: "PSH ACK",
+      httpMethod: "GET",
+      payload: hex(payload),
+      ...overrides,
+    })
+  const run = (packets: ParsedPacket[]) =>
+    analyzePcap({
+      packets,
+      stats: {
+        totalPackets: packets.length,
+        totalBytes: packets.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { TCP: packets.length },
+        linkTypes: [1], decodedPackets: packets.length,
+      },
+    })
+
+  it("150 SYNs to ONE port = a single SYN-FLOOD-001, not 150 alerts", () => {
+    const a = run(Array.from({ length: 150 }, (_, i) => synPkt(i, 443)))
+    const floods = a.threats.filter((t) => t.ruleId === "SYN-FLOOD-001")
+    expect(floods).toHaveLength(1)
+    expect(floods[0].evidence).toContain("150 SYN")
+    expect(a.threats.filter((t) => t.ruleId === "PORT-SCAN-001")).toHaveLength(0)
+    expect(a.job.alerts).toBe(a.threats.length)
+  })
+
+  it("25 SYNs to 25 ports = a single PORT-SCAN-001 with the port count", () => {
+    const a = run(Array.from({ length: 25 }, (_, i) => synPkt(i, 1000 + i)))
+    const scans = a.threats.filter((t) => t.ruleId === "PORT-SCAN-001")
+    expect(scans).toHaveLength(1)
+    expect(scans[0].evidence).toContain("25 ports")
+    expect(a.threats.filter((t) => t.ruleId === "SYN-FLOOD-001")).toHaveLength(0)
+  })
+
+  it("5 identical HTTP logins = ONE HTTP-CREDS-001 whose evidence counts them", () => {
+    const a = run(Array.from({ length: 5 }, (_, i) =>
+      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: i + 1, timestamp: 1000000 + i })))
+    const credAlerts = a.threats.filter((t) => t.ruleId === "HTTP-CREDS-001")
+    expect(credAlerts).toHaveLength(1)
+    expect(credAlerts[0].evidence).toContain("5 plaintext credential submission")
+  })
+
+  it("no two displayed threats share (ruleId, srcIp, dstIp)", () => {
+    const a = run([
+      ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443)),
+      ...Array.from({ length: 25 }, (_, i) => synPkt(1000 + i, 2000 + i)),
+    ])
+    const keys = new Set(a.threats.map((t) => `${t.ruleId}|${t.srcIp}|${t.dstIp}`))
+    expect(keys.size).toBe(a.threats.length)
+  })
+})
+
 describe("Analysis engine", () => {
   it("analyzes an empty capture", () => {
     const result: PCAPResult = {
