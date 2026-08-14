@@ -17,7 +17,9 @@ describe("formatBytes — the single byte formatter (1024 tiers, honest sub-KB)"
 
   it("multi-GB values stay GB (QA: 3174.4 MB on the file card)", () => {
     expect(formatBytes(3.5 * 1073741824)).toBe("3.5 GB")
-    expect(formatBytes(1073741824 * 1024)).toBe("1024.0 GB")
+    // One TiB crosses into the TB tier — a TB label is honest for it (a
+    // "1024.0 GB" label would break the KB → MB → GB → TB progression).
+    expect(formatBytes(1073741824 * 1024)).toBe("1.0 TB")
   })
 
   it("non-finite input renders em-dash, never NaN", () => {

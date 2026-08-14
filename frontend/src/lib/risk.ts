@@ -163,6 +163,33 @@ export function riskColorClass(level: RiskLevel): string {
   return COLOR_CLASSES[level.color] ?? "text-muted-foreground"
 }
 
+const LEVEL_BY_LABEL = Object.fromEntries(spec.levels.map((l) => [l.label, l]))
+
+// The minimum verdict level dictated by the strongest confirmed finding.
+// The pure score band can read LOW (a single HTTP-CREDS-001 → raw 40 → 39/100)
+// while a HIGH-severity finding is present; without a floor that capture
+// tiers with "nothing found". Maps finding severity to its OWN level, so
+// severity is never hidden by the score: Critical(5)→CRITICAL, High(4)→HIGH,
+// Medium(3)→MEDIUM, Low(1-2)→LOW. null when there is no finding.
+export function severityFloor(highestSeverity: number): RiskLevel | null {
+  if (highestSeverity >= 5) return LEVEL_BY_LABEL.CRITICAL ?? null
+  if (highestSeverity === 4) return LEVEL_BY_LABEL.HIGH ?? null
+  if (highestSeverity === 3) return LEVEL_BY_LABEL.MEDIUM ?? null
+  if (highestSeverity >= 1) return LEVEL_BY_LABEL.LOW ?? null
+  return null
+}
+
+// The verdict level: the score's band, floored by the highest finding's
+// severity. The numeric score and the formula are untouched — this only
+// decides the LABEL/color a capture is presented with.
+export function verdictLevel(scoreLevel: RiskLevel, highestSeverity: number): RiskLevel {
+  const floor = severityFloor(highestSeverity)
+  if (!floor) return scoreLevel
+  const floorMin = LEVEL_BY_LABEL[floor.label]?.min ?? 0
+  const scoreMin = LEVEL_BY_LABEL[scoreLevel.label]?.min ?? 0
+  return floorMin > scoreMin ? floor : scoreLevel
+}
+
 export function computeRiskBreakdown(alerts: RiskAlertInput[], burstDetected = false): RiskBreakdown {
   const seen = new Set<string>()
   const items: RiskBreakdownItem[] = []

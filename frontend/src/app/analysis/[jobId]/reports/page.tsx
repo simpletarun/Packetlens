@@ -6,7 +6,7 @@ import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
-import { riskLevel, riskColorClass, RISK_CURVE_K } from "@/lib/risk"
+import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
 import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
@@ -376,7 +376,10 @@ export default function ReportsPage() {
   // null = no time interval (single packet / zero duration) — rates are N/A,
   // never a fabricated 0.001 s / 1 s denominator (QA: 1-SYN capture showed
   // 66 B/s average over a fake 1 s interval).
-  const durationSec = advancedMetrics?.rates?.durationSec ?? null
+  // Legacy jobs (pre-metrics) have no advancedMetrics: fall back to the job's
+  // capture duration exactly like the report builder does, so the page and
+  // the report never disagree on the window.
+  const durationSec = advancedMetrics?.rates?.durationSec ?? (job?.captureDuration ?? null)
   const ratesAvailable = durationSec !== null
 
   // The label must describe the divisor the data was actually divided by:
@@ -469,6 +472,11 @@ export default function ReportsPage() {
     if (!undecodable && packets.some((p) => p.dstIp && p.dstIp !== "\u2014" && isNonUnicast(p.dstIp))) obs.push("multicast/broadcast traffic")
     if (undecodable) obs.push(`capture payloads undecodable (${dltName(linkTypes)} — unsupported encapsulation); only lengths and timestamps parsed`)
     if (dnsQueries > 0) obs.push(`${dnsLookupCount(dns)} distinct DNS lookups (${stats.domains.toLocaleString()} unique domain${stats.domains === 1 ? "" : "s"}, ${dnsQueries} query packets)`)
+    // 0 DNS + any hostname-bearing traffic = the capture began mid-session:
+    // the resolution phase predates the capture, so hostname↔IP correlation
+    // and PTR lookups are unavailable (QA: login.pcapng talks to 4+ named
+    // domains yet holds 0 DNS packets).
+    if (dnsQueries === 0 && (http.length > 0 || tls.length > 0)) obs.push("0 DNS queries captured — capture likely began mid-session; hostname/IP correlation and PTR resolution unavailable")
     if (http.length > 0) obs.push(`${http.length} plaintext HTTP requests`)
     // HTTP User-Agents fingerprint client OSes even without MAC OUI data.
     // Microsoft-CryptoAPI/10.0 is a Windows component and must count as
@@ -506,11 +514,18 @@ export default function ReportsPage() {
     ? "UNKNOWN / INSUFFICIENT DATA"
     : risk
       ? `${risk.normalizedScore}/100 ${risk.levelLabel}`
-      : `${job.riskScore}/100 ${riskLevel(job.riskScore).label}`
+      : `${jobScore}/100 ${fallbackVerdict.label}`
 
-  const scoreVal = risk ? risk.normalizedScore : job.riskScore
-  const levelLabel = undecodable ? "UNKNOWN" : (risk ? risk.levelLabel : riskLevel(job.riskScore).label)
-  const levelColor = undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore)))
+  // job.riskScore is absent on legacy/malformed job records — a bare
+  // undefined would render "undefined/100" in the verdict and conclusion.
+  const jobScore = job.riskScore ?? 0
+  const scoreVal = risk ? risk.normalizedScore : jobScore
+  // Fallback path (no advanced metrics): same severity floor the report
+  // builder applies — the verdict never reads lower than the strongest
+  // finding, even when the score band alone would say SAFE/LOW.
+  const fallbackVerdict = verdictLevel(riskLevel(job.riskScore), job.highestSeverity ?? 0)
+  const levelLabel = undecodable ? "UNKNOWN" : (risk ? risk.levelLabel : fallbackVerdict.label)
+  const levelColor = undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(fallbackVerdict))
   const conclusionText = analystConclusion({
     undecodable,
     decodeRatePct: Math.round(decodeRate * 100),
@@ -583,6 +598,7 @@ export default function ReportsPage() {
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
       `- DNS queries: ${dnsQueries} (${dnsLookupCount(dns)} distinct lookups) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
+      ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- Files extracted: ${files.length} · Credentials: ${credentials.length} · Certificates: ${certificates.length}`,
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
@@ -1022,6 +1038,7 @@ export default function ReportsPage() {
                           <th className="text-left py-2 pr-2">Method</th>
                           <th className="text-left py-2 pr-2">URI</th>
                           <th className="text-left py-2 pr-2">Host</th>
+                          <th className="text-left py-2 pr-2">Dest IP</th>
                           <th className="text-right py-2 pr-2">Status</th>
                           <th className="text-left py-2 pr-2">Content-Type</th>
                           <th className="text-left py-2">User-Agent</th>
@@ -1034,6 +1051,7 @@ export default function ReportsPage() {
                             <td className="py-1.5 pr-2"><Badge variant="outline" className="text-[10px]">{h.method}</Badge></td>
                             <td className="py-1.5 pr-2 font-mono truncate max-w-[160px]">{h.uri}</td>
                             <td className="py-1.5 pr-2 text-muted-foreground">{h.host}</td>
+                            <td className="py-1.5 pr-2 font-mono">{h.dstIp}</td>
                             <td className="py-1.5 pr-2 text-right"><Badge variant="outline" className={"text-[10px] " + (h.status < 300 ? "bg-success/10 text-success" : h.status < 400 ? "bg-info/10 text-info" : "bg-danger/10 text-danger")}>{h.status}</Badge></td>
                             <td className="py-1.5 pr-2 text-muted-foreground truncate max-w-[120px]">{h.contentType}</td>
                             <td className="py-1.5 text-muted-foreground truncate max-w-[180px]">{h.userAgent}</td>
@@ -1760,7 +1778,7 @@ export default function ReportsPage() {
                                   <td className="py-1.5 pr-2 text-muted-foreground">{iocTypeLabel(ioc.type)}</td>
                                   <td className="py-1.5 pr-2 font-mono">{ioc.value}</td>
                                   <td className="py-1.5 pr-2 text-muted-foreground">{ioc.description}</td>
-                                  <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{ioc.severity >= 4 ? "High" : ioc.severity >= 3 ? "Medium" : "Low"}</Badge></td>
+                                  <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{sevLabel(ioc.severity)}</Badge></td>
                                   <td className="py-1.5">{sourceBadge(ioc.source)}</td>
                                 </tr>
                               ))}
@@ -1893,7 +1911,7 @@ export default function ReportsPage() {
                         </div>
                         <div>
                           <h4 className="font-semibold mb-2">Threat Summary</h4>
-                          <p><strong>Alerts:</strong> {alerts.length} ({alerts.filter((t) => t.severity >= 4).length} high, {alerts.filter((t) => t.severity === 3).length} medium, {alerts.filter((t) => t.severity <= 2).length} low)</p>
+                          <p><strong>Alerts:</strong> {alerts.length} ({severityCounts(alerts)})</p>
                           <p><strong>IOCs:</strong> {report.iocs.length} ({report.iocs.filter((i) => i.source === "CONFIRMED_ALERT").length} confirmed, {report.iocs.filter((i) => i.source === "BEHAVIORAL_METRIC").length} behavioral)</p>
                           <p><strong>MITRE Mappings:</strong> {report.mitre.length}</p>
                           <p><strong>Risk Score:</strong> {riskValue()}</p>

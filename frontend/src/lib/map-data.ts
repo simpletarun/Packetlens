@@ -80,7 +80,8 @@ export function formatBytes(b: number): string {
   if (b < 1048576) return (b / 1024).toFixed(1) + " KB"
   if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB"
   // GB/TB tiers: a multi-GB capture rendered "3174.4 MB" on the file card (QA).
-  return (b / 1073741824).toFixed(1) + " GB"
+  if (b < 1099511627776) return (b / 1073741824).toFixed(1) + " GB"
+  return (b / 1099511627776).toFixed(1) + " TB"
 }
 
 // UI tables and the CSV/report exporters must render endpoints identically:

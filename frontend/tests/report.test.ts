@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest"
 import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion } from "@/lib/report"
-import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown } from "@/lib/risk"
+import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
 import type { AdvancedMetrics, AlertEntry, Flow, Packet, Session } from "@/stores/analysis"
 import type { GeoLocation } from "@/lib/geo"
@@ -210,6 +210,34 @@ describe("math fixes (2026-08 audit)", () => {
     expect(bucketOverlapSec("10:15", start, end)).toBe(300)
   })
 
+  it("bucketOverlapSec resolves post-midnight buckets against the NEXT day (audit)", () => {
+    // Capture 23:50:00 → 00:03:00 crossing midnight: the 00:00–00:05 wall
+    // bucket holds only 180 s, and resolving "00:00" on the START day would
+    // put it BEFORE the capture (overlap 0 → full 300, understating ~1.7x).
+    const start = new Date(2026, 7, 13, 23, 50, 0).getTime() / 1000
+    const end = new Date(2026, 7, 14, 0, 3, 0).getTime() / 1000
+    expect(bucketOverlapSec("00:00", start, end)).toBe(180)
+    expect(bucketOverlapSec("23:55", start, end)).toBe(300)
+  })
+
+  it("buildBandwidth divides the partial TAIL rebin bin by its real width (audit)", () => {
+    // 90 s capture, bin = 1 s (binPackets t0 = first packet): the LAST bin
+    // spans only the 0.5 s tail between its last packet and the capture end.
+    // Dividing it by the full 1 s would understate the tail's per-second rate.
+    const start = 1_700_000_000
+    const packets = Array.from({ length: 89 }, (_, i) => ({
+      num: i + 1, timestamp: start + i, srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1, dstPort: 2, protocol: "TCP", length: 60, flags: "", ttl: 64, info: "",
+    }))
+    packets.push({ num: 90, timestamp: start + 89.5, srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1, dstPort: 2, protocol: "TCP", length: 60, flags: "", ttl: 64, info: "" })
+    const bw = buildBandwidth(packets, [], 90)
+    const tail = bw[bw.length - 1]
+    // srcIp is private → counted as OUT. Tail bin: 89 s → 89.5 s holds 60 B
+    // over 0.5 s = 120 B/s, not 60 B/s.
+    expect(tail.out).toBeCloseTo(120, 6)
+    // Interior bins stay full-width 60 B/s.
+    expect(bw[0].out).toBe(60)
+  })
+
   it("buildBandwidth divides each store bin by its own overlap, not fixed 300", () => {
     const start = new Date(2026, 7, 13, 10, 3, 0).getTime() / 1000
     const packets = [
@@ -281,12 +309,51 @@ describe("top ports and throughput helpers", () => {
     expect(dnsLookupCount([mk("a.com"), mk("a.com"), mk("b.com")])).toBe(2)
   })
 
-  it("burst bonus is reported as applied only when an eligible rule actually benefits", () => {
+it("burst bonus is reported as applied only when an eligible rule actually benefits", () => {
     const burstMetrics = { burst: { detected: true }, beaconDetected: true } as unknown as AdvancedMetrics
     expect(buildReportRisk([portScanAlert], burstMetrics)?.burstApplied).toBe(false)
     expect(buildReportRisk([beaconAlert], burstMetrics)?.burstApplied).toBe(true)
     const noBurst = { burst: { detected: false }, beaconDetected: true } as unknown as AdvancedMetrics
     expect(buildReportRisk([beaconAlert], noBurst)?.burstApplied).toBe(false)
+  })
+
+  it("verdict floors to the strongest finding's severity (score band LOW, finding HIGH)", () => {
+    const credAlert: AlertEntry = {
+      id: "t1", timestamp: new Date(T0 * 1000).toISOString(), signature: "Plaintext HTTP Credentials",
+      category: "Credential Theft", severity: 4, confidence: 75, ruleId: "HTTP-CREDS-001",
+      srcIp: "10.0.0.5", dstIp: "23.155.129.172", srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "x",
+    }
+    const metrics = { burst: null, beaconDetected: false } as unknown as AdvancedMetrics
+    const r = buildReportRisk([credAlert], metrics)
+    // Numeric score is untouched: one HTTP-CREDS-001 → raw 40 → 39 (LOW band).
+    expect(r?.normalizedScore).toBe(39)
+    expect(r?.highestSeverity).toBe(4)
+    // But the verdict level is floored by the High finding, never "LOW".
+    expect(r?.levelLabel).toBe("HIGH")
+    // No findings → the pure score band stands.
+    const safe = buildReportRisk([], metrics)
+    expect(safe?.levelLabel).toBe(riskLevel(safe!.normalizedScore).label)
+    // A Medium finding floors to MEDIUM.
+    const medAlert: AlertEntry = { ...credAlert, severity: 3, ruleId: "PORT-SCAN-001" }
+    expect(buildReportRisk([medAlert], metrics)?.levelLabel).toBe("MEDIUM")
+  })
+
+  it("rawScore stays UNROUNDED so the breakdown's curve row agrees with the normalized score (audit)", () => {
+    // TLS-SUSPICIOUS-001 (sev 3 → 8, rule 25) at confidence 40 → 0.5×
+    // multiplier → raw 11.5: a fractional raw must NOT be pre-rounded. The
+    // page substitutes the stored raw into the curve, and a rounded 12 would
+    // display a formula that no longer produces the shown normalized score.
+    const alert: AlertEntry = {
+      id: "t1", timestamp: new Date(T0 * 1000).toISOString(), signature: "Suspicious TLS",
+      category: "Suspicious TLS", severity: 3, confidence: 40, ruleId: "TLS-SUSPICIOUS-001",
+      srcIp: "10.0.0.5", dstIp: "23.155.129.172", srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "x",
+    }
+    const metrics = { burst: null, beaconDetected: false } as unknown as AdvancedMetrics
+    const r = buildReportRisk([alert], metrics)
+    expect(r?.rawScore).toBe(11.5)
+    // The stored raw is the curve input: round(100 * (1 - exp(-raw/80)))
+    // === normalized — a pre-rounded raw would break this identity.
+    expect(Math.round(100 * (1 - Math.exp(-r!.rawScore / 80)))).toBe(r!.normalizedScore)
   })
 
   it("bandwidthStats: min/median/p95 from interval sums; nulls when not enough data", () => {

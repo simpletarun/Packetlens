@@ -46,8 +46,12 @@ export function computeStats(input: {
     // 0:0:0:0:0:0:0:0 — the DHCPv6 client) pass it, and a regenerated capture
     // drifted the census 5 → 6 when DHCPv6 chatter entered the LAN set (QA).
     // isNonUnicast mirrors the analyzer's device filter, so the frontend count
-    // can never admit a row the Rust device list excluded.
-    if (!isPrivateIP(d.ip) || isNonUnicast(d.ip)) continue
+    // can never admit a row the Rust device list excluded. A row whose PRIMARY
+    // is a LAN delegated-prefix IPv6 (the engine's merge pass can leave the
+    // home v6 as the row's ip on a byte-tie) is local too — its private
+    // ALIAS proves the merge (QA: router v6 primary counted as external).
+    if (isNonUnicast(d.ip)) continue
+    if (!isPrivateIP(d.ip) && !(d.addresses ?? []).some((a) => isPrivateIP(a))) continue
     localOwned.add(d.ip)
     for (const a of d.addresses ?? []) {
       if (!isNonUnicast(a)) localOwned.add(a)

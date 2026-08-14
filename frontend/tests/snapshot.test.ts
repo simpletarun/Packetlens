@@ -1,10 +1,8 @@
 import { describe, it, expect } from "vitest"
 import { analyzePcap, ANALYSIS_SCHEMA_VERSION, ANALYZER_VERSION } from "@/lib/analysis"
 import { buildReportAnalysis } from "@/lib/report"
-import { riskLevel } from "@/lib/risk"
+import { riskLevel, verdictLevel } from "@/lib/risk"
 import type { ParsedPacket } from "@/lib/pcap"
-
-const riskLevelOf = (s: number) => riskLevel(s).label
 
 // Golden snapshot of the CANONICAL Analysis JSON: any shape change to the
 // engine's output (schemaVersion bump, new validator field, flow field
@@ -199,6 +197,9 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
     expect(r.metadata.captureQuality).toBe(a.validator.captureQuality)
     expect(r.metadata.ratesAvailable).toBe(a.validator.durationSec !== null)
     expect(r.risk!.normalizedScore).toBe(a.job.riskScore)
-    expect(r.risk!.levelLabel).toBe(riskLevelOf(a.job.riskScore))
+    // The verdict level is the score band floored by the strongest finding —
+    // this capture has a confirmed High finding under a LOW score band.
+    expect(r.risk!.levelLabel).toBe(verdictLevel(riskLevel(a.job.riskScore), a.job.highestSeverity).label)
+    expect(r.risk!.highestSeverity).toBe(4)
   })
 })

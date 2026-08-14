@@ -6,7 +6,7 @@ import { parsePcap } from "@/lib/pcap"
 import { analyzePcap } from "@/lib/analysis"
 import { buildReportAnalysis, dnsLookupCount, analystConclusion } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
-import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel } from "@/lib/risk"
+import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel, verdictLevel } from "@/lib/risk"
 import type { JobSummary } from "@/stores/analysis"
 
 const testsDir = dirname(fileURLToPath(import.meta.url))
@@ -316,7 +316,7 @@ async function audit(file: string, display: string) {
       expect.soft([0.5, 1, 1.5].includes(i.confidenceMult), `${display}: risk mult ${i.ruleId}`).toBe(true)
       expect.soft(Math.abs(i.contribution - (i.severityWeight + i.ruleWeight) * i.confidenceMult) <= 0.11, `${display}: risk contribution ${i.ruleId}`).toBe(true)
     }
-    expect.soft(riskLevel(br.normalizedScore).label, `${display}: risk level`).toBe(br.levelLabel)
+    expect.soft(verdictLevel(riskLevel(br.normalizedScore), br.highestSeverity ?? 0).label, `${display}: risk level`).toBe(br.levelLabel)
     expect.soft(!!br.burstApplied, `${display}: burstApplied`).toBe(boost && br.items.some((i) => BURST_RULES.has(i.ruleId)))
   }
 

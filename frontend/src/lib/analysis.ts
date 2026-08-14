@@ -143,6 +143,10 @@ export interface AnalysisCredential {
   protocol: string; username: string; password: string; service: string
   /** Provenance: the capture packet number that carried the credential. */
   packetNum?: number
+  /** The HTTP Host header of the exchange — ties the alert to the hostname
+   *  the report's HTTP table shows (QA: alerts cited only raw IPs, so a
+   *  finding on 23.155.129.172 could not be correlated to vbsca.ca). */
+  host?: string
 }
 
 export interface AnalysisCertificate {
@@ -746,7 +750,16 @@ function deriveTls(packets: ParsedPacket[]): AnalysisTlsEntry[] {
     // capability offer (QA: qwen handshake offered TLS_AES_128_GCM_SHA256
     // but the ServerHello answered ECDHE-RSA-AES128-GCM-SHA256 → TLSv1.2).
     const version = negotiated !== undefined
-      ? (negotiated >= 0x1301 && negotiated <= 0x1305 ? 'TLSv1.3' : 'TLSv1.2')
+      ? (negotiated >= 0x1301 && negotiated <= 0x1305
+          ? 'TLSv1.3'
+          // Legacy suite: the handshake is pre-1.3. The ClientHello's
+          // legacy_version is the client's REAL offer (0x0301/0x0302/0x0300),
+          // so a TLS 1.0-era handshake must not read as TLSv1.2; only fall
+          // back to 1.2 when the offer is unknown or already 1.2 (QA: a
+          // TLS 1.0 ServerHello pair showed TLSv1.2 before).
+          : p.tlsVersion === 0x0300 || p.tlsVersion === 0x0301 || p.tlsVersion === 0x0302
+            ? tlsVersionName(p.tlsVersion)
+            : 'TLSv1.2')
       : tlsVersionName(p.tlsVersion)
     return {
       id: `tls-${i + 1}`,
@@ -950,6 +963,7 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
         password: decoded.slice(colon + 1),
         service: 'HTTP Basic',
         packetNum: p.num,
+        host: p.httpHost || '',
       })
       continue
     }
@@ -993,6 +1007,7 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
       password: pass ?? '\u2014',
       service: 'HTTP Form',
       packetNum: p.num,
+      host: p.httpHost || '',
     })
   }
   return creds
@@ -1045,34 +1060,14 @@ function osFingerprint(ips: string[], packets: ParsedPacket[], isPrivate: boolea
   return { os: 'Unknown', source: 'ttl' }
 }
 
-function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
-  // IP -> hostname from DNS answers observed in the capture: A/AAAA answers
-  // map the queried name to its IP, PTR answers map the reverse-arpa IP back
-  // to a hostname. First-seen wins; no network calls involved.
-  const ipToName = new Map<string, string>()
-  for (const p of packets) {
-    for (const a of p.dnsAnswers || []) {
-      if (a.ip && a.name) {
-        const name = a.name.replace(/\.$/, '').toLowerCase()
-        if (name && !ipToName.has(a.ip)) ipToName.set(a.ip, name)
-      }
-    }
-  }
-  // TLS SNI names the SERVER the client is contacting (the ClientHello's
-  // dst); it is client-observed, so DNS answers stay authoritative and SNI
-  // only backfills hosts with no DNS resolution (QA: www.wireshark.org never
-  // surfaced in Devices).
-  const sniByIp = new Map<string, string>()
-  for (const p of packets) {
-    if (p.tlsSni && p.dstIp && !sniByIp.has(p.dstIp)) sniByIp.set(p.dstIp, p.tlsSni.toLowerCase())
-  }
-  const map = new Map<string, { mac: string; l2: string; first: number; last: number; count: number; bytes: number }>()
-  // The /64 of every global-scope IPv6 this capture saw as SOURCE, and which
-  // MACs sourced it. A global v6 on a LAN is the delegated /64 — unless the
-  // /64 shows up from two or more LAN interfaces it is a server reachable
-  // through the router, and folding it into the LAN would mislabel the
-  // router's forwarded hosts as local (QA: calls.pcap client kept showing its
-  // own delegated IPv6 as a phantom Remote device).
+// Delegated /64s of the capture: global-scope IPv6 prefixes sourced by TWO or
+// more LAN interfaces are the LAN's own delegated address space, so every
+// address in them is LOCAL. Shared by the device merge (folds home-prefix v6s
+// into the substrate device) and the external-IP derivation (a home-prefix
+// PRIMARY device row — a byte-tie merge artifact — must never count as an
+// external peer). The shadow-MAC collapse keeps forwarded SERVER prefixes out
+// of the delegated set (see deriveDevices).
+function delegatedPrefixes(packets: ParsedPacket[]): Set<string> {
   const prefixSourcers = new Map<string, Set<string>>()
   for (const p of packets) {
     const ip = p.srcIp
@@ -1131,11 +1126,42 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
   for (const m of shadowMacs) {
     for (const macs of prefixSourcers.values()) macs.delete(m)
   }
+  // Delegated only when TWO or more LAN interfaces remain as sourcers: a /64
+  // sourced by a single MAC is a forwarded server prefix (the router forwards
+  // its traffic), never LAN-owned address space.
+  return new Set([...prefixSourcers].filter(([, macs]) => macs.size >= 2).map(([prefix]) => prefix))
+}
+
+function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
+  const delegated = delegatedPrefixes(packets)
+  // Shared with the external-IP derivation: a home-prefix row that became a
+  // device PRIMARY (byte-tie merge keeps the v6 as the row's ip) is still a
+  // LAN address and must never count as an external peer.
   const homePrefix = (ip: string): boolean => {
     if (!ip.includes(':') || isPrivateIp(ip) || isNonUnicast(ip)) return false
-    const n = (prefixSourcers.get(ip.split(':').slice(0, 4).join(':')) ?? new Set()).size
-    return n >= 2
+    return delegated.has(ip.split(':').slice(0, 4).join(':'))
   }
+  // IP -> hostname from DNS answers observed in the capture: A/AAAA answers
+  // map the queried name to its IP, PTR answers map the reverse-arpa IP back
+  // to a hostname. First-seen wins; no network calls involved.
+  const ipToName = new Map<string, string>()
+  for (const p of packets) {
+    for (const a of p.dnsAnswers || []) {
+      if (a.ip && a.name) {
+        const name = a.name.replace(/\.$/, '').toLowerCase()
+        if (name && !ipToName.has(a.ip)) ipToName.set(a.ip, name)
+      }
+    }
+  }
+  // TLS SNI names the SERVER the client is contacting (the ClientHello's
+  // dst); it is client-observed, so DNS answers stay authoritative and SNI
+  // only backfills hosts with no DNS resolution (QA: www.wireshark.org never
+  // surfaced in Devices).
+  const sniByIp = new Map<string, string>()
+  for (const p of packets) {
+    if (p.tlsSni && p.dstIp && !sniByIp.has(p.dstIp)) sniByIp.set(p.dstIp, p.tlsSni.toLowerCase())
+  }
+  const map = new Map<string, { mac: string; l2: string; first: number; last: number; count: number; bytes: number }>()
   // ARP sender MAC → the IP the sender claims to own (RFC 826 sha/spa). This
   // is hard identity evidence the Ethernet header alone can miss: the router's
   // own ARP (192.168.1.1 → 192.168.1.20) declares its interface MAC, which is
@@ -1143,6 +1169,11 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
   // all three fold into ONE device instead of a phantom router split (QA:
   // Devices card read 5 where the report said 4). (Declarations also mark the
   // MAC as a real LAN interface for the shadow-MAC collapse above.)
+  const arpMacByIp = new Map<string, string>()
+  for (const p of packets) {
+    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac) continue
+    if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
+  }
   for (const p of packets) {
     // Dedupe self-addressed packets (gratuitous ARP, DAD): srcIp === dstIp
     // would otherwise count the packet twice for one device (QA).
@@ -1750,7 +1781,11 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     return h
   }
   const suspiciousDns = dnsQueries.filter(q => label(q).length > 40 || entropy(label(q)) > 4.5)
-  const dnsRate = dnsQueries.length / duration
+  // A zero-duration capture (single packet / identical timestamps) has no
+  // time interval — a rate is meaningless, and dividing by 0 would fabricate
+  // "Infinity/s" evidence for a capture with >20 DNS packets but no tunnel
+  // (QA: burst-rate path had the same class of bug).
+  const dnsRate = duration > 0 ? dnsQueries.length / duration : 0
   let maxLabelLen = 0
   let maxEntropy = 0
   for (const q of dnsQueries) {
@@ -1897,13 +1932,16 @@ export function packetProtocolCounts(
 export function analyzePcap(result: PCAPResult): AnalysisResult {
   const { packets: raw, stats } = result
   // Per-direction initial TCP sequence so each side's relative Seq starts at 0
-  // from ITS OWN first segment in capture order (the client SYN on the client
+  // from ITS OWN first segment in wire order (the client SYN on the client
   // leg, the SYN-ACK on the server leg for a handshake in the capture). The
   // previous flowKeyOf base rebased BOTH directions against whichever side
   // appeared first, so mid-session server replies showed raw 32-bit values
-  // (QA: client Seq=0/519, server Seq=834237805).
+  // (QA: client Seq=0/519, server Seq=834237805). The first segment is taken
+  // in TIMESTAMP order, not file order: pcapng writers may store records out
+  // of time order, and a reordered SYN must not become the "base" after the
+  // conversation has already progressed.
   const seqBases = new Map<string, number>()
-  for (const p of raw) {
+  for (const p of [...raw].sort((a, b) => a.timestamp - b.timestamp)) {
     if (p.protocol === 'TCP' && typeof p.tcpSeq === 'number') {
       const key = dirKeyOf(p)
       if (!seqBases.has(key)) seqBases.set(key, p.tcpSeq)
@@ -1951,9 +1989,17 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
   // uploads can never trip exfil, and beacon remoteOf can name the local host
   // as the C2 remote (QA: test.pcapng External 25 → 24 after the v6 folded).
   const localAliases = new Set<string>()
+  const delegated = delegatedPrefixes(raw)
   for (const d of devices) {
-    if (!isPrivateIp(d.ip)) continue
-    localAliases.add(d.ip)
+    // A row is local when its primary is a private LAN address OR a LAN
+    // delegated-prefix IPv6. The latter matters when the merge pass left a
+    // home-prefix v6 as the row's PRIMARY (byte-tie merge): that v6 is still
+    // the LAN's own address and must never read as an external peer (QA:
+    // router v6 primary counted as external). addresses hold only local
+    // aliases (the merge gate is private/home-prefix-only), so they are
+    // added unconditionally.
+    const homePrimary = d.ip.includes(':') && !isPrivateIp(d.ip) && !isNonUnicast(d.ip) && delegated.has(d.ip.split(':').slice(0, 4).join(':'))
+    if (isPrivateIp(d.ip) || homePrimary) localAliases.add(d.ip)
     for (const a of d.addresses ?? []) localAliases.add(a)
   }
   const threats = deriveThreats(raw)
@@ -1962,7 +2008,9 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
   const advancedMetrics = deriveAdvancedMetrics(raw, flows, threats, localAliases)
   let captureEndSec = Date.now() / 1000
   if (raw.length) {
-    let cMax = 0
+    // -Infinity seed: a capture of only pre-1970 timestamps (valid in pcap)
+    // must not resolve its "capture end" to epoch 0 and date certs there.
+    let cMax = -Infinity
     for (const p of raw) if (p.timestamp > cMax) cMax = p.timestamp
     captureEndSec = cMax
   }
@@ -1998,7 +2046,7 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
         ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
         srcIp: c.srcIp, dstIp: c.dstIp, srcPort: 0, dstPort: 0,
         protocol: c.protocol || 'TCP',
-        evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} (first: ${c.username} → ${c.dstIp})`,
+        evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''} (user: ${c.username})`,
         packetNums: [...new Set(creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))],
         // Credentials exist only because payload content was decoded: this is
         // payload proof, not port inference.
@@ -2007,13 +2055,20 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
     }
   }
 
-  // External = non-LAN destinations; multicast/broadcast/unspecified/loopback
-  // are transport chatter, not peers (they used to inflate the count). VPN and
+  // External = peers on EITHER side of every conversation, not just
+  // destinations: a probe capture arriving INBOUND (server → LAN, no replies)
+  // must still count its peers. multicast/broadcast/unspecified/loopback are
+  // transport chatter, not peers (they used to inflate the count). VPN and
   // the client's own delegated-prefix IPv6 are local, so their aliases never
   // count (QA: calls.pcap External 22 behaved as 21 after the v6 merged).
-  const externalIps = new Set(
-    raw.map(p => p.dstIp).filter(Boolean).filter((ip): ip is string => !isNonUnicast(ip!) && !localAliases.has(ip!))
-  )
+  // Mirrors the frontend recompute in stats.ts (plus the delegated-prefix
+  // refinement, which stats mirrors via its private-alias signal), so the job
+  // card, the report and the dashboard can never disagree on the count.
+  const externalIps = new Set<string>()
+  for (const p of raw) {
+    if (p.srcIp && !isNonUnicast(p.srcIp) && !isPrivateIp(p.srcIp) && !localAliases.has(p.srcIp)) externalIps.add(p.srcIp)
+    if (p.dstIp && !isNonUnicast(p.dstIp) && !isPrivateIp(p.dstIp) && !localAliases.has(p.dstIp)) externalIps.add(p.dstIp)
+  }
   const domains = new Set(dns.map(d => d.query))
 
 const job: AnalysisJob = {

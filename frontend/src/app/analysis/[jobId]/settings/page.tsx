@@ -73,6 +73,11 @@ export default function SettingsPage() {
   const [lonInput, setLonInput] = useState<string>(settings.homeLon == null ? "" : String(settings.homeLon))
   const [homeError, setHomeError] = useState<string | null>(null)
   const [homeSaved, setHomeSaved] = useState(false)
+  // Cancellation shared by BOTH poll arms (mount effect + Retry button):
+  // a retry-started poll must also stop when the page unmounts, or it would
+  // keep scheduling setState on a dead component forever (QA: Retry polled
+  // with cancelled: () => false).
+  const geoPollCancelled = useRef(false)
 
   const applyHome = () => {
     setHomeError(null)
@@ -106,9 +111,9 @@ export default function SettingsPage() {
   }
 
   useEffect(() => {
-    let cancelled = false
-    pollGeoStatus({ cancelled: () => cancelled, onStatus: setDbStatus })
-    return () => { cancelled = true }
+    geoPollCancelled.current = false
+    pollGeoStatus({ cancelled: () => geoPollCancelled.current, onStatus: setDbStatus })
+    return () => { geoPollCancelled.current = true }
   }, [])
 
   const uploadDb = async (f: File) => {
@@ -247,7 +252,7 @@ export default function SettingsPage() {
                           // Fire-and-forget: the download endpoint starts the
                           // auto-install server-side; the poll loop tracks it.
                           fetch("/api/v1/geo/db").catch(() => {})
-                          pollGeoStatus({ cancelled: () => false, onStatus: setDbStatus })
+                          pollGeoStatus({ cancelled: () => geoPollCancelled.current, onStatus: setDbStatus })
                         }}>
                         <RefreshCw className="h-3.5 w-3.5 mr-1" /> Retry auto-install
                       </Button>

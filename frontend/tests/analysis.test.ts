@@ -1594,6 +1594,55 @@ describe("v3.2 QA regression fixes", () => {
     expect(analysis.tls[0].cipherSuite).toBe("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
   })
 
+  it("negotiated legacy suite honors a TLS 1.0-era ClientHello — the row reads TLSv1.0, not TLSv1.2 (audit)", () => {
+    const t0 = 1_700_000_000
+    const packets: ParsedPacket[] = [
+      // TLS 1.0 ClientHello (legacy_version 0x0301) answered with a
+      // pre-1.3 suite: the handshake IS 1.0, never 1.2.
+      makePacket({ num: 1, timestamp: t0, srcIp: "192.168.1.10", dstIp: "93.184.216.34", srcPort: 50000, dstPort: 443, tlsSni: "legacy.example", tlsVersion: 0x0301 }),
+      makePacket({ num: 2, timestamp: t0 + 1, srcIp: "93.184.216.34", dstIp: "192.168.1.10", srcPort: 443, dstPort: 50000, tcpFlags: "ACK", tlsCipherSuite: 0x002f }),
+    ]
+    const analysis = analyzePcap(mkResult(packets))
+    expect(analysis.tls.length).toBe(1)
+    // 0x002F is a pre-1.2 suite with no friendly name — the VERSION is what
+    // matters here: the ClientHello's 0x0301 (TLS 1.0) must not read 1.2.
+    expect(analysis.tls[0].version).toBe("TLSv1.0")
+    expect(analysis.tls[0].cipherSuite).toBe("0x002F")
+  })
+
+  it("external IPs count peers on EITHER side — an inbound-only capture still counts its remote (audit)", () => {
+    const packets: ParsedPacket[] = [
+      // Remote probing INTO the LAN, no replies: dst-only counting saw 0.
+      makePacket({ num: 1, srcIp: "8.8.8.8", dstIp: "192.168.1.20", protocol: "UDP", dstPort: 53, tcpFlags: undefined }),
+      // LAN chatter must stay out of the count.
+      makePacket({ num: 2, srcIp: "192.168.1.20", dstIp: "192.168.1.1", protocol: "UDP", dstPort: 53, tcpFlags: undefined }),
+    ]
+    const result: PCAPResult = {
+      packets,
+      stats: { totalPackets: 2, totalBytes: 128, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { UDP: 2 } },
+    }
+    const analysis = analyzePcap(result)
+    expect(analysis.job.externalIps).toBe(1)
+  })
+
+  it("zero-duration captures never fabricate a DNS-tunnel rate (audit: 'Infinity/s' evidence)", () => {
+    // Identical timestamps → no time interval → duration 0. 25 plain queries
+    // would read "25/0 = Infinity/s" and fire the rate branch of the evidence
+    // with a nonsense rate (QA: fabricated DNS-TUNNEL alert).
+    const packets: ParsedPacket[] = []
+    const names = ["www.google.com", "api.github.com", "login.microsoftonline.com"]
+    for (let i = 0; i < 25; i++) {
+      packets.push(makePacket({ num: i + 1, protocol: "UDP", dstPort: 53, timestamp: 1000000, dnsQuery: names[i % names.length] }))
+    }
+    const result: PCAPResult = {
+      packets,
+      stats: { totalPackets: packets.length, totalBytes: packets.reduce((s, p) => s + p.length, 0), duration: 0, startTime: 1000000, endTime: 1000000, protocols: { UDP: packets.length } },
+    }
+    const analysis = analyzePcap(result)
+    expect(analysis.advancedMetrics.dnsTunnelingSuspected).toBe(false)
+    expect(analysis.threats.some((t) => t.ruleId === "DNS-TUNNEL-001")).toBe(false)
+  })
+
   it("beaconing: regular talk to a WNS/Skype push endpoint is not C2 (QA: keepalive FP)", () => {
     const t0 = 1_700_000_000
     const packets: ParsedPacket[] = []

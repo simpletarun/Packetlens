@@ -9,7 +9,7 @@ import type {
 import { isPrivateIP, slaacPrefixesOf, matchesSlaacPrefix } from "@/lib/map-data"
 import { isNonUnicast, safeIso } from "@/lib/analysis"
 import type { GeoLocation } from "@/lib/geo"
-import { buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel } from "./risk"
+import { buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel, verdictLevel } from "./risk"
 import type { RiskBreakdownItem } from "./risk"
 
 // MAC-merged alias → owning device IP (the analyzer's addresses[] field).
@@ -380,19 +380,27 @@ export function buildReportRisk(alerts: AlertEntry[], advancedMetrics: AdvancedM
   const burstApplied = burstConfidenceBoost(advancedMetrics) &&
     riskAlerts.some((a) => burstEligibleRules.includes(a.ruleId))
   const b = computeRiskBreakdown(riskAlerts, burstApplied)
-  const level = riskLevel(b.normalizedScore)
+  // The strongest finding severity, surfaced ALONGSIDE the score — a
+  // HIGH-severity alert with a 39/100 LOW score must never read as a
+  // downgrade of the finding itself.
+  const highestSeverity = alerts.reduce((m, a) => Math.max(m, a.severity), 0)
+  // Verdict level = score band, floored by the finding severity (severity
+  // floor): the numeric score stays honest, but a capture with a confirmed
+  // High finding is never presented as LOW.
+  const level = verdictLevel(riskLevel(b.normalizedScore), highestSeverity)
   return {
-    rawScore: Math.round(b.rawScore),
+    // Unrounded raw: the breakdown's curve row substitutes THIS value, so
+    // rounding it here would make the displayed formula disagree with the
+    // normalized score it produces (QA: raw 40 showed "≈ 39.3" for a curve
+    // evaluated at a rounded integer that was no longer 40).
+    rawScore: b.rawScore,
     normalizedScore: b.normalizedScore,
     formula: b.formula,
     levelLabel: level.label,
     levelColor: level.color,
     items: b.items,
     burstApplied,
-    // The strongest finding severity, surfaced ALONGSIDE the score — a
-    // HIGH-severity alert with a 39/100 LOW score must never read as a
-    // downgrade of the finding itself.
-    highestSeverity: alerts.reduce((m, a) => Math.max(m, a.severity), 0),
+    highestSeverity,
   }
 }
 
@@ -559,6 +567,10 @@ function timelineLabel(secFromStart: number): string {
 
 export interface TimelineBin {
   time: string
+  // Wall-clock start of this bin in epoch seconds, so downstream derivations
+  // (bandwidth per-second rates) can measure the bin's REAL overlap with the
+  // capture instead of assuming a full bin width.
+  startSec: number
   packets: number
   bytes: number
   in: number
@@ -583,6 +595,7 @@ export function binPackets(packets: Packet[], durationSec: number, maxBins = 120
     const idx = Math.floor((packetEpochSec(p) - t0) / bin)
     const b = buckets.get(idx) || {
       time: timelineLabel(idx * bin),
+      startSec: t0 + idx * bin,
       packets: 0,
       bytes: 0,
       in: 0,
@@ -645,18 +658,34 @@ function buildTimeline(
 export function bucketOverlapSec(label: string, captureStartSec: number, captureEndSec: number): number {
   const start = new Date(captureStartSec * 1000)
   const y = start.getFullYear()
-  let iso: string
+  const resolve = (iso: string): number => {
+    const bStart = new Date(iso).getTime() / 1000
+    const overlap = Math.min(bStart + 300, captureEndSec) - Math.max(bStart, captureStartSec)
+    return overlap >= 1 ? Math.min(overlap, 300) : 0
+  }
+  // Resolve the label on the capture's start day first. A bucket on the NEXT
+  // day (capture spanning midnight, or a January bucket in a year-crossing
+  // capture) resolves to a time BEFORE the capture start, so retry with the
+  // next day/year before falling back to a full 300 s (QA: a 23:50–00:03
+  // capture understated the final bucket's rate ~1.7x).
+  const candidates: string[] = []
   if (label.includes("-")) {
     const [md, hhmm] = label.split(" ")
-    iso = `${y}-${md} ${hhmm}`
+    candidates.push(`${y}-${md} ${hhmm}`, `${y + 1}-${md} ${hhmm}`)
   } else {
     const mm = String(start.getMonth() + 1).padStart(2, "0")
     const dd = String(start.getDate()).padStart(2, "0")
-    iso = `${y}-${mm}-${dd} ${label}`
+    candidates.push(`${y}-${mm}-${dd} ${label}`)
+    const tomorrow = new Date(start.getTime() + 86400000)
+    const tmm = String(tomorrow.getMonth() + 1).padStart(2, "0")
+    const tdd = String(tomorrow.getDate()).padStart(2, "0")
+    candidates.push(`${tomorrow.getFullYear()}-${tmm}-${tdd} ${label}`)
   }
-  const bStart = new Date(iso).getTime() / 1000
-  const overlap = Math.min(bStart + 300, captureEndSec) - Math.max(bStart, captureStartSec)
-  return overlap >= 1 ? Math.min(overlap, 300) : 300
+  for (const iso of candidates) {
+    const overlap = resolve(iso)
+    if (overlap > 0) return overlap
+  }
+  return 300
 }
 
 // Bandwidth points are displayed per-second ("KB/s"), so both sources divide
@@ -683,7 +712,16 @@ export function buildBandwidth(
     }))
   }
   const bin = binWidthSec(durationSec)
-  return binPackets(packets as Packet[], durationSec).map((b) => ({ time: b.time, in: b.in / bin, out: b.out / bin }))
+  const [start, end] = packetSpanSec(packets)
+  // The rebin starts at the first packet, so every bin but the LAST is full
+  // width — the tail bin holds the fractional second between its last packet
+  // and the capture end. Dividing it by the full bin width understates the
+  // tail's per-second rate (mirror of the store path's bucketOverlapSec).
+  return binPackets(packets as Packet[], durationSec).map((b) => {
+    const overlap = Math.min(b.startSec + bin, end) - Math.max(b.startSec, start)
+    const width = overlap >= 0.001 ? overlap : bin
+    return { time: b.time, in: b.in / width, out: b.out / width }
+  })
 }
 
 // Real packet/byte counts per alert from flow stats. Flow pairs are stored

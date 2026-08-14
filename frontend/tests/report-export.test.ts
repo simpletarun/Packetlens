@@ -88,7 +88,8 @@ describe("report export data layer parity — every capture must feed the export
     expect.soft(stats.devices, `${name}: devices (local only)`).toBe(localRows)
     const localOwned = new Set<string>()
     for (const d of a.devices) {
-      if (!isPrivateIP(d.ip) || isNonUnicast(d.ip)) continue
+      if (isNonUnicast(d.ip)) continue
+      if (!isPrivateIP(d.ip) && !(d.addresses ?? []).some((ad) => isPrivateIP(ad))) continue
       localOwned.add(d.ip)
       for (const ad of d.addresses ?? []) if (!isNonUnicast(ad)) localOwned.add(ad)
     }
