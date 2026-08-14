@@ -79,6 +79,53 @@ describe("PCAP parser", () => {
     expect(result.packets[0].srcIp).toBe("192.168.1.10")
   })
 
+  it("flags snaplen-truncated frames (captured length < original length)", async () => {
+    const frame = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x08, 0x00, 0x45, 0x00]
+    const cut = frame.slice(0, 10) // only 10 of 16 captured bytes present
+    const buf = Buffer.from([
+      0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      ...little32(1), ...little32(0), ...little32(cut.length), ...little32(frame.length),
+      ...cut,
+    ])
+    const result = await parsePcap(buf)
+    expect(result.stats?.totalPackets).toBe(1)
+    expect(result.stats?.truncatedPackets).toBe(1)
+    expect(result.packets[0].length).toBe(10)
+    expect(result.packets[0].origLength).toBe(16)
+    expect(result.stats?.fileTruncated).toBeFalsy()
+  })
+
+  it("flags frames too short for their own Ethernet header as malformed", async () => {
+    const buf = Buffer.from([
+      0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      ...little32(1), ...little32(0), ...little32(10), ...little32(10),
+      0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0xaa, 0xbb, 0xcc, 0xdd,
+    ])
+    const result = await parsePcap(buf)
+    expect(result.stats?.totalPackets).toBe(1)
+    expect(result.stats?.malformedPackets).toBe(1)
+    expect(result.stats?.decodedPackets).toBe(0)
+    expect(result.stats?.fileTruncated).toBeFalsy()
+  })
+
+  it("flags a file that ends mid-record as truncated (declared length past EOF)", async () => {
+    const buf = Buffer.from([
+      0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      ...little32(1), ...little32(0), ...little32(60), ...little32(60),
+      0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // file ends 6 bytes into a 60-byte frame
+    ])
+    const result = await parsePcap(buf)
+    expect(result.stats?.totalPackets).toBe(1)
+    expect(result.stats?.truncatedPackets).toBe(1)
+    expect(result.stats?.fileTruncated).toBe(true)
+  })
+
   it("decodes RAW IP headers (DLT 12/101) since v3.2 (F-01)", async () => {
     // 20-byte IPv4 header + 8-byte UDP, no Ethernet header.
     const raw = [0x45, 0x00, ...be16(28), ...be16(7), ...be16(0), 64, 17, 0x00, 0x00, 10, 0, 0, 5, 203, 0, 113, 9, ...be16(0), ...be16(0), ...be16(8), 0, 0]
@@ -465,6 +512,55 @@ function buildArpPcap(): Buffer {
     ...frame,
   ])
 }
+
+// Ethernet + IPv4 + TCP with the given flag byte and optional payload.
+// Defaults to an ephemeral client port → 80 (the port-inferred HTTP case).
+function buildFlagTcpPcap(flags: number, payload: number[] = [], srcPort = 50000, dstPort = 80): Buffer {
+  const ipLen = 20 + 20 + payload.length
+  const ip = [
+    0x45, 0x00, ...be16(ipLen), ...be16(7), ...be16(0), 64, 6, 0x00, 0x00,
+    192, 168, 1, 5, 8, 8, 8, 8,
+  ]
+  const tcp = [
+    ...be16(srcPort), ...be16(dstPort), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    (5 << 4) | (flags >> 8 & 0x0f), flags & 0xff,
+    ...be16(65535), ...be16(0), 0x00, 0x00,
+    ...payload,
+  ]
+  const frame = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x08, 0x00, ...ip, ...tcp]
+  return Buffer.from([
+    0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    ...little32(1), ...little32(0), ...little32(frame.length), ...little32(frame.length),
+    ...frame,
+  ])
+}
+
+describe("protocol honesty — payload vs port-inferred labels", () => {
+  it("a pure SYN to :80 is HTTP BY PORT, never payload-confirmed", async () => {
+    const result = await parsePcap(buildFlagTcpPcap(0x02))
+    expect(result.packets[0].appProtocol).toBe("HTTP")
+    expect(result.packets[0].appPayloadConfirmed).toBeUndefined()
+    expect(result.packets[0].httpMethod).toBeUndefined()
+  })
+
+  it("a GET request is payload-confirmed HTTP", async () => {
+    const payload = [...Buffer.from("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")]
+    const result = await parsePcap(buildFlagTcpPcap(0x18, payload))
+    expect(result.packets[0].appProtocol).toBe("HTTP")
+    expect(result.packets[0].appPayloadConfirmed).toBe(true)
+    expect(result.packets[0].httpMethod).toBe("GET")
+  })
+
+  it("a TLS ClientHello on :443 is payload-confirmed TLS", async () => {
+    // TLS record (0x16) + handshake ClientHello (0x01, len 39+2 for SNI).
+    const hello = [0x16, 0x03, 0x01, 0x00, 0x29, 0x01, 0x00, 0x00, 0x29, 0x03, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    const result = await parsePcap(buildFlagTcpPcap(0x18, hello, 50000, 443))
+    expect(result.packets[0].appProtocol).toBe("TLS")
+    expect(result.packets[0].appPayloadConfirmed).toBe(true)
+  })
+})
 
 // ── DER helpers + hand-crafted X.509 certificate for parser tests ──────────
 

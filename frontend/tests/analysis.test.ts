@@ -21,6 +21,143 @@ function makePacket(overrides: Partial<ParsedPacket> = {}): ParsedPacket {
   }
 }
 
+describe("protocol honesty — flow protocolSource (payload vs port_inferred)", () => {
+  function run(packets: ParsedPacket[]) {
+    return analyzePcap({
+      packets,
+      stats: {
+        totalPackets: packets.length,
+        totalBytes: packets.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { TCP: packets.length },
+        linkTypes: [1], decodedPackets: packets.length,
+      },
+    })
+  }
+
+  it("TCP/80 with no HTTP payload is port_inferred, never payload", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "SYN", appProtocol: "HTTP" }),
+      makePacket({ num: 2, timestamp: 1000001, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "ACK", appProtocol: "HTTP" }),
+    ]
+    const f = run(packets).flows[0]
+    expect(f.protocolSource).toBe("port_inferred")
+    expect(f.appProtocol).toBe("HTTP")
+  })
+
+  it("a GET payload makes the flow payload-confirmed HTTP", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "PSH ACK", appProtocol: "HTTP", appPayloadConfirmed: true, httpMethod: "GET" }),
+      makePacket({ num: 2, timestamp: 1000001, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "ACK", appProtocol: "HTTP" }),
+    ]
+    const f = run(packets).flows[0]
+    expect(f.protocolSource).toBe("payload")
+    expect(f.appProtocol).toBe("HTTP")
+  })
+
+  it("bare transport with no app label is transport_only", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 3389, tcpFlags: "SYN" }),
+    ]
+    const f = run(packets).flows[0]
+    expect(f.protocolSource).toBe("transport_only")
+    expect(f.appProtocol).toBeUndefined()
+  })
+
+  it("a payload-confirmed label wins over port-inferred labels in a mixed flow", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "SYN", appProtocol: "HTTP" }),
+      makePacket({ num: 2, timestamp: 1000001, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "PSH ACK", appProtocol: "HTTP", appPayloadConfirmed: true, httpMethod: "POST" }),
+    ]
+    const f = run(packets).flows[0]
+    expect(f.protocolSource).toBe("payload")
+  })
+
+  it("packets surface the appPayloadConfirmed flag", () => {
+    const packets: ParsedPacket[] = [
+      makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 443, appProtocol: "TLS", appPayloadConfirmed: true, tlsSni: "example.com" }),
+    ]
+    const a = run(packets)
+    expect(a.packets[0].appPayloadConfirmed).toBe(true)
+  })
+})
+
+describe("TCP state machine — honest handshake states on flows and sessions", () => {
+  function run(packets: ParsedPacket[]) {
+    return analyzePcap({
+      packets,
+      stats: {
+        totalPackets: packets.length,
+        totalBytes: packets.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { TCP: packets.length },
+        linkTypes: [1], decodedPackets: packets.length,
+      },
+    })
+  }
+
+  // Client 192.168.1.1:12345 → server 10.0.0.1:80; reverse for server→client.
+  const SYN: ParsedPacket = { ...makePacket(), num: 1, tcpFlags: "SYN" }
+  const SYNACK: ParsedPacket = { ...makePacket({ num: 2, timestamp: 1000001, srcIp: "10.0.0.1", dstIp: "192.168.1.1", srcPort: 80, dstPort: 12345 }), tcpFlags: "SYN ACK" }
+  const ACK: ParsedPacket = { ...makePacket({ num: 3, timestamp: 1000002 }), tcpFlags: "ACK" }
+  const RST: ParsedPacket = { ...makePacket({ num: 4, timestamp: 1000003 }), tcpFlags: "RST" }
+  const FIN: ParsedPacket = { ...makePacket({ num: 5, timestamp: 1000004 }), tcpFlags: "FIN ACK" }
+
+  it("SYN only (failed/partial handshake) is INITIATED", () => {
+    const a = run([SYN, { ...makePacket({ num: 6, timestamp: 1000005 }), tcpFlags: "SYN" }])
+    expect(a.sessions[0].state).toBe("INITIATED")
+    expect(a.flows[0].tcpState).toBe("INITIATED")
+  })
+
+  it("SYN + SYN-ACK with no completing ACK is HALF_OPEN, not ESTABLISHED", () => {
+    const a = run([SYN, SYNACK])
+    expect(a.sessions[0].state).toBe("HALF_OPEN")
+    expect(a.flows[0].tcpState).toBe("HALF_OPEN")
+  })
+
+  it("SYN + SYN-ACK + ACK completes the handshake: ESTABLISHED", () => {
+    const a = run([SYN, SYNACK, ACK])
+    expect(a.sessions[0].state).toBe("ESTABLISHED")
+    expect(a.flows[0].tcpState).toBe("ESTABLISHED")
+  })
+
+  it("the final ACK must come AFTER the SYN-ACK (order-sensitive)", () => {
+    // ACK seen before the SYN-ACK (out-of-order capture) never completes it.
+    const a = run([SYN, ACK, SYNACK])
+    expect(a.sessions[0].state).toBe("HALF_OPEN")
+  })
+
+  it("RST overrides everything: RESET", () => {
+    const a = run([SYN, SYNACK, ACK, RST])
+    expect(a.sessions[0].state).toBe("RESET")
+  })
+
+  it("clean FIN close is CLOSED", () => {
+    const a = run([SYN, SYNACK, ACK, FIN])
+    expect(a.sessions[0].state).toBe("CLOSED")
+  })
+
+  it("mid-stream capture without a SYN is ESTABLISHED (honest guess)", () => {
+    const a = run([ACK, ACK])
+    expect(a.sessions[0].state).toBe("ESTABLISHED")
+  })
+
+  it("UDP sessions and flows are STATELESS", () => {
+    const udp: ParsedPacket = { ...makePacket({ num: 1, protocol: "UDP", tcpFlags: undefined }) }
+    const a = run([udp])
+    expect(a.sessions[0].state).toBe("STATELESS")
+    expect(a.flows[0].tcpState).toBe("STATELESS")
+  })
+
+  it("flow and session states always agree (mirror invariant)", () => {
+    const a = run([SYN, SYNACK, ACK, FIN])
+    for (const f of a.flows) {
+      const sess = a.sessions.find((s) => s.srcIp === f.srcIp && s.dstIp === f.dstIp && s.srcPort === f.srcPort && s.dstPort === f.dstPort)
+      expect(sess?.state).toBe(f.tcpState)
+    }
+  })
+})
+
 describe("Analysis engine", () => {
   it("analyzes an empty capture", () => {
     const result: PCAPResult = {
@@ -36,6 +173,90 @@ describe("Analysis engine", () => {
     expect(analysis.advancedMetrics.rates.quality).toBe("EMPTY")
     expect(analysis.advancedMetrics.throughputAvg).toBeNull()
     expect(analysis.advancedMetrics.iocs.length).toBe(0)
+  })
+
+  it("emits the canonical validator: quality, decode stats, integrity", () => {
+    const result: PCAPResult = {
+      packets: [],
+      stats: { totalPackets: 0, totalBytes: 0, duration: 0, startTime: 0, endTime: 0, protocols: {}, linkTypes: [], decodedPackets: 0 },
+    }
+    const analysis = analyzePcap(result)
+    expect(analysis.schemaVersion).toBeTruthy()
+    expect(analysis.validator.schemaVersion).toBe(analysis.schemaVersion)
+    expect(analysis.validator.captureQuality).toBe("EMPTY")
+    expect(analysis.validator.durationSec).toBeNull()
+    expect(analysis.validator.integrity.status).toBe("valid")
+    expect(analysis.validator.integrity.truncatedPackets).toBe(0)
+    expect(analysis.validator.integrity.malformedPackets).toBe(0)
+    expect(analysis.validator.integrity.fileTruncated).toBe(false)
+    expect(analysis.validator.decode.decodeRatePct).toBe(100)
+  })
+
+  it("validator: truncated integrity status wins over decode issues", () => {
+    const packets: ParsedPacket[] = [makePacket({ num: 1, timestamp: 1000000 }), makePacket({ num: 2, timestamp: 1000001 })]
+    const analysis = analyzePcap({
+      packets,
+      stats: {
+        totalPackets: 2, totalBytes: 128, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { TCP: 2 },
+        linkTypes: [1], decodedPackets: 1, truncatedPackets: 2, fileTruncated: true,
+      },
+    })
+    expect(analysis.validator.integrity.status).toBe("truncated")
+    expect(analysis.validator.integrity.fileTruncated).toBe(true)
+    expect(analysis.validator.integrity.truncatedPackets).toBe(2)
+    expect(analysis.validator.decode.decodeRatePct).toBe(50)
+  })
+
+  it("validator: unsupported link type beats malformed/incomplete", () => {
+    const packets: ParsedPacket[] = [makePacket({ num: 1, timestamp: 1000000, length: 64, origLength: 64 })]
+    const analysis = analyzePcap({
+      packets,
+      stats: {
+        totalPackets: 1, totalBytes: 64, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { OTHER: 1 },
+        linkTypes: [999], decodedPackets: 0, malformedPackets: 0,
+      },
+    })
+    expect(analysis.validator.integrity.status).toBe("unsupported_link_type")
+    expect(analysis.validator.integrity.unsupportedLinkTypes).toEqual([999])
+  })
+
+  it("validator: malformed frames are their own status on a supported link type", () => {
+    const packets: ParsedPacket[] = [makePacket({ num: 1, timestamp: 1000000 })]
+    const analysis = analyzePcap({
+      packets,
+      stats: {
+        totalPackets: 1, totalBytes: 64, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { TCP: 1 },
+        linkTypes: [1], decodedPackets: 1, malformedPackets: 3,
+      },
+    })
+    expect(analysis.validator.integrity.status).toBe("malformed")
+    expect(analysis.validator.integrity.malformedPackets).toBe(3)
+  })
+
+  it("validator: incomplete decode is reported when supported DLTs miss packets", () => {
+    const packets: ParsedPacket[] = [makePacket({ num: 1, timestamp: 1000000 }), makePacket({ num: 2, timestamp: 1000001 })]
+    const analysis = analyzePcap({
+      packets,
+      stats: {
+        totalPackets: 2, totalBytes: 128, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { TCP: 2 },
+        linkTypes: [1], decodedPackets: 1,
+      },
+    })
+    expect(analysis.validator.integrity.status).toBe("incomplete_decode")
+  })
+
+  it("validator: valid capture keeps valid status and full decode", () => {
+    const packets: ParsedPacket[] = [makePacket({ num: 1, timestamp: 1000000 }), makePacket({ num: 2, timestamp: 1000001 })]
+    const analysis = analyzePcap({
+      packets,
+      stats: {
+        totalPackets: 2, totalBytes: 128, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { TCP: 2 },
+        linkTypes: [1], decodedPackets: 2,
+      },
+    })
+    expect(analysis.validator.integrity.status).toBe("valid")
+    expect(analysis.validator.integrity.unsupportedLinkTypes).toEqual([])
+    expect(analysis.validator.captureQuality).toBe("VALID")
   })
 
   it("detects port scans from TCP SYN probes", () => {
@@ -440,6 +661,7 @@ describe("Analysis engine", () => {
       packets: [
         { ...base, tcpFlags: "SYN", dstPort: 443 },
         { ...base, tcpFlags: "SYN,ACK", dstPort: 443 },
+        { ...base, tcpFlags: "ACK", dstPort: 443 },
         { ...base, tcpFlags: "SYN,ACK", dstPort: 444 },
         { ...base, tcpFlags: "SYN", dstPort: 445 },
         { ...base, tcpFlags: "SYN", dstPort: 445 },
@@ -447,7 +669,7 @@ describe("Analysis engine", () => {
         { ...base, tcpFlags: "RST", dstPort: 446 },
         { ...base, protocol: "UDP", dstPort: 53, tcpFlags: undefined },
       ],
-      stats: { totalPackets: 8, totalBytes: 512, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { TCP: 7, UDP: 1 } },
+      stats: { totalPackets: 9, totalBytes: 576, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { TCP: 8, UDP: 1 } },
     }
     const analysis = analyzePcap(result)
     // Flow direction follows IP sort order, not the client's — key by the
@@ -458,7 +680,7 @@ describe("Analysis engine", () => {
       stateByPort.set(p, s.state)
     }
     expect(stateByPort.get(443)).toBe("ESTABLISHED")
-    expect(stateByPort.get(444)).toBe("ESTABLISHED")
+    expect(stateByPort.get(444)).toBe("HALF_OPEN")
     expect(stateByPort.get(445)).toBe("INITIATED")
     expect(stateByPort.get(446)).toBe("RESET")
     expect(stateByPort.get(53)).toBe("STATELESS")

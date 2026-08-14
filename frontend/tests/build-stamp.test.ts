@@ -33,6 +33,6 @@ describe("build stamp freshness", () => {
   })
 
   it("stamp carries the current analyzer version", () => {
-    expect(BUILD_STAMP).toContain("v3.2.0")
+    expect(BUILD_STAMP).toContain("v3.4.0")
   })
 })

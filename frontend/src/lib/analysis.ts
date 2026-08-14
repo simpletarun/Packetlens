@@ -1,8 +1,14 @@
 import { PCAPResult, ParsedPacket, tlsCipherSuiteName } from './pcap'
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, RISK_PARAMS } from './risk'
-import { captureRates, CaptureRates } from './metrics'
+import { captureRates, CaptureRates, CaptureQuality } from './metrics'
 
-export const ANALYZER_VERSION = "3.2.0"
+export const ANALYZER_VERSION = "3.4.0"
+
+// Version of the canonical Analysis JSON emitted by analyzePcap. Every
+// consumer (report builder, exports, UI, snapshots) must regenerate against
+// this version; bump it on any shape change so snapshot tests fail loudly
+// instead of silently comparing an old model.
+export const ANALYSIS_SCHEMA_VERSION = "1.0.0"
 
 export interface AnalysisPacket {
   num: number; timestamp: string; srcIp: string; dstIp: string
@@ -13,6 +19,10 @@ export interface AnalysisPacket {
   // App-layer label when the parser identified one (HTTPS/STUN/mDNS…).
   // Optional: older demo packets don't carry it.
   appProtocol?: string
+  // True only when the appProtocol label was confirmed by payload content;
+  // absent = port-inferred (a pure-SYN to :80 is "HTTP by port", not decoded
+  // HTTP — protocol-honesty audit).
+  appPayloadConfirmed?: boolean
   // Transport layer (TCP/UDP/ICMP…) — the timeline's TCP/UDP split keys on
   // this, never on the app-layer `protocol` (HTTPS is still a TCP packet).
   transport?: string
@@ -36,6 +46,18 @@ export interface AnalysisFlow {
   rstCount?: number
   rttMs?: number
   lossPct?: number
+  // Protocol honesty: how the app-layer label was obtained. "payload" = at
+  // least one packet's app protocol was confirmed by payload content
+  // (HTTP request/response line, TLS/QUIC handshake, DNS, SIP); "port_inferred"
+  // = only the well-known-port table suggests a service; "transport_only" =
+  // bare transport with no app label. A TCP/80 flow with no HTTP payload is
+  // NEVER labelled "payload" (QA: port-inferred HTTPS shown as confirmed).
+  protocolSource?: "payload" | "port_inferred" | "transport_only"
+  /** Most specific app layer seen: payload-confirmed wins over port-inferred. */
+  appProtocol?: string
+  // TCP state observed on the wire (see deriveSessions) — mirrored on flows
+  // so the flow table and session list always agree; "STATELESS" on non-TCP.
+  tcpState?: string
 }
 
 export interface AnalysisSession {
@@ -190,6 +212,7 @@ export interface AnalysisAdvancedMetrics {
 }
 
 export interface AnalysisResult {
+  schemaVersion: string
   job: AnalysisJob
   packets: AnalysisPacket[]
   flows: AnalysisFlow[]
@@ -207,11 +230,71 @@ export interface AnalysisResult {
   bandwidth: AnalysisBandwidthPoint[]
   advancedMetrics: AnalysisAdvancedMetrics
   fileInfo: FileInfo
+  // Canonical capture diagnostics: quality, decode stats, and integrity
+  // verdicts (truncated / malformed / unsupported link type / incomplete
+  // decode). Every consumer reads from here; `decode` below is the legacy
+  // alias kept for the store bridge.
+  validator: AnalysisValidator
   // Decode diagnostics (undecodable-input handling): link types from the
   // capture header and how many packets had their encapsulation parsed.
   // decodeRate = decoded / total — a rate near 0 means the verdict must be
   // UNKNOWN, never SAFE.
   decode: { decoded: number; total: number; linkTypes: number[] }
+}
+
+// Integrity verdict precedence: a capture can fail several ways at once; the
+// most severe applicable label wins.
+export type IntegrityStatus = "valid" | "truncated" | "unsupported_link_type" | "malformed" | "incomplete_decode"
+
+// Link types the encapsulation parser has a decoder for (see pcap.ts
+// parseLinkLayer). Any other DLT is a clean-but-undecodable capture.
+const SUPPORTED_DLTS = new Set([0, 1, 12, 101, 108, 113, 276])
+
+export function deriveValidator(
+  rates: CaptureRates,
+  decode: { decoded: number; total: number; linkTypes: number[] },
+  stats: PCAPResult["stats"]
+): AnalysisValidator {
+  const unsupportedLinkTypes = (stats.linkTypes ?? []).filter((lt) => !SUPPORTED_DLTS.has(lt))
+  const truncatedPackets = stats.truncatedPackets ?? 0
+  const malformedPackets = stats.malformedPackets ?? 0
+  const fileTruncated = stats.fileTruncated ?? false
+  const decodeRatePct = decode.total > 0 ? Math.round((decode.decoded / decode.total) * 100) : 100
+
+  let status: IntegrityStatus
+  if (fileTruncated || truncatedPackets > 0) status = "truncated"
+  else if (unsupportedLinkTypes.length > 0) status = "unsupported_link_type"
+  else if (malformedPackets > 0) status = "malformed"
+  else if (decode.total > 0 && decode.decoded < decode.total) status = "incomplete_decode"
+  else status = "valid"
+
+  return {
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    captureQuality: rates.quality,
+    durationSec: rates.durationSec,
+    decode: { ...decode, decodeRatePct },
+    integrity: { status, truncatedPackets, fileTruncated, malformedPackets, unsupportedLinkTypes },
+  }
+}
+
+export interface AnalysisValidator {
+  schemaVersion: string
+  /** EMPTY / SINGLE_PACKET / ZERO_DURATION / VALID — from metrics.ts. */
+  captureQuality: CaptureQuality
+  /** Real capture span; null when no time interval exists. */
+  durationSec: number | null
+  decode: { decoded: number; total: number; linkTypes: number[]; decodeRatePct: number }
+  integrity: {
+    status: IntegrityStatus
+    /** Frames whose captured length < original length (snaplen or file cut). */
+    truncatedPackets: number
+    /** True when the FILE ended mid-record (leftover bytes). */
+    fileTruncated: boolean
+    /** Frames shorter than their own link-layer header. */
+    malformedPackets: number
+    /** Link types with no decoder (e.g. DLT 999). */
+    unsupportedLinkTypes: number[]
+  }
 }
 
 function hexToAscii(hex: string, max = 2048): string {
@@ -256,6 +339,7 @@ length: p.length,
     ttl: p.ttl ?? 0,
     info,
     appProtocol: p.appProtocol || undefined,
+    appPayloadConfirmed: p.appPayloadConfirmed,
     transport: p.transport,
   }
 }
@@ -308,6 +392,23 @@ function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
     // 84 sent + 84 recv for a 84-byte flow (QA: ARP byte-total audit).
     const sent = pkts.filter(p => p.srcIp === srcIp)
     const recv = pkts.filter(p => p.dstIp === srcIp && p.srcIp !== srcIp)
+    // Protocol honesty: payload-confirmed app labels win; a port-only label
+    // on every packet stays "port_inferred" (TCP/80 without HTTP payload).
+    const confirmed = new Map<string, number>()
+    const inferred = new Set<string>()
+    for (const p of pkts) {
+      if (p.appPayloadConfirmed && p.appProtocol) {
+        confirmed.set(p.appProtocol, (confirmed.get(p.appProtocol) ?? 0) + 1)
+      } else if (p.appProtocol) {
+        inferred.add(p.appProtocol)
+      }
+    }
+    const appProtocol = confirmed.size > 0
+      ? [...confirmed.entries()].sort((a, b) => b[1] - a[1])[0][0]
+      : (inferred.size > 0 ? [...inferred].sort()[0] : undefined)
+    const protocolSource: AnalysisFlow["protocolSource"] = confirmed.size > 0
+      ? "payload"
+      : (inferred.size > 0 ? "port_inferred" : "transport_only")
     return {
       id: `flow-${idx + 1}`, srcIp, dstIp, srcPort: Number(srcPort), dstPort: Number(dstPort),
       protocol, packets: pkts.length,
@@ -320,6 +421,8 @@ function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
       duration: Math.round(((tMax - tMin) / 1000) * 1000) / 1000,
       startTime: new Date(tMin).toISOString(),
       endTime: new Date(tMax).toISOString(),
+      appProtocol,
+      protocolSource,
       ...(protocol === 'TCP' ? tcpHealth(pkts, srcIp) : {}),
     }
   }).sort((a, b) => b.packets - a.packets)
@@ -389,7 +492,10 @@ function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
 interface TcpConversationState {
   syn: boolean
   synAck: boolean
-  ack: boolean
+  /** A pure ACK observed AFTER the SYN-ACK — the final handshake ACK (or any
+   *  later data ACK), proving the handshake actually completed. Without it a
+   *  SYN-ACK is a half-open connection, not ESTABLISHED. */
+  postSynAckAck: boolean
   rst: boolean
   fin: boolean
 }
@@ -401,41 +507,48 @@ function tcpConversationStates(packets: ParsedPacket[]): Map<string, TcpConversa
     const key = flowKeyOf(p)
     let s = states.get(key)
     if (!s) {
-      s = { syn: false, synAck: false, ack: false, rst: false, fin: false }
+      s = { syn: false, synAck: false, postSynAckAck: false, rst: false, fin: false }
       states.set(key, s)
     }
     if (p.tcpFlags.includes('SYN')) s.syn = true
-    if (p.tcpFlags.includes('ACK')) s.ack = true
+    if (p.tcpFlags.includes('SYN') && p.tcpFlags.includes('ACK')) s.synAck = true
+    // Order-sensitive: the SYN-ACK itself carries ACK, so only a later pure
+    // ACK (final handshake ACK or data ACK) counts as handshake completion.
+    if (p.tcpFlags.includes('ACK') && !p.tcpFlags.includes('SYN') && s.synAck) s.postSynAckAck = true
     if (p.tcpFlags.includes('RST')) s.rst = true
     if (p.tcpFlags.includes('FIN')) s.fin = true
-    if (p.tcpFlags.includes('SYN') && p.tcpFlags.includes('ACK')) s.synAck = true
   }
   return states
 }
 
+// Module-level so deriveSessions and the flow tcpState mirror share one truth.
+// Flow srcIp/dstIp carry the direction-normalized order from deriveFlows, so
+// the state key rebuilds identically to flowKeyOf(p) on raw packets.
+const SESSION_KEY_OF = (f: AnalysisFlow): string =>
+  `${f.srcIp}|${f.dstIp}|${f.srcPort}|${f.dstPort}|${f.protocol}`
+
+function tcpStateOf(f: AnalysisFlow, tcpStates: Map<string, TcpConversationState>): string {
+  if (f.protocol !== 'TCP') return 'STATELESS'
+  const s = tcpStates.get(SESSION_KEY_OF(f))
+  if (s?.rst) return 'RESET'
+  if (s?.fin) return 'CLOSED'
+  if (s?.synAck && s?.postSynAckAck) return 'ESTABLISHED'
+  if (s?.synAck) return 'HALF_OPEN'
+  if (s?.syn) return 'INITIATED'
+  return 'ESTABLISHED'
+}
+
 function deriveSessions(flows: AnalysisFlow[], tcpStates: Map<string, TcpConversationState>): AnalysisSession[] {
   // State from the OBSERVED handshake, not a blanket "ESTABLISHED": a flow
-  // with 2-3 SYN packets and no ACK is a failed/partial handshake, and a
-  // flow that only saw RST never established. Mid-stream captures without a
-  // SYN fall back to ESTABLISHED (the honest guess).
-  // Flow srcIp/dstIp carry the direction-normalized order from deriveFlows,
-  // so the state key rebuilds identically to flowKeyOf(p) on raw packets.
-  const keyOf = (f: AnalysisFlow): string =>
-    `${f.srcIp}|${f.dstIp}|${f.srcPort}|${f.dstPort}|${f.protocol}`
-  const stateFor = (f: AnalysisFlow): string => {
-    if (f.protocol !== 'TCP') return 'STATELESS'
-    const s = tcpStates.get(keyOf(f))
-    if (s?.rst) return 'RESET'
-    if (s?.fin) return 'CLOSED'
-    if (s?.synAck) return 'ESTABLISHED'
-    if (s?.syn) return 'INITIATED'
-    return 'ESTABLISHED'
-  }
+  // with 2-3 SYN packets and no ACK is a failed/partial handshake, a SYN-ACK
+  // with no completing ACK is half-open, and a flow that only saw RST never
+  // established. Mid-stream captures without a SYN fall back to ESTABLISHED
+  // (the honest guess).
   return flows.map((f, i) => ({
     id: `sess-${i + 1}`, srcIp: f.srcIp, dstIp: f.dstIp,
     srcPort: f.srcPort, dstPort: f.dstPort, protocol: f.protocol,
     packets: f.packets, bytes: f.bytesTotal,
-    state: stateFor(f),
+    state: tcpStateOf(f, tcpStates),
     duration: f.duration, startTime: f.startTime,
   }))
 }
@@ -1688,7 +1801,11 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
   }
   const packets = raw.map((p) => pktToAnalysis(p, seqBases.get(dirKeyOf(p))))
   const flows = deriveFlows(raw)
-  const sessions = deriveSessions(flows, tcpConversationStates(raw))
+  const tcpStates = tcpConversationStates(raw)
+  // Mirror the wire-observed state onto flows so the flow table and session
+  // list never disagree (non-TCP flows get STATELESS, matching sessions).
+  for (const f of flows) f.tcpState = tcpStateOf(f, tcpStates)
+  const sessions = deriveSessions(flows, tcpStates)
   const dns = deriveDns(raw)
   const http = deriveHttp(raw)
   const tls = deriveTls(raw)
@@ -1790,11 +1907,19 @@ const job: AnalysisJob = {
   // File info is provided by the backend Rust analyzer
   const fileInfo: FileInfo = { sha256: '', sha1: '', md5: '' }
 
+  const validator: AnalysisValidator = deriveValidator(advancedMetrics.rates, {
+    decoded: stats.decodedPackets ?? packets.length,
+    total: stats.totalPackets,
+    linkTypes: stats.linkTypes || [],
+  }, stats)
+
   return {
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
     job, packets, flows, sessions, dns, http, tls, files,
     calls,
     credentials, certificates, devices, threats, timeline, bandwidth, advancedMetrics,
     fileInfo,
+    validator,
     decode: {
       decoded: stats.decodedPackets ?? packets.length,
       total: stats.totalPackets,

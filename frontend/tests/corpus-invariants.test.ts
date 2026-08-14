@@ -79,6 +79,70 @@ async function audit(file: string, display: string) {
   expect.soft(a1.decode.decoded, `${display}: decoded<=total`).toBeLessThanOrEqual(a1.decode.total)
   expect.soft(JSON.stringify(a1), `${display}: determinism`).toBe(JSON.stringify(a2))
 
+  // Canonical validator consistency: schema version always present; the
+  // integrity verdict must be exactly derivable from the raw flags, and the
+  // decode stats must agree with the legacy `decode` alias.
+  expect.soft(a1.schemaVersion, `${display}: schemaVersion`).toBeTruthy()
+  expect.soft(a1.validator.schemaVersion, `${display}: validator.schemaVersion`).toBe(a1.schemaVersion)
+  expect.soft(a1.validator.captureQuality, `${display}: validator quality`).toBe(a1.advancedMetrics.rates.quality)
+  expect.soft(a1.validator.durationSec, `${display}: validator durationSec`).toBe(a1.advancedMetrics.rates.durationSec)
+  expect.soft(a1.validator.decode.decoded, `${display}: validator decoded`).toBe(a1.decode.decoded)
+  expect.soft(a1.validator.decode.total, `${display}: validator total`).toBe(a1.decode.total)
+  expect.soft(a1.validator.decode.linkTypes, `${display}: validator linkTypes`).toEqual(a1.decode.linkTypes)
+  const vi = a1.validator.integrity
+  const flagTruncated = vi.fileTruncated || vi.truncatedPackets > 0
+  const flagUnsupported = vi.unsupportedLinkTypes.length > 0
+  const flagMalformed = vi.malformedPackets > 0
+  const flagIncomplete = a1.decode.total > 0 && a1.decode.decoded < a1.decode.total
+  expect.soft(
+    (vi.status === "truncated" && flagTruncated && !(flagUnsupported || flagMalformed || flagIncomplete)) ||
+    (vi.status === "unsupported_link_type" && flagUnsupported && !flagTruncated) ||
+    (vi.status === "malformed" && flagMalformed && !flagTruncated && !flagUnsupported) ||
+    (vi.status === "incomplete_decode" && flagIncomplete && !flagTruncated && !flagUnsupported && !flagMalformed) ||
+    (vi.status === "valid" && !flagTruncated && !flagUnsupported && !flagMalformed && !flagIncomplete),
+    `${display}: integrity verdict consistent with flags (${vi.status})`,
+  ).toBe(true)
+
+  // Protocol honesty: every HTTP/TLS entry must be backed by at least one
+  // payload-confirmed packet; a flow never claims "payload" without one; a
+  // transport-only flow carries no app label (QA: TCP/80 without HTTP payload
+  // was labeled HTTP; pure-SYN packets showed port-inferred app labels).
+  const confirmedApps = new Set(a1.packets.filter((p) => p.appPayloadConfirmed).map((p) => p.appProtocol))
+  expect.soft(
+    a1.http.length === 0 || confirmedApps.has("HTTP"),
+    `${display}: http entries backed by payload-confirmed HTTP (${confirmedApps.has("HTTP")})`,
+  ).toBe(true)
+  expect.soft(
+    a1.tls.length === 0 || confirmedApps.has("TLS") || confirmedApps.has("HTTPS"),
+    `${display}: tls entries backed by payload-confirmed TLS`,
+  ).toBe(true)
+  for (const f of a1.flows) {
+    if (f.protocolSource === "payload") {
+      expect.soft(!!f.appProtocol, `${display}: payload flow ${f.id} has app label`).toBe(true)
+    } else if (f.protocolSource === "transport_only") {
+      expect.soft(!f.appProtocol, `${display}: transport_only flow ${f.id} has no app label`).toBe(true)
+    }
+  }
+  expect.soft(
+    a1.flows.every((f) => f.protocolSource === undefined || ["payload", "port_inferred", "transport_only"].includes(f.protocolSource)),
+    `${display}: flow protocolSource enum`,
+  ).toBe(true)
+
+  // TCP state machine: states come from the observed handshake and the flow
+  // mirror always agrees with its session (QA: all TCP flows claimed
+  // ESTABLISHED; SYN-only and half-open conversations were misreported).
+  const STATES = new Set(["ESTABLISHED", "CLOSED", "RESET", "INITIATED", "HALF_OPEN", "STATELESS"])
+  expect.soft(
+    a1.sessions.every((s) => STATES.has(s.state)),
+    `${display}: session state enum (${[...new Set(a1.sessions.map((s) => s.state))].join(",")})`,
+  ).toBe(true)
+  for (const f of a1.flows) {
+    const sess = a1.sessions.find(
+      (s) => s.srcIp === f.srcIp && s.dstIp === f.dstIp && s.srcPort === f.srcPort && s.dstPort === f.dstPort,
+    )
+    expect.soft(sess?.state === f.tcpState, `${display}: flow ${f.id} tcpState ${f.tcpState} mirrors session ${sess?.state}`).toBe(true)
+  }
+
   const totalLen = pkts.reduce((s, p) => s + (p.length || 0), 0)
   let flowPkts = 0, flowBytes = 0
   const flowKeys = new Set<string>()

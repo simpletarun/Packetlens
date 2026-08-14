@@ -887,14 +887,14 @@ export default function ReportsPage() {
                             <td className="py-1.5 pr-2"><Badge variant="outline" className="text-[10px]">{s.protocol}</Badge></td>
                             <td className="py-1.5 pr-2 text-right">{s.packets}</td>
                             <td className="py-1.5 pr-2 text-right text-muted-foreground">{formatBytes(s.bytes)}</td>
-                            <td className="py-1.5"><Badge variant="outline" className={"text-[10px] " + (s.state === "ESTABLISHED" ? "bg-success/10 text-success" : s.state === "CLOSED" ? "bg-muted text-muted-foreground" : "bg-warning/10 text-warning")}>{s.state}</Badge></td>
+                            <td className="py-1.5"><Badge variant="outline" className={"text-[10px] " + (s.state === "ESTABLISHED" ? "bg-success/10 text-success" : s.state === "CLOSED" ? "bg-muted text-muted-foreground" : s.state === "RESET" ? "bg-destructive/10 text-destructive" : "bg-warning/10 text-warning")}>{s.state}</Badge></td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
                   {sessions.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest sessions of {sessions.length.toLocaleString()} — the Analysis page lists all sessions.</div>}
-                  <p className="text-xs text-muted-foreground mt-3">Sessions mirror flows one-to-one (one session per direction-normalized conversation; TCP flows are marked ESTABLISHED, others STATELESS). Higher-level, multi-flow session reconstruction is not implemented.</p>
+                  <p className="text-xs text-muted-foreground mt-3">Sessions mirror flows one-to-one (one session per direction-normalized conversation; states come from the observed handshake — INITIATED = SYN seen but no completion, HALF_OPEN = SYN-ACK replied but never completed, ESTABLISHED = full handshake or mid-stream capture, RESET/CLOSED, STATELESS = non-TCP). Higher-level, multi-flow session reconstruction is not implemented.</p>
                 </CardContent>
               </Card>
             </section>

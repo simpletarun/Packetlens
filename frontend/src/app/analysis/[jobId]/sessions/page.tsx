@@ -24,7 +24,7 @@ export default function SessionsPage() {
   )
 
   const stateColor = (s: string) => {
-    const m: Record<string, string> = { ESTABLISHED: "bg-success/10 text-success", CLOSED: "bg-muted text-muted-foreground", "TIME_WAIT": "bg-warning/10 text-warning", "SYN_SENT": "bg-info/10 text-info", STATELESS: "bg-chart-3/10 text-chart-3" }
+    const m: Record<string, string> = { ESTABLISHED: "bg-success/10 text-success", CLOSED: "bg-muted text-muted-foreground", HALF_OPEN: "bg-warning/10 text-warning", INITIATED: "bg-info/10 text-info", RESET: "bg-destructive/10 text-destructive", STATELESS: "bg-chart-3/10 text-chart-3" }
     return m[s] || "bg-muted text-muted-foreground"
   }
 

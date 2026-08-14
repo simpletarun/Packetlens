@@ -18,6 +18,13 @@ export interface PCAPResult {
     // decoded" (pre-decode-tracking behavior).
     linkTypes?: number[]
     decodedPackets?: number
+    // Capture integrity signals for the canonical validator: frames whose
+    // captured length is shorter than their original length (snaplen or file
+    // truncation), frames too short for their own link-layer header
+    // (malformed), and whether the file ended mid-record (leftover bytes).
+    truncatedPackets?: number
+    malformedPackets?: number
+    fileTruncated?: boolean
   }
 }
 
@@ -50,6 +57,12 @@ export interface ParsedPacket {
   tcpWin?: number
   tcpPayloadLen?: number
   appProtocol?: string
+  // True only when the app protocol label above was CONFIRMED BY PAYLOAD
+  // (HTTP request/response line, TLS/QUIC handshake record, DNS, SIP, ARP
+  // opcode). Absent = the label came from the well-known-port table
+  // (port-inferred): TCP/80 with no HTTP payload is HTTP *by port*, never a
+  // definitive claim (protocol-honesty audit).
+  appPayloadConfirmed?: boolean
   // Transport layer (TCP/UDP/ICMP…) separate from `protocol` (app layer:
   // HTTPS/STUN/mDNS…). Transport is what the timeline's TCP/UDP split and the
   // session state machine key on — app labels must not erase the transport.
@@ -116,7 +129,7 @@ function flagStr(f: number): string {
 }
 
 function newResult(): PCAPResult {
-  return { packets: [], stats: { totalPackets: 0, totalBytes: 0, duration: 0, startTime: 0, endTime: 0, protocols: {}, linkTypes: [], decodedPackets: 0 } }
+  return { packets: [], stats: { totalPackets: 0, totalBytes: 0, duration: 0, startTime: 0, endTime: 0, protocols: {}, linkTypes: [], decodedPackets: 0, truncatedPackets: 0, malformedPackets: 0, fileTruncated: false } }
 } 
 
 function finalize(r: PCAPResult): void {
@@ -150,27 +163,36 @@ function addPkt(r: PCAPResult, p: ParsedPacket): void {
 // split staying honest.
 export const KNOWN_DLTS = new Set([0, 1, 12, 101, 108, 113, 276])
 
-function parseLinkLayer(linkType: number, dv: DataView, maxLen: number, p: ParsedPacket): boolean {
+// Returns whether the frame was decoded AND whether it was malformed (shorter
+// than its own link-layer header — corrupt or cut data, distinct from
+// "unsupported link type", which is a clean frame the parser has no decoder
+// for). The canonical validator uses both signals.
+function parseLinkLayer(linkType: number, dv: DataView, maxLen: number, p: ParsedPacket): { decoded: boolean; malformed: boolean } {
   switch (linkType) {
     case 1:
+      if (maxLen < 14) return { decoded: false, malformed: true }
       parseEthernet(dv, maxLen, p)
-      return true
+      return { decoded: true, malformed: false }
     case 12:
     case 101:
+      if (maxLen < 1) return { decoded: false, malformed: true }
       parseRawIp(dv, 0, maxLen, p)
-      return true
+      return { decoded: true, malformed: false }
     case 0:
     case 108:
+      if (maxLen < 4) return { decoded: false, malformed: true }
       parseLoopback(dv, maxLen, p)
-      return true
+      return { decoded: true, malformed: false }
     case 113:
+      if (maxLen < 16) return { decoded: false, malformed: true }
       parseSll(dv, maxLen, p)
-      return true
+      return { decoded: true, malformed: false }
     case 276:
+      if (maxLen < 20) return { decoded: false, malformed: true }
       parseSll2(dv, maxLen, p)
-      return true
+      return { decoded: true, malformed: false }
     default:
-      return false
+      return { decoded: false, malformed: false }
   }
 }
 
@@ -260,14 +282,20 @@ function parsePCAP(buf: Buffer, linkTypeOverride?: number): PCAPResult {
     const pdv = new DataView(buf.buffer, buf.byteOffset + off, dataLen)
     const pkt: ParsedPacket = { num: ++num, timestamp: tsSec + tsUsec / 1_000_000, length: dataLen, origLength: origLen, payload: '' }
 
-    if (parseLinkLayer(linkType, pdv, dataLen, pkt)) {
-      r.stats.decodedPackets = (r.stats.decodedPackets ?? 0) + 1
-    }
+    if (dataLen < origLen) r.stats.truncatedPackets = (r.stats.truncatedPackets ?? 0) + 1
+    const ll = parseLinkLayer(linkType, pdv, dataLen, pkt)
+    if (ll.decoded) r.stats.decodedPackets = (r.stats.decodedPackets ?? 0) + 1
+    if (ll.malformed) r.stats.malformedPackets = (r.stats.malformedPackets ?? 0) + 1
 
     pkt.payload = hex(pdv, 0, dataLen)
     addPkt(r, pkt)
     off += inclLen
   }
+
+  // EOF mid-record: the loop exited with either leftover bytes too short for
+  // another 16-byte record header, or a declared packet length that extended
+  // past the end of the file (off overflowed the buffer).
+  if (off !== buf.length && off + 16 > buf.length) r.stats.fileTruncated = true
 
   reassembleTlsSni(r.packets)
   finalize(r)
@@ -290,7 +318,8 @@ function parsePCAPNG(buf: Buffer, linkTypeOverride?: number): PCAPResult {
   while (off + 8 <= buf.length) {
     const blockType = dv.getUint32(off, le)
     const blockLen = dv.getUint32(off + 4, le)
-    if (blockLen < 12 || off + blockLen > buf.length) break
+    if (blockLen < 12) { if (off + 8 <= buf.length) r.stats.fileTruncated = true; break }
+    if (off + blockLen > buf.length) { r.stats.fileTruncated = true; break }
 
     if (blockType === 0x0a0d0d0a) {
     } else if (blockType === 0x00000001 && off + 20 <= buf.length) {
@@ -331,15 +360,20 @@ function parsePCAPNG(buf: Buffer, linkTypeOverride?: number): PCAPResult {
       const pdv = new DataView(buf.buffer, buf.byteOffset + pktOff, dataLen)
       const pkt: ParsedPacket = { num: ++num, timestamp, length: dataLen, origLength: origLen, payload: '' }
 
-      if (parseLinkLayer(lt, pdv, dataLen, pkt)) {
-        r.stats.decodedPackets = (r.stats.decodedPackets ?? 0) + 1
-      }
+      if (dataLen < origLen) r.stats.truncatedPackets = (r.stats.truncatedPackets ?? 0) + 1
+      const ll = parseLinkLayer(lt, pdv, dataLen, pkt)
+      if (ll.decoded) r.stats.decodedPackets = (r.stats.decodedPackets ?? 0) + 1
+      if (ll.malformed) r.stats.malformedPackets = (r.stats.malformedPackets ?? 0) + 1
       pkt.payload = hex(pdv, 0, dataLen)
       addPkt(r, pkt)
     }
 
     off += blockLen
   }
+
+  // EOF mid-record: leftover bytes too short for another block header, or a
+  // block whose declared length extends past the end of the file.
+  if (off !== buf.length && off + 8 > buf.length) r.stats.fileTruncated = true
 
   reassembleTlsSni(r.packets)
   finalize(r)
@@ -372,6 +406,7 @@ function parseARP(dv: DataView, off: number, maxLen: number, p: ParsedPacket): v
   const oper = dv.getUint16(off + 6)
   p.protocol = 'ARP'
   p.appProtocol = oper === 2 ? 'ARP-Reply' : oper === 1 ? 'ARP-Request' : 'ARP'
+  p.appPayloadConfirmed = true
   p.srcIp = ipv4At(dv, off + 14)
   p.dstIp = ipv4At(dv, off + 24)
   if (maxLen >= 14) p.arpSenderMac = macStr(dv, off + 8)
@@ -519,7 +554,7 @@ function detectAppProtocol(dv: DataView, off: number, len: number, srcPort: numb
   // SSRC) — mirrors analyzer/src/pipeline.rs.
   if (isSipStart(dv, off, len) || srcPort === 5060 || dstPort === 5060 || srcPort === 5061 || dstPort === 5061) {
     const sip = parseSip(dv, off, len)
-    if (sip) { p.sip = sip; p.appProtocol = 'SIP' }
+    if (sip) { p.sip = sip; p.appProtocol = 'SIP'; p.appPayloadConfirmed = true }
   }
   if (transport === 'UDP') {
     const rtp = parseRtp(dv, off, len)
@@ -714,6 +749,7 @@ function arpaToIp(name: string): string | undefined {
 function parseDNS(dv: DataView, off: number, len: number, p: ParsedPacket): void {
   if (len < 12) return
   p.appProtocol = 'DNS'
+  p.appPayloadConfirmed = true
   // QR bit (0x80 of the FLAGS word): queries echo no question of their own for
   // counting, but responses often DO echo the question — so distinguishing the
   // two matters for any "queries" metric (a response must never count as one).
@@ -784,6 +820,7 @@ function parseHTTP(dv: DataView, off: number, len: number, p: ParsedPacket): voi
 
   if (data.startsWith('GET ') || data.startsWith('POST ') || data.startsWith('PUT ') || data.startsWith('DELETE ') || data.startsWith('HEAD ') || data.startsWith('PATCH ')) {
     p.appProtocol = 'HTTP'
+    p.appPayloadConfirmed = true
     const firstSpace = data.indexOf(' ')
     const secondSpace = data.indexOf(' ', firstSpace + 1)
     if (firstSpace > 0 && secondSpace > firstSpace) {
@@ -798,6 +835,7 @@ function parseHTTP(dv: DataView, off: number, len: number, p: ParsedPacket): voi
     if (uaMatch) p.httpUa = uaMatch[1].trim()
   } else if (data.startsWith('HTTP/1.')) {
     p.appProtocol = 'HTTP'
+    p.appPayloadConfirmed = true
     // Response line: HTTP/1.1 200 OK → status code for the request row on
     // the same flow (v3.2 F-04 QA: the old UI faked 200 on every row).
     const statusMatch = data.match(/^HTTP\/1\.[01]\s+(\d{3})/)
@@ -825,6 +863,7 @@ function parseTLS(dv: DataView, off: number, len: number, p: ParsedPacket): void
   if (handshakeType === 0x01 && hsLen >= 39) {
     // ClientHello: SNI + version (shared with QUIC's CRYPTO frame body).
     p.appProtocol = 'TLS'
+    p.appPayloadConfirmed = true
     scanClientHelloSni(dv, off + 9, hsEnd, p)
   } else if (handshakeType === 0x02 && hsLen >= 37) {
     // ServerHello: the negotiated cipher suite. TLS 1.3 changed the legacy
@@ -850,7 +889,7 @@ function parseTLS(dv: DataView, off: number, len: number, p: ParsedPacket): void
     if (process.env.DEBUG_QUIC) console.error("DBG cert hsType 0x0b certLen", certLen)
     const cert = parseX509Der(dv, pos, certLen)
     if (process.env.DEBUG_QUIC) console.error("DBG parsed cert", cert)
-    if (cert) { p.tlsCert = cert; p.appProtocol = 'TLS' }
+    if (cert) { p.tlsCert = cert; p.appProtocol = 'TLS'; p.appPayloadConfirmed = true }
   }
 }
 
@@ -1066,6 +1105,7 @@ function parseQUIC(dv: DataView, off: number, len: number, p: ParsedPacket): boo
     const hsBodyLen = (dv.getUint8(f + 1) << 16) | (dv.getUint8(f + 2) << 8) | dv.getUint8(f + 3)
     if (hsBodyLen < 39 || f + 4 + hsBodyLen > f + dataLen.value) return false
     p.appProtocol = 'QUIC'
+    p.appPayloadConfirmed = true
     scanClientHelloSni(dv, f + 4, f + 4 + hsBodyLen, p)
     return true
   }
