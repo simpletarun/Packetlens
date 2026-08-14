@@ -2,9 +2,8 @@
   <h1 align="center">PacketLens</h1>
   <p align="center"><b>Free, 100% local PCAP analyzer. Drop a PCAP. Get a full security report — entirely on your machine.</b></p>
   <p align="center">
-    <a href="https://github.com/simpletarun/Packetlens/releases/tag/v3.2.0"><img src="https://img.shields.io/badge/release-v3.2.0-blue" alt="Release v3.2.0"></a>
+    <a href="https://github.com/simpletarun/Packetlens/releases/tag/v3.3.0"><img src="https://img.shields.io/badge/release-v3.3.0-blue" alt="Release v3.3.0"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
-    <a href="frontend/tests"><img src="https://img.shields.io/badge/tests-353%20passed-brightgreen" alt="353 tests passing"></a>
     <a href="#faq"><img src="https://img.shields.io/badge/privacy-100%25%20local-lightgrey" alt="100% local"></a>
   </p>
   <p align="center">
@@ -14,7 +13,7 @@
 
 ---
 
-PacketLens is a **free, 100% local PCAP analyzer** for network forensics and security reporting. Upload a capture and nothing leaves your machine: parsing, flows, sessions, DNS, TCP health, risk scoring (spec 1.3), VoIP (SIP/RTP), offline GeoIP via DB-IP MMDB, investigation graph, world map, and **PDF / HTML / CSV exports** — with no cloud, no account, and no telemetry. Built with Next.js + TypeScript, backed by 350+ tests.
+PacketLens is a **free, 100% local PCAP analyzer** for network forensics and security reporting. Upload a capture and nothing leaves your machine: parsing, flows, sessions, DNS, TCP health, risk scoring (spec 1.3), VoIP (SIP/RTP), offline GeoIP via DB-IP MMDB, investigation graph, world map, and **PDF / HTML / CSV exports** — with no cloud, no account, and no telemetry. Built with Next.js + TypeScript.
 
 ---
 
@@ -68,7 +67,6 @@ npm run dev          # → http://localhost:3456
 | Map | d3-geo (Natural Earth, bundled — no tile servers) |
 | GeoIP | mmdb-lib (DB-IP City Lite) |
 | State | zustand |
-| Tests | vitest — **353 tests / 29 files** |
 
 ---
 
@@ -99,7 +97,7 @@ No. A single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`,
 ## 📚 Docs & status
 
 - [User Guide](docs/PacketLens-User-Guide.html) (HTML + PDF) · [Privacy Policy](frontend/src/app/privacy/page.tsx) · [Workboard](docs/TODO.md)
-- Analyzer **3.2.0** · report schema **1.0** · risk spec **1.3** · [Release v3.2.0](https://github.com/simpletarun/Packetlens/releases/tag/v3.2.0)
+- Analyzer **3.2.0** · report schema **1.0** · risk spec **1.3** · [Release v3.3.0](https://github.com/simpletarun/Packetlens/releases/tag/v3.3.0)
 
 ---
 
