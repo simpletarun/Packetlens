@@ -19,9 +19,19 @@ export function safeIso(ms: number): string {
 
 // Version of the canonical Analysis JSON emitted by analyzePcap. Every
 // consumer (report builder, exports, UI, snapshots) must regenerate against
-// this version; bump it on any shape change so snapshot tests fail loudly
-// instead of silently comparing an old model.
-export const ANALYSIS_SCHEMA_VERSION = "1.0.0"
+// this version; bump it on any SHAPE change so snapshot tests fail loudly
+// instead of silently comparing an old model. Bumped to 1.1.0 for the
+// protocolSource enum rename (payload/port_inferred/transport_only →
+// PAYLOAD_CONFIRMED/PORT_INFERRED/UNKNOWN) + new job fields
+// (highestSeverity, metricSpecVersion, detectionRuleVersion).
+export const ANALYSIS_SCHEMA_VERSION = "1.1.0"
+
+// Semantic contracts are versioned independently of the JSON shape: the
+// metric semantics (rate definitions, capture-quality meaning), the risk
+// formula, and the detection rules can change meaning without changing a
+// single JSON field — these versions make such changes explicit.
+export const METRIC_SPEC_VERSION = "1.1.0"
+export const DETECTION_RULE_VERSION = "1.0.0"
 
 export interface AnalysisPacket {
   num: number; timestamp: string; srcIp: string; dstIp: string
@@ -59,13 +69,14 @@ export interface AnalysisFlow {
   rstCount?: number
   rttMs?: number
   lossPct?: number
-  // Protocol honesty: how the app-layer label was obtained. "payload" = at
-  // least one packet's app protocol was confirmed by payload content
-  // (HTTP request/response line, TLS/QUIC handshake, DNS, SIP); "port_inferred"
-  // = only the well-known-port table suggests a service; "transport_only" =
-  // bare transport with no app label. A TCP/80 flow with no HTTP payload is
-  // NEVER labelled "payload" (QA: port-inferred HTTPS shown as confirmed).
-  protocolSource?: "payload" | "port_inferred" | "transport_only"
+  // Protocol honesty: how the app-layer label was obtained. "PAYLOAD_CONFIRMED"
+  // = at least one packet's app protocol was confirmed by payload content
+  // (HTTP request/response line, TLS/QUIC handshake, DNS, SIP); "PORT_INFERRED"
+  // = only the well-known-port table suggests a service; "UNKNOWN" = bare
+  // transport with no app label. A TCP/80 flow with no HTTP payload is
+  // NEVER labelled "PAYLOAD_CONFIRMED" (QA: port-inferred HTTPS shown as
+  // confirmed). The UI must not render inferred protocols as confirmed.
+  protocolSource?: "PAYLOAD_CONFIRMED" | "PORT_INFERRED" | "UNKNOWN"
   /** Most specific app layer seen: payload-confirmed wins over port-inferred. */
   appProtocol?: string
   // TCP state observed on the wire (see deriveSessions) — mirrored on flows
@@ -184,7 +195,13 @@ interface AnalysisJob {
   devices: number; externalIps: number; countries: number
   domains: number; protocols: string[]
   alerts: number; riskScore: number; captureDuration: number; createdAt: string
+  /** Max severity (0-5) across all confirmed findings — displayed ALONGSIDE
+   *  riskScore, never hidden by numeric normalization (a 39/100 LOW score can
+   *  coexist with a HIGH severity finding and the report must say so). */
+  highestSeverity: number
   analyzerVersion?: string
+  metricSpecVersion?: string
+  detectionRuleVersion?: string
   sha256?: string
   sha1?: string
   md5?: string
@@ -193,7 +210,7 @@ interface AnalysisJob {
   captureQuality?: string
 }
 
-interface FileInfo {
+export interface FileInfo {
   sha256: string
   sha1: string
   md5: string
@@ -414,8 +431,12 @@ function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
     // (ARP srcIp == dstIp, e.g. 192.168.1.17 → 192.168.1.17) count each
     // packet ONCE — the old filters matched both legs and produced
     // 84 sent + 84 recv for a 84-byte flow (QA: ARP byte-total audit).
-    const sent = pkts.filter(p => p.srcIp === srcIp)
-    const recv = pkts.filter(p => p.dstIp === srcIp && p.srcIp !== srcIp)
+    // Undecodable packets have `undefined` addresses, so the placeholder
+    // ('—') must be applied BEFORE the leg filters — otherwise the "—|—"
+    // flow matches neither leg and reports bytesSent=0, bytesRecv=0 with
+    // bytesTotal=600 (conservation violation the validator caught).
+    const sent = pkts.filter(p => (p.srcIp || '\u2014') === srcIp)
+    const recv = pkts.filter(p => (p.dstIp || '\u2014') === srcIp && (p.srcIp || '\u2014') !== srcIp)
     // Protocol honesty: payload-confirmed app labels win; a port-only label
     // on every packet stays "port_inferred" (TCP/80 without HTTP payload).
     const confirmed = new Map<string, number>()
@@ -431,8 +452,8 @@ function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
       ? [...confirmed.entries()].sort((a, b) => b[1] - a[1])[0][0]
       : (inferred.size > 0 ? [...inferred].sort()[0] : undefined)
     const protocolSource: AnalysisFlow["protocolSource"] = confirmed.size > 0
-      ? "payload"
-      : (inferred.size > 0 ? "port_inferred" : "transport_only")
+      ? "PAYLOAD_CONFIRMED"
+      : (inferred.size > 0 ? "PORT_INFERRED" : "UNKNOWN")
     return {
       id: `flow-${idx + 1}`, srcIp, dstIp, srcPort: Number(srcPort), dstPort: Number(dstPort),
       protocol, packets: pkts.length,
@@ -524,9 +545,21 @@ interface TcpConversationState {
   fin: boolean
 }
 
+// State derivation is a priority-ordered transition table over the OBSERVED
+// wire sequence — never an inference from the latest packet alone:
+//   RESET (any RST) > CLOSED (any FIN) > ESTABLISHED (SYN-ACK + completing
+//   ACK) > HALF_OPEN (SYN-ACK without the final ACK) > INITIATED (SYN only) >
+//   ESTABLISHED (mid-stream guess).
+// RST always wins, so SYN → SYN-ACK → RST can never read as ESTABLISHED, and
+// a pure ACK without a SYN-ACK can never read as a completed handshake.
 function tcpConversationStates(packets: ParsedPacket[]): Map<string, TcpConversationState> {
   const states = new Map<string, TcpConversationState>()
-  for (const p of packets) {
+  // Process in TIMESTAMP order, not file order: pcapng writers can record
+  // packets out of order (multi-interface captures, live merges), and a
+  // reversed handshake would otherwise read the completing ACK BEFORE the
+  // SYN-ACK — misclassifying an established session as HALF_OPEN.
+  const ordered = [...packets].sort((a, b) => a.timestamp - b.timestamp)
+  for (const p of ordered) {
     if (!p.tcpFlags) continue
     const key = flowKeyOf(p)
     let s = states.get(key)
@@ -621,10 +654,15 @@ function deriveDns(packets: ParsedPacket[]): AnalysisDnsEntry[] {
 function deriveHttp(packets: ParsedPacket[]): AnalysisHttpEntry[] {
   // Response side first: index by reversed flow so each request row shows the
   // real status + Content-Type the server sent back (QA: was faked 200 / "").
+  // When several responses exist for one flow, the LATEST BY TIMESTAMP wins —
+  // file order can be out-of-order in pcapng, and the last file-order response
+  // would otherwise be an arbitrary one.
   const responseByFlow = new Map<string, ParsedPacket>()
   for (const p of packets) {
     if (p.httpStatus === undefined || !p.srcIp || !p.dstIp) continue
-    responseByFlow.set(`${p.srcIp}:${p.srcPort}:${p.dstIp}:${p.dstPort}`, p)
+    const key = `${p.srcIp}:${p.srcPort}:${p.dstIp}:${p.dstPort}`
+    const prev = responseByFlow.get(key)
+    if (!prev || p.timestamp > prev.timestamp) responseByFlow.set(key, p)
   }
   return packets.filter(p => p.httpMethod).map((p, i) => {
     const res = p.srcIp && p.dstIp
@@ -668,12 +706,17 @@ function deriveTls(packets: ParsedPacket[]): AnalysisTlsEntry[] {
   // from the SNI ClientHello. Key by the ServerHello's SRC (the server; its
   // dst is the client) and join onto the handshake row by the SNI packet's
   // dst, so every row shows the suite the two sides actually agreed on.
-  const serverSuite = new Map<string, number>()
+  const serverSuite = new Map<string, { suite: number; t: number }>()
   for (const p of packets) {
-    if (typeof p.tlsCipherSuite === 'number' && p.srcIp && !serverSuite.has(p.srcIp)) serverSuite.set(p.srcIp, p.tlsCipherSuite)
+    if (typeof p.tlsCipherSuite === 'number' && p.srcIp) {
+      // Latest-by-timestamp wins (pcapng file order can be out of order): a
+      // renegotiated suite must not be overwritten by an older packet.
+      const prev = serverSuite.get(p.srcIp)
+      if (prev === undefined || p.timestamp > prev.t) serverSuite.set(p.srcIp, { suite: p.tlsCipherSuite, t: p.timestamp })
+    }
   }
   return packets.filter(p => p.tlsSni).map((p, i) => {
-    const negotiated = p.dstIp && serverSuite.has(p.dstIp) ? serverSuite.get(p.dstIp)! : undefined
+    const negotiated = p.dstIp && serverSuite.has(p.dstIp) ? serverSuite.get(p.dstIp)!.suite : undefined
     // The negotiated suite decides the version. A 0x13xx suite can only be
     // NEGOTIATED by TLS 1.3 (RFC 8446) — when the server agreed one, the
     // handshake is 1.3 even if this ClientHello's legacy_version field reads
@@ -1329,8 +1372,10 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       e.ports.add(p.dstPort)
       if (p.dstIp) e.dsts.add(p.dstIp)
       e.syn++
-      // Provenance: the first few triggering packet numbers (UI shows these).
-      if (e.packetNums.length < 5) e.packetNums.push(p.num)
+      // Provenance: EVERY triggering packet number, not just a sample — a
+      // one-event-per-alert contract hides no evidence (an alert may cover
+      // hundreds of probes; all are cited).
+      e.packetNums.push(p.num)
       e.first = Math.min(e.first, p.timestamp)
       e.last = Math.max(e.last, p.timestamp)
     } else if (p.tcpFlags?.includes('RST') || p.tcpFlags?.includes('FIN')) {
@@ -1552,7 +1597,9 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   //    (QA: 66 B/s one-packet capture "burst").
   // 2. Not evaluable below 10 KB total wire bytes: no meaningful spike.
   // 3. Threshold = 2 × average throughput (peak must EXCEED 2× avg to be a
-  //    burst; average is total/rate-window per metrics.ts).
+  //    burst; average is total/capture-span per metrics.ts — the honest
+  //    number, so a capture whose average already exceeds its peak second
+  //    simply never produces a burst, which is the truth).
   // 4. Ratio = peak / avg (the banner's ×N); window = the contiguous run of
   //    seconds around the PEAK second that stay above threshold — a spike
   //    elsewhere in the capture is never labeled with unrelated seconds
@@ -1906,24 +1953,39 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
   // Rust engine emits HTTP-CREDS-001 / CRED-LEAK-001 for them, and the local
   // path must mirror that or a capture of plaintext logins scores zero risk
   // (QA: login.pcapng — 2 HTTP form passwords, risk 0 SAFE).
+  // Event identity = (rule, client → server): one alert per conversation that
+  // leaked credentials, so two INDEPENDENT attacks (different clients or
+  // different servers) produce two alerts instead of collapsing into one —
+  // while one conversation with N credential packets is ONE event citing all
+  // N packet numbers as evidence.
   if (credentials.length > 0) {
-    const c = credentials[0]
-    const isHttp = c.service.toUpperCase().startsWith('HTTP')
-    threats.push({
-      id: `alert-${threats.length + 1}`,
-      timestamp: safeIso(captureEndSec * 1000),
-      signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
-      category: isHttp ? 'Credential Theft' : 'Credential Leak',
-      severity: 4, confidence: isHttp ? 75 : 70,
-      ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
-      srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
-      protocol: 'TCP',
-      evidence: `${credentials.length} plaintext credential submission(s) over ${c.service} (first: ${c.username} → ${c.dstIp})`,
-      packetNums: [...new Set(credentials.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))].slice(0, 5),
-      // Credentials exist only because payload content was decoded: this is
-      // payload proof, not port inference.
-      payloadConfirmed: true,
-    })
+    const groups = new Map<string, AnalysisCredential[]>()
+    for (const c of credentials) {
+      const key = `${c.service.toUpperCase().startsWith('HTTP') ? 'HTTP' : 'LEAK'}|${c.srcIp}|${c.dstIp}`
+      const g = groups.get(key)
+      if (g) g.push(c)
+      else groups.set(key, [c])
+    }
+    for (const [key, creds] of groups) {
+      const c = creds[0]
+      const isHttp = c.service.toUpperCase().startsWith('HTTP')
+      threats.push({
+        id: `alert-${threats.length + 1}`,
+        // Latest credential in the event (ISO UTC sorts lexically).
+        timestamp: creds.map((x) => x.timestamp).sort().pop()!,
+        signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
+        category: isHttp ? 'Credential Theft' : 'Credential Leak',
+        severity: 4, confidence: isHttp ? 75 : 70,
+        ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
+        srcIp: c.srcIp, dstIp: c.dstIp, srcPort: 0, dstPort: 0,
+        protocol: c.protocol || 'TCP',
+        evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} (first: ${c.username} → ${c.dstIp})`,
+        packetNums: [...new Set(creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))],
+        // Credentials exist only because payload content was decoded: this is
+        // payload proof, not port inference.
+        payloadConfirmed: true,
+      })
+    }
   }
 
   // External = non-LAN destinations; multicast/broadcast/unspecified/loopback
@@ -1943,10 +2005,13 @@ const job: AnalysisJob = {
     externalIps: externalIps.size, countries: 0, domains: domains.size,
     protocols: [...new Set(raw.map(p => p.protocol).filter(Boolean) as string[])],
     alerts: threats.length, analyzerVersion: ANALYZER_VERSION,
+    metricSpecVersion: METRIC_SPEC_VERSION,
+    detectionRuleVersion: DETECTION_RULE_VERSION,
     riskScore: computeRisk(
       buildRiskInputs(threats),
       burstConfidenceBoost(advancedMetrics)
     ),
+    highestSeverity: threats.reduce((m, t) => Math.max(m, t.severity), 0),
     captureDuration: advancedMetrics.rates.durationSec ?? 0,
     captureQuality: advancedMetrics.rates.quality,
     createdAt: safeIso((stats.startTime || raw[0]?.timestamp || 0) * 1000),
@@ -1961,7 +2026,7 @@ const job: AnalysisJob = {
     linkTypes: stats.linkTypes || [],
   }, stats)
 
-  return {
+  return assertValidAnalysisResult({
     schemaVersion: ANALYSIS_SCHEMA_VERSION,
     job, packets, flows, sessions, dns, http, tls, files,
     calls,
@@ -1973,5 +2038,143 @@ const job: AnalysisJob = {
       total: stats.totalPackets,
       linkTypes: stats.linkTypes || [],
     },
+  })
+}
+
+const SESSION_STATES = new Set(['STATELESS', 'INITIATED', 'HALF_OPEN', 'ESTABLISHED', 'RESET', 'CLOSED'])
+
+// ─── FULL AnalysisResult validation ────────────────────────────────────────
+// The permanent guard of the pipeline:
+//   PCAP → Analysis Engine → Canonical AnalysisResult → FULL VALIDATION →
+//   ONLY THEN → UI / HTML / PDF / JSON / API
+// Runs after EVERY analyzePcap (invalid results never leave the engine), and
+// again before every export/API response. It enforces the conservation
+// invariants (packet/byte totals reconcile across packets, flows, sessions
+// and the job summary), the evidence-provenance contract (every packetNum and
+// flowId must exist, payloadConfirmed must be backed by decoder evidence),
+// and the protocolSource/TCP-state state machines.
+export function analysisProblems(a: AnalysisResult): string[] {
+  const problems: string[] = []
+  const fail = (msg: string) => { problems.push(msg) }
+  const n = a.packets.length
+
+  if (a.schemaVersion !== ANALYSIS_SCHEMA_VERSION) fail(`schemaVersion ${a.schemaVersion} != ${ANALYSIS_SCHEMA_VERSION}`)
+  if (a.job.totalPackets !== n) fail(`job.totalPackets ${a.job.totalPackets} != packets ${n}`)
+  if (a.job.totalFlows !== a.flows.length) fail(`job.totalFlows ${a.job.totalFlows} != flows ${a.flows.length}`)
+  if (a.job.conversations !== a.sessions.length) fail(`job.conversations ${a.job.conversations} != sessions ${a.sessions.length}`)
+  if (a.job.alerts !== a.threats.length) fail(`job.alerts ${a.job.alerts} != threats ${a.threats.length}`)
+  const maxSev = a.threats.reduce((m, t) => Math.max(m, t.severity), 0)
+  if (a.job.highestSeverity !== maxSev) fail(`job.highestSeverity ${a.job.highestSeverity} != max threat severity ${maxSev}`)
+  if (a.job.riskScore < 0 || a.job.riskScore > 100 || !Number.isFinite(a.job.riskScore)) fail(`job.riskScore ${a.job.riskScore} out of [0,100]`)
+  if (!Number.isInteger(a.job.highestSeverity) || a.job.highestSeverity < 0 || a.job.highestSeverity > 5) fail(`job.highestSeverity ${a.job.highestSeverity} out of [0,5]`)
+
+  // ── Conservation invariants (byte/packet conservation) ─────────────────
+  let flowPackets = 0
+  let flowBytes = 0
+  for (const f of a.flows) {
+    if (!Number.isInteger(f.packets) || f.packets < 0) fail(`flow ${f.id}: packets ${f.packets}`)
+    if (!Number.isFinite(f.bytesTotal) || f.bytesTotal < 0) fail(`flow ${f.id}: bytesTotal ${f.bytesTotal}`)
+    flowPackets += f.packets
+    flowBytes += f.bytesTotal
+    if (f.bytesSent + f.bytesRecv !== f.bytesTotal) {
+      fail(`flow ${f.id}: bytesSent(${f.bytesSent}) + bytesRecv(${f.bytesRecv}) != bytesTotal(${f.bytesTotal})`)
+    }
   }
+  if (flowPackets !== n) fail(`Σ flow packets ${flowPackets} != total packets ${n}`)
+  let packetBytes = 0
+  for (const p of a.packets) {
+    if (!Number.isFinite(p.length) || p.length < 0) fail(`packet ${p.num}: length ${p.length}`)
+    packetBytes += p.length
+  }
+  if (flowBytes !== packetBytes) fail(`Σ flow bytes ${flowBytes} != Σ packet bytes ${packetBytes}`)
+  const sessionPackets = a.sessions.reduce((s, x) => s + x.packets, 0)
+  if (sessionPackets !== flowPackets) fail(`Σ session packets ${sessionPackets} != Σ flow packets ${flowPackets}`)
+
+  // ── Capture-quality / rates consistency ────────────────────────────────
+  const q = a.advancedMetrics.rates
+  if (a.job.captureQuality !== q.quality) fail(`job.captureQuality ${a.job.captureQuality} != rates.quality ${q.quality}`)
+  if (a.validator.captureQuality !== q.quality) fail(`validator.captureQuality ${a.validator.captureQuality} != rates.quality ${q.quality}`)
+  if (a.job.captureDuration !== (q.durationSec ?? 0)) fail(`job.captureDuration ${a.job.captureDuration} != durationSec ${q.durationSec}`)
+  const QUALITIES: CaptureQuality[] = ['EMPTY', 'SINGLE_PACKET', 'ZERO_DURATION', 'VALID']
+  if (!QUALITIES.includes(q.quality)) fail(`rates.quality ${q.quality} not in enum`)
+  if (q.quality !== 'VALID') {
+    if (q.durationSec !== null || q.avgBps !== null || q.avgPacketsSec !== null || q.peakBps !== null) {
+      fail(`non-VALID capture (${q.quality}) must have null rates`)
+    }
+  } else {
+    if (!(q.durationSec! > 0)) fail(`VALID capture needs durationSec > 0`)
+    if (q.avgBps === null || q.peakBps === null) fail(`VALID capture needs numeric avg/peak`)
+  }
+  if (q.avgExceedsPeak !== (q.avgBps !== null && q.peakBps !== null && q.avgBps > q.peakBps)) {
+    fail(`avgExceedsPeak ${q.avgExceedsPeak} inconsistent with avg ${q.avgBps} / peak ${q.peakBps}`)
+  }
+  if (a.validator.decode.total !== a.decode.total || a.validator.decode.decoded !== a.decode.decoded) {
+    fail(`validator.decode disagrees with decode alias`)
+  }
+
+  // ── Protocol-source state machine (payload evidence required) ──────────
+  const packetByNum = new Map<number, AnalysisPacket>()
+  for (const p of a.packets) packetByNum.set(p.num, p)
+  for (const f of a.flows) {
+    if (f.protocolSource === undefined) continue
+    if (!['PAYLOAD_CONFIRMED', 'PORT_INFERRED', 'UNKNOWN'].includes(f.protocolSource)) {
+      fail(`flow ${f.id}: protocolSource ${f.protocolSource} not in enum`)
+    }
+  }
+
+  // ── Evidence provenance: every reference must exist and be supported ────
+  const flowIds = new Set(a.flows.map((f) => f.id))
+  for (const t of a.threats) {
+    if (t.flowId !== undefined && !flowIds.has(t.flowId)) fail(`threat ${t.id}: flowId ${t.flowId} does not exist`)
+    for (const num of t.packetNums ?? []) {
+      if (!Number.isInteger(num) || num < 1 || num > n) {
+        fail(`threat ${t.id}: packetNum ${num} out of range 1..${n}`)
+        continue
+      }
+      if (t.payloadConfirmed === true) {
+        const p = packetByNum.get(num)
+        if (!p?.appPayloadConfirmed) {
+          fail(`threat ${t.id}: payloadConfirmed but packet ${num} has no decoder payload evidence`)
+        }
+      }
+    }
+  }
+  for (const c of a.credentials) {
+    const cn = c.packetNum
+    if (!Number.isInteger(cn) || cn === undefined || cn < 1 || cn > n) {
+      fail(`credential ${c.id}: packetNum ${cn} out of range 1..${n}`)
+    } else if (!packetByNum.get(cn)?.appPayloadConfirmed) {
+      fail(`credential ${c.id}: packet ${cn} lacks decoder payload evidence`)
+    }
+  }
+
+  // ── TCP state machine enum + flow/session parity ───────────────────────
+  for (const s of a.sessions) {
+    if (!SESSION_STATES.has(s.state)) fail(`session ${s.id}: state ${s.state} not in enum`)
+  }
+  for (const f of a.flows) {
+    if (f.tcpState === undefined) continue
+    if (!SESSION_STATES.has(f.tcpState)) fail(`flow ${f.id}: tcpState ${f.tcpState} not in enum`)
+    const s = a.sessions.find((x) => x.srcIp === f.srcIp && x.dstIp === f.dstIp && x.srcPort === f.srcPort && x.dstPort === f.dstPort && x.protocol === f.protocol)
+    if (s && s.state !== f.tcpState) fail(`flow ${f.id}: tcpState ${f.tcpState} != session state ${s.state}`)
+    if (f.protocol !== 'TCP' && f.tcpState !== 'STATELESS') fail(`flow ${f.id}: non-TCP flow with tcpState ${f.tcpState}`)
+  }
+
+  // ── Alert dedup contract: one event per (ruleId, srcIp, dstIp) ─────────
+  const eventKeys = new Set<string>()
+  for (const t of a.threats) {
+    const key = `${t.ruleId}|${t.srcIp}|${t.dstIp}`
+    if (eventKeys.has(key)) fail(`duplicate threat event ${key} (alerts ${t.id})`)
+    eventKeys.add(key)
+  }
+
+  return problems
+}
+
+export function assertValidAnalysisResult(a: AnalysisResult): AnalysisResult {
+  const problems = analysisProblems(a)
+  if (problems.length > 0) {
+    throw new Error(`AnalysisResult failed validation (${problems.length}): ${problems.slice(0, 8).join('; ')}${problems.length > 8 ? `; …${problems.length - 8} more` : ''}`)
+  }
+  return a
 }

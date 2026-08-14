@@ -74,7 +74,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
     }
     expect(JSON.stringify(model, null, 2)).toMatchInlineSnapshot(`
       "{
-        "schemaVersion": "1.0.0",
+        "schemaVersion": "1.1.0",
         "analyzerVersion": "3.4.0",
         "job": {
           "totalPackets": 4,
@@ -85,7 +85,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
           "captureDuration": 3
         },
         "validator": {
-          "schemaVersion": "1.0.0",
+          "schemaVersion": "1.1.0",
           "captureQuality": "VALID",
           "durationSec": 3,
           "decode": {
@@ -114,7 +114,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
             "packets": 3,
             "bytesTotal": 192,
             "appProtocol": "HTTP",
-            "protocolSource": "payload",
+            "protocolSource": "PAYLOAD_CONFIRMED",
             "tcpState": "INITIATED"
           },
           {
@@ -125,7 +125,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
             "protocol": "UDP",
             "packets": 1,
             "bytesTotal": 64,
-            "protocolSource": "transport_only",
+            "protocolSource": "UNKNOWN",
             "tcpState": "STATELESS"
           }
         ],
@@ -144,8 +144,8 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
             "ruleId": "HTTP-CREDS-001",
             "severity": 4,
             "confidence": 75,
-            "srcIp": "multiple",
-            "dstIp": "external",
+            "srcIp": "192.168.1.5",
+            "dstIp": "8.8.8.8",
             "packetNums": [
               2
             ],

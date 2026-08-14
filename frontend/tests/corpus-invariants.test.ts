@@ -117,14 +117,14 @@ async function audit(file: string, display: string) {
     `${display}: tls entries backed by payload-confirmed TLS`,
   ).toBe(true)
   for (const f of a1.flows) {
-    if (f.protocolSource === "payload") {
+    if (f.protocolSource === "PAYLOAD_CONFIRMED") {
       expect.soft(!!f.appProtocol, `${display}: payload flow ${f.id} has app label`).toBe(true)
-    } else if (f.protocolSource === "transport_only") {
-      expect.soft(!f.appProtocol, `${display}: transport_only flow ${f.id} has no app label`).toBe(true)
+    } else if (f.protocolSource === "UNKNOWN") {
+      expect.soft(!f.appProtocol, `${display}: UNKNOWN flow ${f.id} has no app label`).toBe(true)
     }
   }
   expect.soft(
-    a1.flows.every((f) => f.protocolSource === undefined || ["payload", "port_inferred", "transport_only"].includes(f.protocolSource)),
+    a1.flows.every((f) => f.protocolSource === undefined || ["PAYLOAD_CONFIRMED", "PORT_INFERRED", "UNKNOWN"].includes(f.protocolSource)),
     `${display}: flow protocolSource enum`,
   ).toBe(true)
 
@@ -354,7 +354,10 @@ async function audit(file: string, display: string) {
       expect.soft(q.durationSec! > 0, `${display}: VALID duration > 0`).toBe(true)
       expect.soft(q.avgPacketsSec!, `${display}: VALID avgPacketsSec`).toBeGreaterThan(0)
       expect.soft(q.avgBps!, `${display}: VALID avgBps`).toBeGreaterThan(0)
-      expect.soft(q.avgBps!, `${display}: avg <= peak BY CONSTRUCTION`).toBeLessThanOrEqual(q.peakBps!)
+      // The average is total/span — it may legitimately EXCEED the peak on
+      // bursty captures (a gap mid-capture shrinks the divisor; Teardrop is
+      // 914 B/s avg vs 764 B/s peak). avgExceedsPeak must track it exactly.
+      expect.soft(q.avgExceedsPeak === (q.avgBps! > q.peakBps!), `${display}: avgExceedsPeak consistent (avg=${q.avgBps!.toFixed(1)}, peak=${q.peakBps})`).toBe(true)
     } else {
       expect.soft(q.durationSec === null && q.avgBps === null && q.avgPacketsSec === null && q.peakBps === null, `${display}: ${q.quality} has null rates`).toBe(true)
     }

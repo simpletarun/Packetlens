@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest"
 import { render, cleanup, screen, fireEvent } from "@testing-library/react"
 import { useAnalysisStore } from "@/stores/analysis"
 import type { AlertEntry, JobSummary } from "@/stores/analysis"
+import { ANALYSIS_SCHEMA_VERSION } from "@/lib/analysis"
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ jobId: "key-test" }),
@@ -20,15 +21,17 @@ function seedStore() {
     totalPackets: 2, totalFlows: 1, conversations: 1,
     devices: 2, externalIps: 1, countries: 0, domains: 0,
     protocols: ["TCP"], alerts: 2, riskScore: 10,
-    captureDuration: 60, createdAt: "2024-01-01T00:00:00.000Z",
+    highestSeverity: 4, captureQuality: "VALID", captureDuration: 1,
+    createdAt: "2024-01-01T00:00:00.000Z",
     completedAt: "2024-01-01T00:00:02.000Z",
   }
   // Two alerts with the SAME timestamp and signature land in the same
   // timeline bin, so the alert-dot key "time + signature" would collide.
-  const mkAlert = (id: string): AlertEntry => ({
+  // Different sources keep the event-dedup contract (ruleId|srcIp|dstIp).
+  const mkAlert = (id: string, srcIp: string, dstIp: string): AlertEntry => ({
     id, timestamp: "2024-01-01T00:00:01.000Z", signature: "SYN Flood Attempt",
     category: "DoS", severity: 4, confidence: 90, ruleId: "SYN-FLOOD-001",
-    srcIp: "192.168.1.1", dstIp: "10.0.0.1", srcPort: 12345, dstPort: 80,
+    srcIp, dstIp, srcPort: 12345, dstPort: 80,
     protocol: "TCP", evidence: "test",
   })
   useAnalysisStore.getState().setAllData({
@@ -37,8 +40,14 @@ function seedStore() {
       { num: 1, timestamp: "2024-01-01T00:00:00.100Z", srcIp: "192.168.1.1", dstIp: "10.0.0.1", srcPort: 12345, dstPort: 80, protocol: "TCP", length: 64, flags: "SYN", ttl: 64, info: "" },
       { num: 2, timestamp: "2024-01-01T00:00:01.100Z", srcIp: "10.0.0.1", dstIp: "192.168.1.1", srcPort: 80, dstPort: 12345, protocol: "TCP", length: 60, flags: "ACK", ttl: 64, info: "" },
     ],
-    flows: [], sessions: [], dns: [], http: [], tls: [], files: [],
-    credentials: [], certificates: [], devices: [], alerts: [mkAlert("a1"), mkAlert("a2")],
+    flows: [
+      { id: "f1", srcIp: "192.168.1.1", dstIp: "10.0.0.1", srcPort: 12345, dstPort: 80, protocol: "TCP", packets: 2, bytesTotal: 124, bytesSent: 64, bytesRecv: 60, duration: 1, startTime: "2024-01-01T00:00:00.100Z", endTime: "2024-01-01T00:00:01.100Z", retrans: 0, appProtocol: "HTTP", protocolSource: "PORT_INFERRED", tcpState: "INITIATED" },
+    ],
+    sessions: [
+      { id: "s1", srcIp: "192.168.1.1", dstIp: "10.0.0.1", srcPort: 12345, dstPort: 80, protocol: "TCP", packets: 2, bytes: 124, startTime: "2024-01-01T00:00:00.100Z", endTime: "2024-01-01T00:00:01.100Z", duration: 1, state: "INITIATED" },
+    ],
+    dns: [], http: [], tls: [], files: [],
+    credentials: [], certificates: [], devices: [], alerts: [mkAlert("a1", "192.168.1.1", "10.0.0.1"), mkAlert("a2", "10.0.0.5", "203.0.113.9")],
     timeline: [
       { time: "00:00", packets: 1, bytes: 64, tcp: 1, udp: 0, dns: 0, tls: 0 },
       { time: "00:30", packets: 1, bytes: 60, tcp: 1, udp: 0, dns: 0, tls: 0 },
@@ -47,8 +56,25 @@ function seedStore() {
       { time: "00:00", in: 64, out: 0 },
       { time: "00:30", in: 60, out: 0 },
     ],
-    advancedMetrics: null,
+    advancedMetrics: {
+      rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 2, avgBps: 124, peakBps: 124, bucketCount: 1, avgExceedsPeak: false },
+      burst: null,
+      throughputAvg: 124, throughputPeak: 124,
+      beaconDetected: false, dnsTunnelingSuspected: false, dataExfiltrationSuspected: false,
+      torVpnProxyDetected: false, portScanEnhanced: false, ja3Suspicious: false,
+      topTalkers: [], iocs: [], mitreMappings: [],
+    },
     burst: null,
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    validator: {
+      schemaVersion: ANALYSIS_SCHEMA_VERSION,
+      captureQuality: "VALID",
+      durationSec: 1,
+      decode: { decoded: 2, total: 2, linkTypes: [1], decodeRatePct: 100 },
+      integrity: { status: "valid", truncatedPackets: 0, fileTruncated: false, malformedPackets: 0, unsupportedLinkTypes: [] },
+    },
+    decode: { decoded: 2, total: 2, linkTypes: [1] },
+    fileInfo: { sha256: "", sha1: "", md5: "" },
   })
 }
 
@@ -265,8 +291,10 @@ describe("Reports page render", () => {
     // Backtick spans became real <code>; the Analysis ID links into the app.
     expect(html).toContain(`<code><a href="http://localhost:3000/analysis/key-test">key-test</a></code>`)
     expect(html).not.toContain("`key-test`")
-    // Verdict carries its level class.
-    expect(html).toContain(`<strong class="lv-safe">SAFE</strong>`)
+    // Verdict carries its level class (report risk recomputed from the two
+    // sev-4 alerts: 71/100 HIGH — the seed's job.riskScore is only a
+    // fallback when advancedMetrics are absent).
+    expect(html).toContain(`<strong class="lv-high">HIGH</strong>`)
     // No double-escaping anywhere in the artifact.
     expect(html).not.toContain("&amp;amp;")
     // Markdown tables became real tables with a header row (cells are
@@ -280,27 +308,55 @@ describe("Reports page render", () => {
     const job: JobSummary = {
       id: "key-test", filename: "csv-export.pcap", fileSize: 1024,
       status: "done", progress: 100, stage: "complete",
-      totalPackets: 2, totalFlows: 1, conversations: 1,
+      totalPackets: 8, totalFlows: 2, conversations: 2,
       devices: 0, externalIps: 1, countries: 0, domains: 0,
       protocols: ["TCP"], alerts: 0, riskScore: 5,
-      captureDuration: 60, createdAt: "2024-01-01T00:00:00.000Z",
+      highestSeverity: 0, captureQuality: "VALID", captureDuration: 1,
+      createdAt: "2024-01-01T00:00:00.000Z",
       completedAt: "2024-01-01T00:00:02.000Z",
     }
+    // The export guard re-validates the canonical result, so the fixture
+    // must reconcile: 8 packets, Σ bytes 1000 = flows 600 + 400.
+    const packetLens = [120, 120, 120, 120, 120, 133, 133, 134]
     useAnalysisStore.getState().setAllData({
       job,
-      packets: [
-        { num: 1, timestamp: "2024-01-01T00:00:00.100Z", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", length: 64, flags: "", ttl: 64, info: "" },
-      ],
+      packets: packetLens.map((length, i) => ({
+        num: i + 1, timestamp: `2024-01-01T00:00:00.${(i + 1) * 100}Z`,
+        srcIp: i < 5 ? "192.168.1.20" : "8.8.8.8", dstIp: i < 5 ? "8.8.8.8" : "192.168.1.20",
+        srcPort: i < 5 ? 42315 : 443, dstPort: i < 5 ? 443 : 42315,
+        protocol: "TCP", length, flags: "ACK", ttl: 64, info: "",
+      })),
       flows: [
-        { id: "f1", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", packets: 5, bytesTotal: 600, bytesSent: 300, bytesRecv: 300, duration: 9, startTime: "2024-01-01T00:00:00.100Z", endTime: "2024-01-01T00:00:09.100Z", retrans: 2 },
-        { id: "f2", srcIp: "8.8.8.8", dstIp: "192.168.1.20", srcPort: 443, dstPort: 42315, protocol: "TCP", packets: 3, bytesTotal: 400, bytesSent: 400, bytesRecv: 0, duration: 8, startTime: "2024-01-01T00:00:00.200Z", endTime: "2024-01-01T00:00:08.200Z", directionUnknown: true },
+        { id: "f1", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", packets: 5, bytesTotal: 600, bytesSent: 300, bytesRecv: 300, duration: 9, startTime: "2024-01-01T00:00:00.100Z", endTime: "2024-01-01T00:00:09.100Z", retrans: 2, tcpState: "ESTABLISHED" },
+        { id: "f2", srcIp: "8.8.8.8", dstIp: "192.168.1.20", srcPort: 443, dstPort: 42315, protocol: "TCP", packets: 3, bytesTotal: 400, bytesSent: 0, bytesRecv: 400, duration: 8, startTime: "2024-01-01T00:00:00.200Z", endTime: "2024-01-01T00:00:08.200Z", retrans: 0, directionUnknown: true, tcpState: "ESTABLISHED" },
       ],
-      sessions: [], dns: [], http: [], tls: [], files: [],
+      sessions: [
+        { id: "s1", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", packets: 5, bytes: 600, startTime: "2024-01-01T00:00:00.100Z", endTime: "2024-01-01T00:00:09.100Z", duration: 9, state: "ESTABLISHED" },
+        { id: "s2", srcIp: "8.8.8.8", dstIp: "192.168.1.20", srcPort: 443, dstPort: 42315, protocol: "TCP", packets: 3, bytes: 400, startTime: "2024-01-01T00:00:00.200Z", endTime: "2024-01-01T00:00:08.200Z", duration: 8, state: "ESTABLISHED" },
+      ],
+      dns: [], http: [], tls: [], files: [],
       credentials: [], certificates: [], devices: [], alerts: [],
-      timeline: [{ time: "00:00", packets: 1, bytes: 64, tcp: 1, udp: 0, dns: 0, tls: 0 }],
-      bandwidth: [{ time: "00:00", in: 64, out: 0 }],
-      advancedMetrics: null,
+      timeline: [{ time: "00:00", packets: 8, bytes: 1000, tcp: 8, udp: 0, dns: 0, tls: 0 }],
+      bandwidth: [{ time: "00:00", in: 400, out: 600 }],
+      advancedMetrics: {
+        rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 8, avgBps: 1000, peakBps: 1000, bucketCount: 1, avgExceedsPeak: false },
+        burst: null,
+        throughputAvg: 1000, throughputPeak: 1000,
+        beaconDetected: false, dnsTunnelingSuspected: false, dataExfiltrationSuspected: false,
+        torVpnProxyDetected: false, portScanEnhanced: false, ja3Suspicious: false,
+        topTalkers: [], iocs: [], mitreMappings: [],
+      },
       burst: null,
+      schemaVersion: ANALYSIS_SCHEMA_VERSION,
+      validator: {
+        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        captureQuality: "VALID",
+        durationSec: 1,
+        decode: { decoded: 8, total: 8, linkTypes: [1], decodeRatePct: 100 },
+        integrity: { status: "valid", truncatedPackets: 0, fileTruncated: false, malformedPackets: 0, unsupportedLinkTypes: [] },
+      },
+      decode: { decoded: 8, total: 8, linkTypes: [1] },
+      fileInfo: { sha256: "", sha1: "", md5: "" },
     })
     let captured: Blob | null = null
     vi.spyOn(URL, "createObjectURL").mockImplementation((b) => { captured = b as Blob; return "blob:mock" })

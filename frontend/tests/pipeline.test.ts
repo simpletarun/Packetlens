@@ -110,15 +110,16 @@ describe("end-to-end pipeline on testing.pcapng", () => {
     })
     expect(stats.devices).toBe(localDevices)
 
-    // Throughput: the engine's canonical avg divides total bytes by the rate
-    // window = max(real span, covered seconds), so it can never exceed the
-    // peak bucket (QA: Teardrop 914 B/s avg vs 764 B/s peak on dense short
-    // captures). This is the single number the report page renders.
+    // Throughput: the engine's canonical avg divides total bytes by the real
+    // capture span (total/span), exactly matching Wireshark. On bursty dense
+    // captures the average may legitimately sit ABOVE the largest single
+    // second bucket (Teardrop: 914 B/s avg vs 764 B/s peak) — the report
+    // page renders this one number, and avgExceedsPeak flags the state.
     const total = analysis.packets.reduce((s, p) => s + p.length, 0)
     const rates = analysis.advancedMetrics.rates
-    const rateWindow = Math.max(rates.durationSec ?? duration, rates.bucketCount)
-    expect(Math.abs(total / rateWindow - (analysis.advancedMetrics.throughputAvg ?? 0))).toBeLessThan(1)
-    expect(analysis.advancedMetrics.throughputAvg!).toBeLessThanOrEqual(analysis.advancedMetrics.throughputPeak!)
+    expect(rates.avgBps).toBeCloseTo(total / rates.durationSec!, 6)
+    expect(Math.abs(rates.avgBps! - (analysis.advancedMetrics.throughputAvg ?? 0))).toBeLessThan(1)
+    expect(rates.avgExceedsPeak === (rates.avgBps! > rates.peakBps!)).toBe(true)
 
     // Port services: previously-unlabeled well-known ports resolve.
     expect(portServiceName(7, "TCP")).toBe("Echo")

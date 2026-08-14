@@ -21,7 +21,7 @@ function makePacket(overrides: Partial<ParsedPacket> = {}): ParsedPacket {
   }
 }
 
-describe("protocol honesty — flow protocolSource (payload vs port_inferred)", () => {
+describe("protocol honesty — flow protocolSource (PAYLOAD_CONFIRMED vs PORT_INFERRED)", () => {
   function run(packets: ParsedPacket[]) {
     return analyzePcap({
       packets,
@@ -35,32 +35,32 @@ describe("protocol honesty — flow protocolSource (payload vs port_inferred)", 
     })
   }
 
-  it("TCP/80 with no HTTP payload is port_inferred, never payload", () => {
+  it("TCP/80 with no HTTP payload is PORT_INFERRED, never PAYLOAD_CONFIRMED", () => {
     const packets: ParsedPacket[] = [
       makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "SYN", appProtocol: "HTTP" }),
       makePacket({ num: 2, timestamp: 1000001, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "ACK", appProtocol: "HTTP" }),
     ]
     const f = run(packets).flows[0]
-    expect(f.protocolSource).toBe("port_inferred")
+    expect(f.protocolSource).toBe("PORT_INFERRED")
     expect(f.appProtocol).toBe("HTTP")
   })
 
-  it("a GET payload makes the flow payload-confirmed HTTP", () => {
+  it("a GET payload makes the flow PAYLOAD_CONFIRMED HTTP", () => {
     const packets: ParsedPacket[] = [
       makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "PSH ACK", appProtocol: "HTTP", appPayloadConfirmed: true, httpMethod: "GET" }),
       makePacket({ num: 2, timestamp: 1000001, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "ACK", appProtocol: "HTTP" }),
     ]
     const f = run(packets).flows[0]
-    expect(f.protocolSource).toBe("payload")
+    expect(f.protocolSource).toBe("PAYLOAD_CONFIRMED")
     expect(f.appProtocol).toBe("HTTP")
   })
 
-  it("bare transport with no app label is transport_only", () => {
+  it("bare transport with no app label is UNKNOWN", () => {
     const packets: ParsedPacket[] = [
       makePacket({ num: 1, timestamp: 1000000, dstIp: "8.8.8.8", dstPort: 3389, tcpFlags: "SYN" }),
     ]
     const f = run(packets).flows[0]
-    expect(f.protocolSource).toBe("transport_only")
+    expect(f.protocolSource).toBe("UNKNOWN")
     expect(f.appProtocol).toBeUndefined()
   })
 
@@ -70,7 +70,7 @@ describe("protocol honesty — flow protocolSource (payload vs port_inferred)", 
       makePacket({ num: 2, timestamp: 1000001, dstIp: "8.8.8.8", dstPort: 80, tcpFlags: "PSH ACK", appProtocol: "HTTP", appPayloadConfirmed: true, httpMethod: "POST" }),
     ]
     const f = run(packets).flows[0]
-    expect(f.protocolSource).toBe("payload")
+    expect(f.protocolSource).toBe("PAYLOAD_CONFIRMED")
   })
 
   it("packets surface the appPayloadConfirmed flag", () => {
@@ -121,10 +121,18 @@ describe("TCP state machine — honest handshake states on flows and sessions", 
     expect(a.flows[0].tcpState).toBe("ESTABLISHED")
   })
 
-  it("the final ACK must come AFTER the SYN-ACK (order-sensitive)", () => {
-    // ACK seen before the SYN-ACK (out-of-order capture) never completes it.
-    const a = run([SYN, ACK, SYNACK])
+  it("an ACK BEFORE the SYN-ACK in TIME never completes it (HALF_OPEN)", () => {
+    // ACK at t1 < SYN-ACK at t2: the completing ACK did not follow the
+    // SYN-ACK, so the handshake is not established.
+    const a = run([SYN, { ...ACK, timestamp: 1000001 }, { ...SYNACK, timestamp: 1000002 }])
     expect(a.sessions[0].state).toBe("HALF_OPEN")
+  })
+
+  it("pcapng out-of-order FILE order still derives the true state (ESTABLISHED)", () => {
+    // File order [SYN t0, ACK t2, SYN-ACK t1] — a multi-interface writer
+    // recorded the ACK before the SYN-ACK. Timestamp order is the truth.
+    const a = run([SYN, ACK, SYNACK])
+    expect(a.sessions[0].state).toBe("ESTABLISHED")
   })
 
   it("RST overrides everything: RESET", () => {
@@ -155,6 +163,13 @@ describe("TCP state machine — honest handshake states on flows and sessions", 
       const sess = a.sessions.find((s) => s.srcIp === f.srcIp && s.dstIp === f.dstIp && s.srcPort === f.srcPort && s.dstPort === f.dstPort)
       expect(sess?.state).toBe(f.tcpState)
     }
+  })
+
+  it("job.highestSeverity is the strongest finding severity — never the count", () => {
+    const noThreats = run([SYN])
+    expect(noThreats.job.highestSeverity).toBe(0)
+    const a = run([SYN, SYNACK, ACK, FIN])
+    expect(a.job.highestSeverity).toBe(a.threats.reduce((m, t) => Math.max(m, t.severity), 0))
   })
 })
 
@@ -206,6 +221,9 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
       protocol: "TCP",
       tcpFlags: "PSH ACK",
       httpMethod: "GET",
+      // The parser sets appPayloadConfirmed on every decoded HTTP message —
+      // fixtures must mirror the decoder contract or evidence validation fails.
+      appPayloadConfirmed: true,
       payload: hex(payload),
       ...overrides,
     })
@@ -249,7 +267,7 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
   it("no two displayed threats share (ruleId, srcIp, dstIp)", () => {
     const a = run([
       ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443)),
-      ...Array.from({ length: 25 }, (_, i) => synPkt(1000 + i, 2000 + i)),
+      ...Array.from({ length: 25 }, (_, i) => synPkt(150 + i, 2000 + i)),
     ])
     const keys = new Set(a.threats.map((t) => `${t.ruleId}|${t.srcIp}|${t.dstIp}`))
     expect(keys.size).toBe(a.threats.length)
@@ -258,23 +276,39 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
   it("provenance: findings cite the exact triggering packet numbers", () => {
     const a = run([
       ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443)),
-      ...Array.from({ length: 25 }, (_, i) => synPkt(1000 + i, 2000 + i, "10.0.0.6")),
+      ...Array.from({ length: 25 }, (_, i) => synPkt(150 + i, 2000 + i, "10.0.0.6")),
     ])
     const flood = a.threats.find((t) => t.ruleId === "SYN-FLOOD-001")!
     expect(flood.packetNums?.[0]).toBe(1)
-    expect(flood.packetNums!.length).toBeLessThanOrEqual(5)
+    // Every triggering packet is retained as evidence, not a 5-packet sample.
+    expect(flood.packetNums!.length).toBe(150)
     expect(flood.packetNums!.every((n) => n >= 1)).toBe(true)
     const scan = a.threats.find((t) => t.ruleId === "PORT-SCAN-001")!
-    expect(scan.packetNums![0]).toBe(1001)
+    expect(scan.packetNums![0]).toBe(151)
   })
 
   it("provenance: credential findings are payloadConfirmed and cite the packet", () => {
     const a = run(Array.from({ length: 5 }, (_, i) =>
-      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: 10 + i, timestamp: 1000000 + i })))
+      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: i + 1, timestamp: 1000000 + i })))
     const cred = a.threats.find((t) => t.ruleId === "HTTP-CREDS-001")!
     expect(cred.payloadConfirmed).toBe(true)
-    expect(cred.packetNums).toEqual([10, 11, 12, 13, 14])
-    expect(a.credentials.map((c) => c.packetNum)).toEqual([10, 11, 12, 13, 14])
+    expect(cred.packetNums).toEqual([1, 2, 3, 4, 5])
+    expect(a.credentials.map((c) => c.packetNum)).toEqual([1, 2, 3, 4, 5])
+  })
+
+  it("two INDEPENDENT credential events (different clients) are two alerts, one with all packets", () => {
+    const a = run([
+      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: 1, timestamp: 1000000 }),
+      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: 2, timestamp: 1000001, srcIp: "192.168.1.6" }),
+      httpPacket("GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzM2NyZXQ=\r\n", { num: 3, timestamp: 1000002, srcIp: "192.168.1.6" }),
+    ])
+    const credAlerts = a.threats.filter((t) => t.ruleId === "HTTP-CREDS-001")
+    expect(credAlerts).toHaveLength(2)
+    const first = credAlerts.find((t) => t.srcIp === "192.168.1.5")!
+    expect(first.packetNums).toEqual([1])
+    const second = credAlerts.find((t) => t.srcIp === "192.168.1.6")!
+    expect(second.packetNums).toEqual([2, 3])
+    expect(second.evidence).toContain("2 plaintext credential submission")
   })
 })
 
@@ -1030,7 +1064,9 @@ describe("Analysis engine", () => {
     expect(f.srcIp).toBe("\u2014")
     expect(f.protocol).toBe("OTHER")
     expect(f.directionUnknown).toBe(true)
-    expect(f.bytesSent).toBe(0)
+    // Direction is unknown, so every undecodable byte lands on ONE leg —
+    // never doubled (600+600) and never lost (0+0 vs 600): conservation.
+    expect(f.bytesSent).toBe(600)
     expect(f.bytesRecv).toBe(0)
     expect(f.bytesTotal).toBe(600)
   })
@@ -1054,7 +1090,8 @@ describe("Analysis engine", () => {
     const other = analysis.flows.find((f) => f.protocol === "OTHER")
     expect(other).toBeDefined()
     expect(other!.directionUnknown).toBe(true)
-    expect(other!.bytesSent).toBe(0)
+    // Undecodable bytes all land on one leg (never doubled, never lost).
+    expect(other!.bytesSent).toBe(64)
     expect(other!.bytesRecv).toBe(0)
   })
 
@@ -1268,6 +1305,9 @@ describe("Credential extraction (deriveCredentials)", () => {
       protocol: "TCP",
       tcpFlags: "PSH ACK",
       httpMethod: "GET",
+      // The parser sets appPayloadConfirmed on every decoded HTTP message —
+      // fixtures must mirror the decoder contract or evidence validation fails.
+      appPayloadConfirmed: true,
       payload: hex(payload),
       ...overrides,
     })

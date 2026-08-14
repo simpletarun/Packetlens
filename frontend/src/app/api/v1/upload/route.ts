@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { parsePcap, KNOWN_DLTS } from '@/lib/pcap'
-import { analyzePcap } from '@/lib/analysis'
+import { analyzePcap, assertValidAnalysisResult } from '@/lib/analysis'
 import { enrichDeviceVendors } from '@/lib/oui-server'
 import { storeJob } from '@/lib/job-store'
 import { sameOrigin } from '@/lib/request-guard'
@@ -96,6 +96,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     analysisResult.job.filename = sanitizeFilename(file.name)
     analysisResult.job.fileSize = file.size
     analysisResult.job.createdAt = new Date().toISOString()
+
+    // Full validation at the API boundary — an invalid result must never be
+    // stored or served (pipeline: PCAP → engine → canonical result → FULL
+    // VALIDATION → only then → API/UI/export).
+    assertValidAnalysisResult(analysisResult)
 
     const jobId = analysisResult.job.id
     storeJob(jobId, analysisResult.job.filename, analysisResult)

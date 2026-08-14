@@ -850,9 +850,19 @@ describe("analystConclusion � the verdict must never call a capture clean whil
     expect(text).toContain("12% of packets could be decoded")
     expect(text).toContain("No verdict is possible")
   })
+
+  it("a degraded capture WITH findings says why the rates may be wrong", () => {
+    // Non-VALID + alerts: the finding stands, and the note explains that
+    // rate/burst evidence may be unavailable — a clean-ish note would
+    // silently downgrade the detection.
+    const text = analystConclusion({ ...base, quality: "SINGLE_PACKET", alerts: [{ signature: "Plaintext HTTP Credentials" }], score: 39 })
+    expect(text).toContain("1 confirmed finding detected")
+    expect(text).toContain("NOT clean")
+    expect(text).toContain("capture quality")
+  })
 })
 
-describe("T1040 mapping for plaintext credential alerts", () => {
+describe("MITRE mapping for plaintext credential alerts (T1552, not T1040)", () => {
   it("recommends rotating the exposed accounts, not generic Network Sniffing investigation", () => {
     const report = buildReportAnalysis({
       job: null,
@@ -864,7 +874,7 @@ describe("T1040 mapping for plaintext credential alerts", () => {
         srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 0, dstPort: 0, protocol: "HTTP",
         evidence: "1 plaintext credential submission(s) over HTTP Form",
       }],
-packets: [], flows: [], sessions: [], tls: [], http: [],
+      packets: [], flows: [], sessions: [], tls: [], http: [],
       timeline: [], bandwidth: [],
       advancedMetrics: {
         throughputAvg: 0, throughputPeak: 0, burst: null,
@@ -876,8 +886,10 @@ packets: [], flows: [], sessions: [], tls: [], http: [],
     const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials"))
     expect(rec?.text).toBe("Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS")
     expect(rec?.severity).toBe(4)
-    const mitre = report.mitre.find((m) => m.id === "T1040")
-    expect(mitre?.technique).toBe("Network Sniffing")
+    const mitre = report.mitre.find((m) => m.id === "T1552")
+    expect(mitre?.technique).toBe("Unsecured Credentials")
     expect(mitre?.description).toContain("cleartext")
+    // T1040 (Network Sniffing) is the WRONG frame for passive HTTP creds.
+    expect(report.mitre.find((m) => m.id === "T1040")).toBeUndefined()
   })
 })

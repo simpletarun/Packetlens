@@ -131,8 +131,11 @@ const TECHNIQUE_RULES: Record<string, string[]> = {
   "T1071.004": ["DNS-TUNNEL-001"],
   T1041: ["DATA-EXFIL-001"],
   T1071: ["C2-BEACON-001"],
-  T1040: ["HTTP-CREDS-001"],
-  T1552: ["CRED-LEAK-001"],
+  // Plaintext credentials transmitted over the wire = Unsecured Credentials
+  // (T1552), NOT Network Sniffing (T1040 — that requires passive interception
+  // evidence we never have). Semantic fix: HTTP-CREDS-001/CRED-LEAK-001 are
+  // exposure events, and their mapping must say so (QA: creds mapped T1040).
+  T1552: ["HTTP-CREDS-001", "CRED-LEAK-001"],
   T1105: ["MALWARE-DL-001"],
   "T1583.001": ["TLS-SUSPICIOUS-001"],
 }
@@ -152,7 +155,7 @@ const TECHNIQUE_ID: Record<string, string> = {
   "C2-BEACON-001": "T1071",
   "DATA-EXFIL-001": "T1041",
   "TLS-SUSPICIOUS-001": "T1583.001",
-  "HTTP-CREDS-001": "T1040",
+  "HTTP-CREDS-001": "T1552",
 }
 
 // IOC type → alert rule that backs it. The engine fires DNS-TUNNEL-001,
@@ -187,8 +190,7 @@ const TECHNIQUE_NAMES: Record<string, { name: string; desc: string }> = {
   "T1071.004": { name: "DNS Tunneling", desc: "Data encoded in DNS queries/responses" },
   T1041: { name: "Exfiltration Over C2 Channel", desc: "Data sent to external server" },
   T1071: { name: "Application Layer Protocol", desc: "Periodic C2 beaconing detected" },
-  T1040: { name: "Network Sniffing", desc: "Credentials transmitted in cleartext, sniffable over the network" },
-  T1552: { name: "Unsecured Credentials", desc: "Credential exposure via authentication traffic" },
+  T1552: { name: "Unsecured Credentials", desc: "Credentials submitted or stored in cleartext (transit, files, logs) without protection" },
   T1105: { name: "Ingress Tool Transfer", desc: "Download of files from remote systems" },
   "T1583.001": { name: "Acquire Infrastructure: Domains", desc: "Suspicious TLS or domain infrastructure" },
 }
@@ -295,6 +297,9 @@ export interface ReportRisk {
   levelColor: string
   items: RiskBreakdownItem[]
   burstApplied: boolean
+  /** Max finding severity (0-5) among the alerts, shown next to the score so
+   *  numeric normalization never hides a HIGH/Critical finding. */
+  highestSeverity: number
 }
 
 interface IocFinding {
@@ -384,6 +389,10 @@ export function buildReportRisk(alerts: AlertEntry[], advancedMetrics: AdvancedM
     levelColor: level.color,
     items: b.items,
     burstApplied,
+    // The strongest finding severity, surfaced ALONGSIDE the score — a
+    // HIGH-severity alert with a 39/100 LOW score must never read as a
+    // downgrade of the finding itself.
+    highestSeverity: alerts.reduce((m, a) => Math.max(m, a.severity), 0),
   }
 }
 
@@ -427,7 +436,7 @@ const MITRE_REC: Record<string, string> = {
   T1071: "Isolate beaconing endpoints and hunt for C2 malware on affected hosts",
   T1090: "Enforce blocking of known proxy/TOR/VPN endpoints; review outbound policy",
   T1003: "Rotate exposed credentials and investigate hosts involved in authentication traffic",
-  T1040: "Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS",
+  T1552: "Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS",
   T1213: "Review data-collection endpoints and restrict access to sensitive repositories",
 }
 
@@ -854,17 +863,24 @@ export function osFromUserAgent(ua: string): string | undefined {
 // capture; their own forwarded copies are not client lookups. Falls back to
 // counting every non-response entry when no resolver was observed
 // (server-side capture), so the number is never silently zero.
+// Event identity is normalized (client, name, type, class): the name is
+// lowercased and stripped of its trailing dot (DNS names are case-insensitive,
+// RFC 4343; "example.com." == "EXAMPLE.COM"), the type is the question type,
+// and the class is IN for every real-world query. Two different clients
+// querying the same name are TWO lookups; a retransmitted query from the same
+// client is ONE.
 export function dnsLookupCount(entries: DnsEntry[]): number {
   const queries = entries.filter((d) => !d.isResponse)
   const resolvers = new Set<string>()
   for (const d of queries) resolvers.add(d.dstIp)
   const seen = new Set<string>()
+  const norm = (d: DnsEntry) => `${d.srcIp}\u0000${d.query.replace(/\.$/, '').toLowerCase()}\u0000${d.type}\u0000IN`
   for (const d of queries) {
     if (resolvers.has(d.srcIp)) continue
-    seen.add(`${d.query}\u0000${d.type}`)
+    seen.add(norm(d))
   }
   if (seen.size === 0) {
-    for (const d of queries) seen.add(`${d.query}\u0000${d.type}`)
+    for (const d of queries) seen.add(norm(d))
   }
   return seen.size
 }
@@ -1163,7 +1179,9 @@ export function buildFlowsCsv(
 // alert + IOC yet concluded "No suspicious indicators were detected"), and a
 // capture without a measurable time interval (single packet / zero duration)
 // has NO rate or burst evidence — "insufficient evidence", not proof of
-// safety (QA: 1-SYN capture concluded clean).
+// safety (QA: 1-SYN capture concluded clean). The verdict depends on BOTH
+// capture quality and detections: a non-VALID capture can never conclude
+// SAFE/clean, even when no rule fired.
 export function analystConclusion(opts: {
   undecodable: boolean
   decodeRatePct: number
@@ -1176,7 +1194,14 @@ export function analystConclusion(opts: {
     return `Only ${opts.decodeRatePct}% of packets could be decoded — the capture uses unsupported encapsulation (${opts.encapName}), so lengths and timestamps parsed but no headers did. No verdict is possible on undecodable traffic; re-capture with Ethernet encapsulation (or an explicit DLT override) and re-analyze.`
   }
   if (opts.alerts.length > 0) {
-    return `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${opts.alerts[0].signature}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+    const head = `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${opts.alerts[0].signature}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+    // Findings on a poor-quality capture are still findings, but the missing
+    // rate/burst evidence must be stated — never a bare "clean" or a bare
+    // "significant" that implies full analysis.
+    if (opts.quality && opts.quality !== "VALID") {
+      return `${head} Note: the capture quality is ${opts.quality.toLowerCase().replace("_", " ")} — rate analysis, burst detection, and behavioral detection were not possible, so other activity may be hidden.`
+    }
+    return head
   }
   // 0 alerts on a VALID capture: no configured rule triggered. This is not
   // "proven safe" — it is clean under the configured rules only.
@@ -1199,10 +1224,10 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
   // timestamps). Never fabricated with a 0.001 s / 1 s fallback denominator:
   // a one-packet capture has no rates, and the report must show N/A
   // (QA: 1-SYN capture showed 66 B/s average over a fake 1 s interval).
-  // Fixtures built without the engine's rates field fall back to the real
-  // packet span (never a rounded job summary).
-  const durationSec = advancedMetrics?.rates?.durationSec ??
-    (packets.length > 1 ? (() => { const [a, b] = packetSpanSec(packets); return b - a > 0 ? b - a : null })() : null)
+  // Fixtures without the engine's rates field fall back to the engine-written
+  // job summary value — the renderer never recomputes a duration from raw
+  // packets (renderers are read-only consumers of the canonical result).
+  const durationSec = advancedMetrics?.rates?.durationSec ?? (job?.captureDuration ?? null)
 
   const risk = buildReportRisk(alerts, advancedMetrics)
   const groups = groupAlerts(alerts)

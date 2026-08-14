@@ -7,6 +7,7 @@ import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass } from "@/lib/risk"
+import { analysisProblems } from "@/lib/analysis"
 import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
@@ -15,7 +16,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
-  Download, FileText, AlertTriangle, Globe, Shield, Monitor,
+  Download, FileText, AlertTriangle, Globe, Shield, ShieldAlert, Monitor,
   Package, GitFork, MessagesSquare, FolderOpen, Key, Verified, BarChart3, History, Zap,
   Phone
 } from "lucide-react"
@@ -161,6 +162,9 @@ export default function ReportsPage() {
   const geoMap = useAnalysisStore((s) => s.geoMap)
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const decode = useAnalysisStore((s) => s.decode)
+  const schemaVersion = useAnalysisStore((s) => s.schemaVersion)
+  const validator = useAnalysisStore((s) => s.validator)
+  const fileInfo = useAnalysisStore((s) => s.fileInfo)
 
   // Report credentials are masked by default, same as the Credentials page
   // (privacy); the section header carries the Show/Hide toggle.
@@ -266,6 +270,49 @@ export default function ReportsPage() {
     bandwidth,
     advancedMetrics,
   }), [job, jobInfo, alerts, packets, flows, sessions, tls, http, timeline, bandwidth, advancedMetrics])
+
+  // The canonical AnalysisResult, rebuilt from the served slices + the
+  // contract fields (schemaVersion/validator/fileInfo) the data API now
+  // returns. Exports re-validate THIS object before producing anything —
+  // an invalid result is not renderable/exportable (pipeline: engine →
+  // full validation → only then → UI/HTML/PDF/JSON/API).
+  const canonicalResult = useMemo(() => {
+    if (!job || !validator) return null
+    return {
+      schemaVersion: schemaVersion ?? "",
+      job: { ...job, status: "done" as const, progress: 100, stage: "complete" },
+      packets,
+      flows,
+      sessions,
+      dns,
+      http,
+      tls,
+      files,
+      calls,
+      credentials,
+      certificates,
+      devices,
+      threats: alerts,
+      timeline,
+      bandwidth,
+      advancedMetrics: advancedMetrics ?? { rates: { quality: "EMPTY", durationSec: null, avgPacketsSec: null, avgBps: null, peakBps: null, bucketCount: 0, avgExceedsPeak: false } },
+      fileInfo: fileInfo ?? { sha256: "", sha1: "", md5: "" },
+      validator,
+      decode: decode ?? { decoded: 0, total: 0, linkTypes: [] },
+    } as unknown as import("@/lib/analysis").AnalysisResult
+  }, [job, schemaVersion, validator, fileInfo, packets, flows, sessions, dns, http, tls, files, calls, credentials, certificates, alerts, timeline, bandwidth, advancedMetrics, decode])
+
+  // Export guard: refuse to emit any report artifact from an invalid result.
+  const requireValid = (): boolean => {
+    if (!canonicalResult) return false
+    const problems = analysisProblems(canonicalResult)
+    if (problems.length > 0) {
+      alert(`Export blocked: AnalysisResult failed validation (${problems.length} problems) — this is a pipeline bug, not a capture issue.`)
+      console.error("Export blocked by validation:", problems)
+      return false
+    }
+    return true
+  }
 
   const risk = report.risk
   const mitre = report.mitre
@@ -473,6 +520,7 @@ export default function ReportsPage() {
   })
 
   const handleExport = () => {
+    if (!requireValid()) return
     const t = document.title
     document.title = "PacketLens Report - " + job.filename
     setTimeout(() => {
@@ -515,6 +563,9 @@ export default function ReportsPage() {
         ["Local Devices", stats.devices.toLocaleString()],
         ["Duration", durLabel(durationSec)],
         ["Risk score", riskValue()],
+        // Severity is never hidden by the score: a HIGH finding is stated
+        // next to a LOW numeric score, not swallowed by it.
+        ["Highest finding", (risk?.highestSeverity ?? job.highestSeverity ?? 0) > 0 ? `${sevLabel(risk?.highestSeverity ?? job.highestSeverity ?? 0)} (${risk?.highestSeverity ?? job.highestSeverity ?? 0}/5)` : "None"],
       ]),
       "",
       `## Capture Information`,
@@ -582,10 +633,12 @@ export default function ReportsPage() {
   }
 
   const exportHtml = () => {
+    if (!requireValid()) return
     downloadText(`${job.filename}-report.html`, markdownToHtml(buildMarkdown(), { jobId: job.id, jobFilename: job.filename, origin: window.location.origin }), "text/html")
   }
 
   const exportCsv = () => {
+    if (!requireValid()) return
     downloadText(`${job.filename}-flows.csv`, buildFlowsCsv(flows, geoMap, packets), "text/csv")
   }
 
@@ -689,6 +742,10 @@ export default function ReportsPage() {
                   { label: "Certificates", value: certificates.length.toLocaleString(), icon: Verified, color: "text-chart-2" },
                   { label: "Alerts", value: alerts.length.toLocaleString(), icon: AlertTriangle, color: "text-danger" },
                   { label: "Risk Score", value: riskValue(), icon: AlertTriangle, color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))) },
+                  // Severity is surfaced ALONGSIDE the score — numeric
+                  // normalization must never hide the strongest finding
+                  // (a 39/100 LOW score with a HIGH finding reads as HIGH present).
+                  { label: "Highest Finding", value: (risk?.highestSeverity ?? job.highestSeverity ?? 0) > 0 ? `${sevLabel(risk?.highestSeverity ?? job.highestSeverity ?? 0)} (${risk?.highestSeverity ?? job.highestSeverity ?? 0}/5)` : "None", icon: ShieldAlert, color: (risk?.highestSeverity ?? 0) >= 4 ? "text-danger" : "text-muted-foreground" },
                   { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
                   { label: "Avg Packet Size", value: avgPacketBytes + " B", icon: Package, color: "text-muted-foreground" },
                 ].map(({ label, value, color }) => (

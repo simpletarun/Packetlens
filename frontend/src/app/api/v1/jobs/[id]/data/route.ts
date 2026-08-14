@@ -51,5 +51,10 @@ export async function GET(
     advancedMetrics: d.advancedMetrics,
     burst: d.advancedMetrics.burst ?? null,
     decode: d.decode,
+    // Canonical contract fields — the export path re-validates the complete
+    // result with these before producing HTML/PDF/JSON.
+    schemaVersion: d.schemaVersion,
+    validator: d.validator,
+    fileInfo: d.fileInfo,
   })
 }

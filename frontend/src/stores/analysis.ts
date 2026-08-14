@@ -1,5 +1,5 @@
 import { create } from "zustand"
-import type { BurstInfo } from "@/lib/analysis"
+import type { BurstInfo, AnalysisValidator, FileInfo } from "@/lib/analysis"
 import type { CaptureRates } from "@/lib/metrics"
 import type { GeoLocation } from "@/lib/geo"
 import { computeStats, AnalysisStats } from "@/lib/stats"
@@ -28,6 +28,11 @@ export interface JobSummary {
   domains: number; protocols: string[]; alerts: number
   riskScore: number; captureDuration: number; createdAt: string
   completedAt?: string
+  /** Max finding severity (0-5); surfaced next to riskScore so a HIGH finding
+   *  never reads as downgraded by a LOW score. */
+  highestSeverity?: number
+  /** Canonical capture quality (EMPTY/SINGLE_PACKET/ZERO_DURATION/VALID). */
+  captureQuality?: string
   isDemo?: boolean
   sha256?: string
   sha1?: string
@@ -51,6 +56,10 @@ export interface Flow {
   // True when either endpoint is undecodable ("—"): direction unknowable,
   // UI shows "—"/"unknown" instead of fake zero/symmetric bytes.
   directionUnknown?: boolean
+  // Protocol honesty (v3.3): how appProtocol was determined.
+  appProtocol?: string
+  protocolSource?: "PAYLOAD_CONFIRMED" | "PORT_INFERRED" | "UNKNOWN"
+  tcpState?: string
   // TCP health metrics (v3.2). Present only when the capture carried enough
   // TCP state to derive them honestly — absent means "not computable".
   retrans?: number
@@ -65,7 +74,7 @@ export interface Session {
   id: string; srcIp: string; dstIp: string
   srcPort: number; dstPort: number; protocol: string
   packets: number; bytes: number; state: string
-  duration: number; startTime: string
+  duration: number; startTime: string; endTime?: string
 }
 
 export interface DnsEntry {
@@ -222,6 +231,11 @@ interface AnalysisViewData {
   burst: BurstInfo | null
   jobInfo?: JobInfo
   decode?: { decoded: number; total: number; linkTypes: number[] } | null
+  /** Canonical contract fields — carried so the export path can re-validate
+   *  the complete AnalysisResult before producing HTML/PDF/JSON. */
+  schemaVersion?: string
+  validator?: AnalysisValidator
+  fileInfo?: FileInfo
 }
 
 interface AnalysisState {
@@ -244,6 +258,9 @@ interface AnalysisState {
   advancedMetrics: AdvancedMetrics | null
   burst: BurstInfo | null
   decode: { decoded: number; total: number; linkTypes: number[] } | null
+  schemaVersion: string | null
+  validator: AnalysisValidator | null
+  fileInfo: FileInfo | null
   geoMap: Map<string, GeoLocation>
   stats: AnalysisStats
   beginnerMode: boolean
@@ -282,6 +299,7 @@ const initialState = {
   files: [], calls: [], credentials: [], certificates: [], devices: [], alerts: [],
   timeline: [], bandwidth: [], advancedMetrics: null, burst: null,
   decode: null,
+  schemaVersion: null, validator: null, fileInfo: null,
   geoMap: new Map<string, GeoLocation>(),
   stats: {
     totalPackets: 0, totalFlows: 0, sessions: 0, devices: 0, externalIps: 0,
@@ -355,6 +373,9 @@ export const useAnalysisStore = create<AnalysisState>((set, get) => {
       advancedMetrics: data.advancedMetrics,
       burst: data.burst ?? null,
       decode: data.decode ?? null,
+      schemaVersion: data.schemaVersion ?? null,
+      validator: data.validator ?? null,
+      fileInfo: data.fileInfo ?? null,
       // Drop the previous job's geo before the new one's resolution lands — the
       // old countries card would otherwise linger on the new job's stats
       // (geoMap resolves asynchronously after setAllData).

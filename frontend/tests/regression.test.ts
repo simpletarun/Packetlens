@@ -136,7 +136,11 @@ describe("Regression tests", () => {
     const flow = analysis.flows[0]
     expect(flow.srcIp).toBe("\u2014")
     expect(flow.directionUnknown).toBe(true)
-    expect(flow.bytesSent).toBe(0)
+    // The old filters matched NEITHER leg (undefined IPs vs the "—" key),
+    // so 0+0=0 was reported against a 1200-byte total — a conservation
+    // violation the validator now rejects. Direction is unknown, so all
+    // bytes land on one leg: 1200 sent, 0 recv, 1200 total.
+    expect(flow.bytesSent).toBe(1200)
     expect(flow.bytesRecv).toBe(0)
     expect(flow.bytesTotal).toBe(1200)
   })

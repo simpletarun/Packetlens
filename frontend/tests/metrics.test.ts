@@ -47,25 +47,27 @@ describe("captureRates edge cases", () => {
 })
 
 describe("captureRates valid captures", () => {
-  it("duration is the real span; avg divides the rate window (never above peak)", () => {
+  it("avg is total/span — sub-second bursts honestly exceed the peak rate", () => {
     const r = rates([[0, 100], [0.42, 100]])
     expect(r.quality).toBe("VALID")
     expect(r.durationSec).toBeCloseTo(0.42, 5)
-    // Both packets land in the same 1s bucket: the rate window is 1s, so the
-    // average (200 B/s) equals the peak and never overstates the 0.42s span.
-    expect(r.avgBps).toBe(200)
-    expect(r.avgPacketsSec).toBe(2)
+    // 200 bytes over a 0.42s span is 476.19 B/s. There is only ONE 1s bucket
+    // (peak 200 B/s), so the average of the whole capture may legitimately
+    // sit above the largest single-second bucket — the flag says so.
+    expect(r.avgBps).toBeCloseTo(200 / 0.42, 5)
+    expect(r.avgPacketsSec).toBeCloseTo(2 / 0.42, 5)
     expect(r.peakBps).toBe(200)
-    expect(r.avgBps!).toBeLessThanOrEqual(r.peakBps!)
+    expect(r.avgExceedsPeak).toBe(true)
   })
 
   it("sparse captures divide by the real span (Wireshark-style)", () => {
     const r = rates([[0, 100], [0.5, 100], [3, 100]])
     expect(r.durationSec).toBe(3)
     expect(r.bucketCount).toBe(2)
-    // max(span=3, buckets=2) = 3
+    // 300 bytes / 3s = 100 B/s regardless of bucket count.
     expect(r.avgBps).toBe(100)
     expect(r.avgPacketsSec).toBe(1)
+    expect(r.avgExceedsPeak).toBe(false)
   })
 
   it("peak is the largest per-second bucket", () => {
@@ -75,23 +77,35 @@ describe("captureRates valid captures", () => {
     expect(r.bucketCount).toBe(3)
   })
 
-  it("average <= peak holds BY CONSTRUCTION", () => {
-    const r = rates([[0, 100], [0.5, 200], [2, 50], [9, 9000]])
-    expect(r.avgBps!).toBeLessThanOrEqual(r.peakBps!)
+  it("a short capture inside one big second can out-average its own peak (flag on)", () => {
+    const r = rates([[0, 100], [0.5, 200], [2, 50]])
+    // 350 bytes / 2s span = 175 B/s; peak bucket (second 0) = 300 B/s.
+    expect(r.avgBps).toBe(175)
+    expect(r.peakBps).toBe(300)
+    expect(r.avgExceedsPeak).toBe(false)
+    // A gap mid-capture shrinks the divisor and can push the average above
+    // the peak bucket — the flag is the single source of truth.
+    const r2 = rates([[0, 900], [8, 100]])
+    expect(r2.avgBps).toBe(125)
+    expect(r2.peakBps).toBe(900)
+    expect(r2.avgExceedsPeak).toBe(false)
   })
 
-  it("dense integer-second captures cannot average above the peak (QA: Teardrop)", () => {
+  it("dense integer-second captures: avg is total/span, never re-windowed (QA: Teardrop)", () => {
     const r = rates([[0, 1], [1, 1], [2, 1]])
-    // span = 2 but all 3 seconds are covered -> window 3, avg = 1 <= peak 1
+    // span = 2, total 3 bytes -> avg 1.5 B/s. The old max(span, buckets)=3
+    // denominator faked 1 B/s; Teardrop honestly reads 914 avg vs 764 peak.
     expect(r.durationSec).toBe(2)
-    expect(r.avgBps).toBe(1)
-    expect(r.avgBps!).toBeLessThanOrEqual(r.peakBps!)
+    expect(r.avgBps).toBe(1.5)
+    expect(r.peakBps).toBe(1)
+    expect(r.avgExceedsPeak).toBe(true)
   })
 
   it("a single spike to a tall bucket is the peak", () => {
     const r = rates([[0, 500], [1, 500], [2, 500], [3, 5000]])
     expect(r.peakBps).toBe(5000)
-    // window = max(3, 4) = 4
-    expect(r.avgBps).toBeCloseTo(6500 / 4, 5)
+    // 6500 bytes over the 3s span = 2166.67 B/s (honest total/span).
+    expect(r.avgBps).toBeCloseTo(6500 / 3, 5)
+    expect(r.avgExceedsPeak).toBe(false)
   })
 })

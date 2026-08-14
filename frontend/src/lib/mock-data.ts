@@ -467,7 +467,7 @@ function deriveMockMetrics(): AnalysisAdvancedMetrics {
   return {
     // Canonical capture metrics (same shape the real engine emits): the mock
     // has real timestamps, so it is always VALID with numeric rates.
-    rates: { quality: "VALID", durationSec: duration, avgPacketsSec: _mockPackets.length / duration, avgBps: throughputAvg, peakBps: throughputPeak, bucketCount: buckets.size },
+    rates: { quality: "VALID", durationSec: duration, avgPacketsSec: _mockPackets.length / duration, avgBps: throughputAvg, peakBps: throughputPeak, bucketCount: buckets.size, avgExceedsPeak: throughputAvg > throughputPeak },
     throughputAvg,
     throughputPeak,
     burst,
