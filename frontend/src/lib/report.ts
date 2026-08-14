@@ -42,7 +42,15 @@ export function localOwnedAddresses(devices: { ip: string; addresses?: string[];
   const owned = new Set<string>()
   const add = (ip?: string) => { if (ip && ip !== "\u2014") owned.add(ip) }
   for (const d of devices) {
-    if (!isPrivateIP(d.ip) || isNonUnicast(d.ip)) continue
+    // Mirror stats.ts's local-ownership rule EXACTLY: a row is local when its
+    // primary is a private unicast address OR it carries a private alias. The
+    // byte-tie merge can leave a delegated home-prefix v6 as the row's PRIMARY
+    // (analysis.ts externalIps and stats.ts already exclude it via the private
+    // alias) — skipping such rows here let the map draw the LAN's own v6 as a
+    // phantom external dot, so the globe showed MORE nodes than the report's
+    // external IP count.
+    if (isNonUnicast(d.ip)) continue
+    if (!isPrivateIP(d.ip) && !(d.addresses ?? []).some((a) => isPrivateIP(a))) continue
     add(d.ip)
     for (const a of d.addresses ?? []) if (!isNonUnicast(a)) add(a)
   }

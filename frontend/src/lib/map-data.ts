@@ -301,9 +301,14 @@ interface LocalPublicFlow {
   packets: number
   // Dominant protocol by bytes (home arcs are colored by it, B-77).
   protocol: string
-  // Directional bytes for home-arc color (blue = home→peer out, green = in).
+  // Directional bytes AND packets for home-arc color (blue = home→peer out,
+  // green = in). The map's DRAWN strip sums arc packets so the packet counter
+  // uses the exact same scope as the byte counter (a packet is "drawn" iff its
+  // arc is drawn) — LAN/broadcast packets never reach this aggregation.
   inBytes: number
   outBytes: number
+  inPackets: number
+  outPackets: number
   // Directional local↔public pairs (srcIp>dstIp): the old "flows drawn"
   // header counted arcs per direction, so this keeps the same numbers.
   flows: number
@@ -368,7 +373,7 @@ export function deriveMapData(
   let undecodableBytes = 0
   let undecodablePackets = 0
   const prefixSet = aliases ? slaacPrefixesOf(aliases) : null
-  const localPublicMap = new Map<string, { bytes: number; packets: number; flows: number; protoBytes: Record<string, number>; inBytes: number; outBytes: number }>()
+  const localPublicMap = new Map<string, { bytes: number; packets: number; flows: number; protoBytes: Record<string, number>; inBytes: number; outBytes: number; inPackets: number; outPackets: number }>()
   const localPublicSeen = new Map<string, Set<string>>()
 
   const epochOf = (ts?: string | number) => {
@@ -423,7 +428,7 @@ export function deriveMapData(
     if (srcLocal !== dstLocal) {
       const peer = srcLocal ? p.dstIp : p.srcIp
       if (!isPrivateIP(peer) && !isNonUnicast(peer)) {
-        const agg = localPublicMap.get(peer) ?? { bytes: 0, packets: 0, flows: 0, protoBytes: {}, inBytes: 0, outBytes: 0 }
+        const agg = localPublicMap.get(peer) ?? { bytes: 0, packets: 0, flows: 0, protoBytes: {}, inBytes: 0, outBytes: 0, inPackets: 0, outPackets: 0 }
         agg.bytes += p.length || 0
         agg.packets++
         agg.protoBytes[p.protocol || "Unknown"] = (agg.protoBytes[p.protocol || "Unknown"] || 0) + (p.length || 0)
@@ -431,8 +436,8 @@ export function deriveMapData(
         const pk = `${p.srcIp}>${p.dstIp}`
         if (!seen.has(pk)) { seen.add(pk); agg.flows++ }
         localPublicSeen.set(peer, seen)
-        if (srcLocal) agg.outBytes += p.length || 0
-        else agg.inBytes += p.length || 0
+        if (srcLocal) { agg.outBytes += p.length || 0; agg.outPackets++ }
+        else { agg.inBytes += p.length || 0; agg.inPackets++ }
         localPublicMap.set(peer, agg)
       }
     }
@@ -521,6 +526,7 @@ export function deriveMapData(
     .map(([peerIp, v]) => ({
       peerIp, bytes: v.bytes, packets: v.packets, flows: v.flows,
       inBytes: v.inBytes, outBytes: v.outBytes,
+      inPackets: v.inPackets, outPackets: v.outPackets,
       // Dominant protocol by bytes so a home-anchored arc carries the peer's
       // real color (QA: every local↔public arc rendered legend-gray).
       protocol: Object.entries(v.protoBytes).sort((a, b) => b[1] - a[1])[0]?.[0] || "Unknown",

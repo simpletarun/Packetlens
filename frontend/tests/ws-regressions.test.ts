@@ -345,6 +345,32 @@ describe("extended local ownership (B-72)", () => {
     expect(owned.has("8.8.8.8")).toBe(false)
   })
 
+  it("localOwnedAddresses treats a home-prefix PUBLIC primary as local when a private alias exists — the map can never draw more nodes than the report's external IPs (QA)", () => {
+    // The byte-tie merge can leave a delegated home-prefix v6 as a device
+    // row's PRIMARY. stats.ts/analysis.ts exclude it via its private alias;
+    // the map's alias set must do the same or the LAN's own v6 draws as a
+    // phantom external dot (screenshot: 7 markers for 5 external IPs).
+    const devices = [
+      { id: "1", ip: "2401:4900:1:2::100", addresses: ["192.168.1.20", "2401:4900:1:2::100"], mac: "aa:bb:01" },
+      { id: "2", ip: "8.8.8.8", addresses: ["8.8.8.8"], mac: "cc:dd:02" },
+    ]
+    const owned = localOwnedAddresses(devices)
+    expect(owned.has("2401:4900:1:2::100")).toBe(true)
+    expect(owned.has("192.168.1.20")).toBe(true)
+    expect(owned.has("8.8.8.8")).toBe(false)
+    // End-to-end: the phantom v6 never reaches the globe as a node.
+    const geo = new Map<string, { country: string; countryCode: string; city: string; lat: number; lon: number; isPrivate: boolean }>([
+      ["2401:4900:1:2::100", { country: "India", countryCode: "IN", city: "Mumbai", lat: 19.07, lon: 72.87, isPrivate: false }],
+      ["8.8.8.8", { country: "United States", countryCode: "US", city: "Mountain View", lat: 37.386, lon: -122.084, isPrivate: false }],
+    ])
+    const data = deriveMapData([
+      mk(1, "2401:4900:1:2::100", "8.8.8.8", 256),
+      mk(2, "192.168.1.20", "8.8.8.8", 128),
+    ], geo, owned)
+    expect(data.nodes.map((n) => n.ip)).toEqual(["8.8.8.8"])
+    expect(data.undrawnPublic).toHaveLength(0)
+  })
+
   it("deriveMapData hides /64 siblings of aliases even without MAC data", () => {
     const geo = new Map<string, { country: string; countryCode: string; city: string; lat: number; lon: number; isPrivate: boolean }>([
       ["101.2.27.162", { country: "India", countryCode: "IN", city: "Bengaluru", lat: 12.9716, lon: 77.5946, isPrivate: false }],
@@ -390,6 +416,10 @@ describe("local↔public flows (B-71)", () => {
     // the peer→.20 return (128) is inbound — home arcs color blue/green by it.
     expect(f.outBytes).toBe(768)
     expect(f.inBytes).toBe(128)
+    // Per-direction packets so the DRAWN strip can sum packets over the same
+    // arcs as bytes (QA: drawn PKTS used to be capture-wide, 152 vs 148).
+    expect(f.outPackets).toBe(2)
+    expect(f.inPackets).toBe(1)
     const peer = data.nodeMap.get("101.2.27.162")!
     expect(peer.bytes).toBe(896) // alias-side traffic still sized on the dot
     expect(peer.localConns).toBe(3)

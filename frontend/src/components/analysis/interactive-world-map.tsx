@@ -77,9 +77,6 @@ const PALETTES: Record<"light" | "dark", WorldPalette> = {
 }
 
 const HUB_COLOR = "#F97316"
-// Neutral ocean point used only when local↔public flows exist but home is
-// unknown — positions their arcs without ever drawing a marker there.
-const LOCAL_ANCHOR_POS = { lat: -30, lon: -15 }
 // ViewBox 1600×900 = exactly 16/9, so the frame's aspectRatio never leaves
 // letterbox bands above/below the map (the old 1600×860 sat inside a 16/9
 // frame with the svg fit-to-width, banding ~2% top AND bottom).
@@ -121,6 +118,7 @@ interface Arc {
   color: string
   w: number
   bytes: number
+  packets: number
   protocol: string
   srcIp: string
   dstIp: string
@@ -256,18 +254,17 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
   const mapData = useMemo<MapData>(() => deriveMapData(packets, geoMap, localAliases), [packets, geoMap, localAliases])
   const panels = useMemo(() => mapPanels(mapData), [mapData])
   // Home anchor: manual settings win, else an owned public address in the
-  // capture, else — when local↔public traffic exists but home is unknown —
-  // a neutral ocean anchor so the connection lines still draw. The anchor is
-  // purely geometric: NO hub ring, label, or tooltip is rendered for it, so
-  // the map stays "public pins only" (no fake local marker on the globe).
-  const anchor = useMemo<{ lat: number; lon: number; synthetic: boolean } | null>(() => {
-    if (homeAnchor) return { ...homeAnchor, synthetic: false }
+  // capture (B-75). When neither exists there is NO anchor — local↔public
+  // arcs are simply not drawn, because inventing an origin (the old synthetic
+  // "South America" ocean point) fabricated a phantom home the data never
+  // contained (QA). The caption/footer say so explicitly instead.
+  const anchor = useMemo<{ lat: number; lon: number; derived: boolean } | null>(() => {
+    if (homeAnchor) return { ...homeAnchor, derived: false }
     const owned = homeAnchorFromOwnedPublic(localAliases, geoMap)
-    if (owned) return { ...owned, synthetic: false }
-    return mapData.localPublicFlows.length > 0 ? { ...LOCAL_ANCHOR_POS, synthetic: true } : null
-  }, [homeAnchor, localAliases, geoMap, mapData.localPublicFlows.length])
-  const anchorSynthetic = anchor?.synthetic === true
-  const anchorDerived = Boolean(anchor) && !homeAnchor && !anchorSynthetic
+    if (owned) return { ...owned, derived: true }
+    return null
+  }, [homeAnchor, localAliases, geoMap])
+  const anchorDerived = anchor?.derived === true
   const localHosts = localDevices ?? panels.localHosts
   const protoCounts = useMemo(() => [...Object.entries(packetProtocolCounts(packets))].sort((a, b) => b[1] - a[1]), [packets])
   const protoTotal = protoCounts.reduce((s, [, c]) => s + c, 0)
@@ -352,7 +349,7 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
       })
   }, [world, matchedNodes])
 
-  const hubPos = useMemo<[number, number] | null>(() => (anchor && !anchorSynthetic && world ? world.px(anchor.lat, anchor.lon) : null), [anchor, anchorSynthetic, world])
+  const hubPos = useMemo<[number, number] | null>(() => (anchor && world ? world.px(anchor.lat, anchor.lon) : null), [anchor, world])
 
   // ip → drawn XY: cluster members resolve to the badge centroid (their own
   // pins are hidden UNDER the badge), singles to their pin. Arcs and home
@@ -381,22 +378,24 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
   // must sit exactly on pins (spec: never draw floating ends).
   const arcJobs = useMemo(() => {
     if (!world) return []
-    const jobs: { lat1: number; lon1: number; lat2: number; lon2: number; color: string; bytes: number; protocol: string; srcIp: string; dstIp: string }[] = []
+    const jobs: { lat1: number; lon1: number; lat2: number; lon2: number; color: string; bytes: number; packets: number; protocol: string; srcIp: string; dstIp: string }[] = []
     // Home-anchored arcs, split by direction: outbound (home→peer) = blue,
-    // inbound (peer→home) = green — each direction gets its own arc.
+    // inbound (peer→home) = green — each direction gets its own arc. Packets
+    // ride per direction so the DRAWN strip can sum packets over the exact
+    // same arcs as bytes.
     if (anchor) {
       for (const f of mapData.localPublicFlows) {
         if (!drawnXY.has(f.peerIp)) continue
         const n = mapData.nodeMap.get(f.peerIp)
         if (!n) continue
-        if (f.outBytes > 0) jobs.push({ lat1: anchor.lat, lon1: anchor.lon, lat2: n.lat, lon2: n.lon, color: pal.out, bytes: f.outBytes, protocol: `${f.protocol} ↦`, srcIp: "HOME", dstIp: f.peerIp })
-        if (f.inBytes > 0) jobs.push({ lat1: n.lat, lon1: n.lon, lat2: anchor.lat, lon2: anchor.lon, color: pal.in, bytes: f.inBytes, protocol: `${f.protocol} ↤`, srcIp: f.peerIp, dstIp: "HOME" })
+        if (f.outBytes > 0) jobs.push({ lat1: anchor.lat, lon1: anchor.lon, lat2: n.lat, lon2: n.lon, color: pal.out, bytes: f.outBytes, packets: f.outPackets, protocol: `${f.protocol} ↦`, srcIp: "HOME", dstIp: f.peerIp })
+        if (f.inBytes > 0) jobs.push({ lat1: n.lat, lon1: n.lon, lat2: anchor.lat, lon2: anchor.lon, color: pal.in, bytes: f.inBytes, packets: f.inPackets, protocol: `${f.protocol} ↤`, srcIp: f.peerIp, dstIp: "HOME" })
       }
     }
     // Public↔public arcs keep their protocol colors.
     for (const a of mapData.arcs) {
       if (!drawnXY.has(a.srcIp) || !drawnXY.has(a.dstIp)) continue
-      jobs.push({ lat1: a.coordinates[0][0], lon1: a.coordinates[0][1], lat2: a.coordinates[a.coordinates.length - 1][0], lon2: a.coordinates[a.coordinates.length - 1][1], color: a.color, bytes: a.bytes, protocol: a.protocol, srcIp: a.srcIp, dstIp: a.dstIp })
+      jobs.push({ lat1: a.coordinates[0][0], lon1: a.coordinates[0][1], lat2: a.coordinates[a.coordinates.length - 1][0], lon2: a.coordinates[a.coordinates.length - 1][1], color: a.color, bytes: a.bytes, packets: a.packets, protocol: a.protocol, srcIp: a.srcIp, dstIp: a.dstIp })
     }
     return jobs
   }, [world, drawnXY, mapData, anchor, pal])
@@ -417,7 +416,7 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
       if (Math.hypot(d[0] - s[0], d[1] - s[1]) < 15) continue
       const pts = arcCurvePts(s[0], s[1], d[0], d[1], `${j.srcIp}→${j.dstIp}`)
       pts[pts.length - 1] = [d[0], d[1]]
-      out.push({ pts, color: j.color, w: arcWidth(j.bytes), bytes: j.bytes, protocol: j.protocol, srcIp: j.srcIp, dstIp: j.dstIp })
+      out.push({ pts, color: j.color, w: arcWidth(j.bytes), bytes: j.bytes, packets: j.packets, protocol: j.protocol, srcIp: j.srcIp, dstIp: j.dstIp })
     }
     return out
   }, [arcJobs, world, drawnXY, anchor])
@@ -502,26 +501,20 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
   // 80 drawn arcs).
   const flowsDrawn = arcs.length
   const bytesDrawn = arcs.reduce((s, a) => s + a.bytes, 0)
-  // The DRAWN strip must stay internally consistent under the search filter:
-  // bytes/flows already come from the filtered `arcs`, so packets are matched
-  // too (matched nodes + home arcs to matched peers) — otherwise "DRAWN 2
-  // FLOWS · 452,190 PKTS" implies the whole capture is on screen. Unfiltered
-  // (q = "") keeps the capture-wide count exactly as before.
-  const drawnPackets = useMemo(() => {
-    if (!q) return mapData.totalPackets
-    let s = 0
-    for (const n of matchedNodes) s += n.packets
-    if (anchor) for (const f of mapData.localPublicFlows) if (drawnXY.has(f.peerIp)) s += f.packets
-    return s
-  }, [q, mapData.totalPackets, matchedNodes, anchor, mapData.localPublicFlows, drawnXY])
+  // ONE aggregation scope for the whole DRAWN strip: bytes, packets and
+  // flows all sum over the exact same drawn arcs. ARP/DHCP/mDNS and every
+  // other local-only packet carry no arc, so they are excluded from packets
+  // exactly as they are from bytes — the counters can no longer disagree on
+  // what "drawn" means (QA: 152 PKTS vs 148 truly drawn packets).
+  const packetsDrawn = arcs.reduce((s, a) => s + a.packets, 0)
 
   return (
     <MapChrome
       publicIps={matchedNodes.length}
       flows={flowsDrawn}
       trafficBytes={bytesDrawn}
-      homeValue={anchor && !anchorSynthetic ? `${anchor.lat.toFixed(1)}°, ${anchor.lon.toFixed(1)}°` : "Not set"}
-      homeSub={anchorSynthetic ? "set Home in Settings for exact lines" : anchorDerived ? "roamed from your router" : "where local arcs anchor"}
+      homeValue={anchor ? `${anchor.lat.toFixed(1)}°, ${anchor.lon.toFixed(1)}°` : "Not set"}
+      homeSub={anchor ? (anchorDerived ? "roamed from your router" : "where local arcs anchor") : (mapData.localPublicFlows.length > 0 ? "not set — local↔internet arcs are not drawn" : "not set")}
       privateHosts={localHosts}
       topCountries={topCountries}
       protoCounts={protoCounts}
@@ -656,7 +649,10 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
             crushed the "CAPTURE · HOME …" caption at bottom-4). */}
         <div className="pointer-events-none absolute right-4 bottom-10 z-10 flex max-w-[46%] flex-wrap justify-end gap-x-2.5 gap-y-1.5">
           {[
-            { label: "Home", glyph: <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: HUB_COLOR, boxShadow: `0 0 0 2px ${pal.pinRing}` }} /> },
+            // Home chip only when a home marker will actually be drawn — with
+            // Home unset the legend must not promise an orange hub that
+            // doesn't exist (QA).
+            ...(hubPos !== null ? [{ label: "Home", glyph: <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: HUB_COLOR, boxShadow: `0 0 0 2px ${pal.pinRing}` }} /> }] : []),
             { label: "Destination", glyph: <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: pal.pin, boxShadow: "0 0 0 2px #fff" }} /> },
             { label: "Outbound", glyph: <span className="inline-block h-0.5 w-4 rounded-full" style={{ background: pal.out }} /> },
             { label: "Inbound", glyph: <span className="inline-block h-0.5 w-4 rounded-full" style={{ background: pal.in }} /> },
@@ -671,8 +667,14 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
             row now, so the old pr-48 clearance is gone; bumped to text-sm
             (QA: bottom-left read too small). */}
         <div className="pointer-events-none absolute inset-x-0 bottom-4 z-10 flex justify-between px-3 text-sm font-medium uppercase tracking-widest" style={{ color: pal.footer }}>
-          <span className="font-mono tabular-nums">DRAWN {formatBytes(bytesDrawn)} · {drawnPackets.toLocaleString()} PKTS · {flowsDrawn.toLocaleString()} FLOWS</span>
-          <span className="font-mono tabular-nums hidden sm:inline">CAPTURE {durationS}s · HOME {anchor && !anchorSynthetic ? `${anchor.lat.toFixed(1)} ${anchor.lon.toFixed(1)}` : "—"}{anchorDerived ? " (DERIVED)" : ""}</span>
+          <span className="font-mono tabular-nums"
+            title="DRAWN = arcs actually rendered on the map: bytes, packets and flows summed over the same arcs, one line per external peer per direction. Local-only traffic (ARP, DHCP, mDNS) is never drawn.">
+            DRAWN {formatBytes(bytesDrawn)} · {packetsDrawn.toLocaleString()} PKTS · {flowsDrawn.toLocaleString()} FLOWS
+          </span>
+          <span className="font-mono tabular-nums hidden sm:inline"
+            title="CAPTURE = the whole capture, independent of what the map can draw.">
+            CAPTURE {durationS}s · {mapData.totalPackets.toLocaleString()} PKTS · HOME {anchor ? `${anchor.lat.toFixed(1)} ${anchor.lon.toFixed(1)}` : "—"}{anchorDerived ? " (DERIVED)" : ""}
+          </span>
         </div>
 
         {/* Tooltips */}
@@ -709,6 +711,9 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
         {/* Footer note */}
         <p className="pointer-events-none absolute inset-x-0 bottom-0 px-2 py-0.5 pr-40 text-[9px]" style={{ color: pal.footer, opacity: 0.65 }}>
           Private-IP nodes are never drawn on the map — they have no geography.
+          {anchor === null && mapData.localPublicFlows.length > 0 && (
+            <> {mapData.localPublicFlows.length > 1 ? "Local↔internet flows are not drawn" : "A local↔internet flow is not drawn"} — set a Home location in Settings to anchor {mapData.localPublicFlows.length > 1 ? `them (${mapData.localPublicFlows.reduce((s, f) => s + f.packets, 0).toLocaleString()} pkts).` : "it."}</>
+          )}
         </p>
       </div>
     </MapChrome>

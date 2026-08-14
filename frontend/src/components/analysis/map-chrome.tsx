@@ -59,9 +59,9 @@ function flagEmoji(cc: string): string {
 function kpiCard(label: string, value: string, sub: string) {
   return (
     <div className="rounded-xl border bg-card shadow-sm px-4 py-3 min-w-0">
-      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="text-2xl font-bold tabular-nums leading-tight truncate">{value}</div>
-      <div className="text-[10px] text-muted-foreground truncate">{sub}</div>
+      <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="mt-0.5 text-2xl font-bold tabular-nums leading-tight text-foreground break-words">{value}</div>
+      <div className="mt-0.5 text-[10px] text-muted-foreground break-words">{sub}</div>
     </div>
   )
 }
@@ -153,8 +153,8 @@ export function MapChrome({
       {/* Top summary bar */}
       <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3 mb-4">
         {kpiCard("Public IPs", publicIps.toLocaleString(), "drawn on the map")}
-        {kpiCard("Destinations", flows.toLocaleString(), "external flows drawn")}
-        {kpiCard("Total Traffic", formatBytes(trafficBytes), "sum across flows")}
+        {kpiCard("Flows Drawn", flows.toLocaleString(), "one arc per peer, per direction")}
+        {kpiCard("Total Traffic", formatBytes(trafficBytes), "sum across drawn arcs")}
         {kpiCard("Home Network", homeValue, homeSub)}
         {kpiCard("Private Hosts", privateHosts.toLocaleString(), "hidden from globe")}
       </div>

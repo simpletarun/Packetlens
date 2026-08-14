@@ -1,6 +1,6 @@
 import { render } from "@testing-library/react"
 import { describe, it, expect } from "vitest"
-import { ProtoDonut } from "@/components/analysis/map-chrome"
+import { ProtoDonut, MapChrome } from "@/components/analysis/map-chrome"
 
 describe("ProtoDonut", () => {
   it("renders real color stops in the conic-gradient (QA: string destructure emitted character garbage, donut had no slices)", () => {
@@ -27,5 +27,45 @@ describe("ProtoDonut", () => {
   it("shows the empty state for zero packets", () => {
     const { container } = render(<ProtoDonut protoCounts={[]} protoTotal={0} />)
     expect(container.textContent).toContain("No packets")
+  })
+})
+
+describe("MapChrome KPI bar", () => {
+  it("renders all five KPI chips with label + value + sub (QA: chips showed only sub fragments, no titles or values)", () => {
+    const { container } = render(
+      <MapChrome
+        publicIps={5}
+        flows={7}
+        trafficBytes={10813}
+        homeValue="Not set"
+        homeSub="not set — local↔internet arcs are not drawn"
+        privateHosts={2}
+        topCountries={[{ name: "United States", code: "US", bytes: 10813 }]}
+        protoCounts={[["TCP", 100]]}
+        protoTotal={100}
+        hiddenProtocols={new Set()}
+        unresolved={[]}
+        undecodable={null}
+        info={{ mapType: "Globe", geoDb: "GeoIP2", dataSource: "Test" }}
+      >
+        <div data-testid="map-slot" />
+      </MapChrome>
+    )
+    const text = container.textContent ?? ""
+    // Label / value / sub triples — every chip must show all three parts.
+    expect(text).toContain("Public IPs")
+    expect(text).toContain("5")
+    expect(text).toContain("drawn on the map")
+    expect(text).toContain("Flows Drawn")
+    expect(text).toContain("7")
+    expect(text).toContain("one arc per peer, per direction")
+    expect(text).toContain("Total Traffic")
+    expect(text).toContain("10.6 KB")
+    expect(text).toContain("sum across drawn arcs")
+    expect(text).toContain("Home Network")
+    expect(text).toContain("Not set")
+    expect(text).toContain("not set — local↔internet arcs are not drawn")
+    expect(text).toContain("Private Hosts")
+    expect(text).toContain("2")
   })
 })
