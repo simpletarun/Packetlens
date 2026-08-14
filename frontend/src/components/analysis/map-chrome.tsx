@@ -82,16 +82,20 @@ export function ProtoDonut({ protoCounts, protoTotal, hidden = new Set<string>()
   const entries = protoCounts.filter(([, c]) => c > 0)
   let acc = 0
   let gradient = ""
-  const stops: string[] = []
+  // [color, from%, to%] tuples — the OLD code pushed a formatted string and
+  // then destructured it like an array, which iterated CHARACTERS ("C P  "
+  // for "TCP #3b82f6 …") and made the whole conic-gradient invalid, so the
+  // donut always rendered with no slices at all (QA).
+  const stops: [string, string, string][] = []
   for (const [proto, count] of entries) {
     const from = acc
     acc += count / protoTotal * 100
     const off = hidden.has(proto)
     const color = off ? "var(--muted-foreground)" : PROTOCOL_COLORS[proto] || "#64748b"
-    stops.push(`${proto} ${color} ${from.toFixed(2)}% ${acc.toFixed(2)}%`)
+    stops.push([color, `${from.toFixed(2)}%`, `${acc.toFixed(2)}%`])
   }
   // conic-gradient with 1% hard stops between segments keeps slices crisp.
-  gradient = `conic-gradient(from -90deg, ${stops.map(([, color, a, b]) => `${color} ${a} ${b}`).join(", ")})`
+  gradient = `conic-gradient(from -90deg, ${stops.map(([color, a, b]) => `${color} ${a} ${b}`).join(", ")})`
   const visibleTotal = entries.filter(([p]) => !hidden.has(p)).reduce((s, [, c]) => s + c, 0)
   return (
     <div className="text-center">

@@ -19,7 +19,7 @@ import { useEffect, useMemo, useRef, useState, useCallback, type MouseEvent as R
 import { geoNaturalEarth1, geoPath, geoGraticule10 } from "d3-geo"
 import { useTheme } from "next-themes"
 import { Maximize2, ZoomIn, ZoomOut, Maximize, Search, X } from "lucide-react"
-import { clusterByCity, clampLat, clampLon, deriveMapData, formatBytes, mapPanels, nodeSearchHaystack, homeAnchorFromOwnedPublic, type MapData, type MapNode } from "@/lib/map-data"
+import { clusterByCity, clampLat, clampLon, deriveMapData, formatBytes, mapPanels, topCountriesOf, nodeSearchHaystack, homeAnchorFromOwnedPublic, type MapData, type MapNode } from "@/lib/map-data"
 import { packetProtocolCounts } from "@/lib/analysis"
 import { zoomView } from "@/lib/map-view"
 import { resolveGeoBatch, setOnlineGeoAllowed, type GeoLocation } from "@/lib/geo"
@@ -291,6 +291,11 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
     return mapData.nodes.filter((n) => nodeSearchHaystack(n).includes(q))
   }, [mapData.nodes, q])
 
+  // Search filters the sidebar like it filters pins/arcs: the Top Countries
+  // panel is re-aggregated over the matched set (same helper mapPanels uses,
+  // so the two only differ by what the filter leaves visible).
+  const topCountries = useMemo(() => topCountriesOf(matchedNodes), [matchedNodes])
+
   const pins = useMemo<Pin[]>(() => {
     if (!world) return []
     // Folded max, not Math.max(...spread): mapData.nodes grows one entry per
@@ -497,16 +502,28 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
   // 80 drawn arcs).
   const flowsDrawn = arcs.length
   const bytesDrawn = arcs.reduce((s, a) => s + a.bytes, 0)
+  // The DRAWN strip must stay internally consistent under the search filter:
+  // bytes/flows already come from the filtered `arcs`, so packets are matched
+  // too (matched nodes + home arcs to matched peers) — otherwise "DRAWN 2
+  // FLOWS · 452,190 PKTS" implies the whole capture is on screen. Unfiltered
+  // (q = "") keeps the capture-wide count exactly as before.
+  const drawnPackets = useMemo(() => {
+    if (!q) return mapData.totalPackets
+    let s = 0
+    for (const n of matchedNodes) s += n.packets
+    if (anchor) for (const f of mapData.localPublicFlows) if (drawnXY.has(f.peerIp)) s += f.packets
+    return s
+  }, [q, mapData.totalPackets, matchedNodes, anchor, mapData.localPublicFlows, drawnXY])
 
   return (
     <MapChrome
-      publicIps={mapData.nodes.length}
+      publicIps={matchedNodes.length}
       flows={flowsDrawn}
       trafficBytes={bytesDrawn}
       homeValue={anchor && !anchorSynthetic ? `${anchor.lat.toFixed(1)}°, ${anchor.lon.toFixed(1)}°` : "Not set"}
       homeSub={anchorSynthetic ? "set Home in Settings for exact lines" : anchorDerived ? "roamed from your router" : "where local arcs anchor"}
       privateHosts={localHosts}
-      topCountries={panels.topCountries}
+      topCountries={topCountries}
       protoCounts={protoCounts}
       protoTotal={protoTotal}
       hiddenProtocols={new Set()}
@@ -654,7 +671,7 @@ export function InteractiveWorldMap({ packets, alerts = [], localDevices, localA
             row now, so the old pr-48 clearance is gone; bumped to text-sm
             (QA: bottom-left read too small). */}
         <div className="pointer-events-none absolute inset-x-0 bottom-4 z-10 flex justify-between px-3 text-sm font-medium uppercase tracking-widest" style={{ color: pal.footer }}>
-          <span className="font-mono tabular-nums">DRAWN {formatBytes(bytesDrawn)} · {mapData.totalPackets.toLocaleString()} PKTS · {flowsDrawn.toLocaleString()} FLOWS</span>
+          <span className="font-mono tabular-nums">DRAWN {formatBytes(bytesDrawn)} · {drawnPackets.toLocaleString()} PKTS · {flowsDrawn.toLocaleString()} FLOWS</span>
           <span className="font-mono tabular-nums hidden sm:inline">CAPTURE {durationS}s · HOME {anchor && !anchorSynthetic ? `${anchor.lat.toFixed(1)} ${anchor.lon.toFixed(1)}` : "—"}{anchorDerived ? " (DERIVED)" : ""}</span>
         </div>
 

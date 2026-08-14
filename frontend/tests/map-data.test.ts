@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { deriveMapData, isPrivateIP, homeAnchorFromOwnedPublic } from "@/lib/map-data"
+import { deriveMapData, isPrivateIP, homeAnchorFromOwnedPublic, topCountriesOf, mapPanels } from "@/lib/map-data"
 
 const mk = (n: number, src: string, dst: string, len = 64) => ({
   num: n, timestamp: "2024-01-01T00:00:00Z", srcIp: src, dstIp: dst,
@@ -236,5 +236,49 @@ describe("homeAnchorFromOwnedPublic (B-75) — local↔public arcs anchor offlin
     expect(homeAnchorFromOwnedPublic(aliases, new Map())).toBeNull()
     const junk = new Map([["2401:4900:8910:960f::1", { ip: "x", country: "Unknown", countryCode: "??", city: "", lat: 0, lon: 0, isPrivate: false }]])
     expect(homeAnchorFromOwnedPublic(aliases, junk as never)).toBeNull()
+  })
+})
+
+describe("MapArc shape (memory)", () => {
+  it("arcs never retain per-packet timestamp arrays — nothing consumed them and they held O(packets) memory (QA)", () => {
+    const data = deriveMapData([
+      mk(1, PUBLICS[0], PUBLICS[1], 64),
+      mk(2, PUBLICS[0], PUBLICS[1], 64),
+    ], publicGeo())
+    expect(data.arcs).toHaveLength(1)
+    expect("timestamps" in data.arcs[0]).toBe(false)
+    expect(data.arcs[0].packets).toBe(2)
+    expect(data.arcs[0].bytes).toBe(128)
+  })
+})
+
+describe("topCountriesOf (search-filtered Top Countries)", () => {
+  const geo = new Map([
+    ["8.8.8.8", { ip: "8.8.8.8", country: "United States", countryCode: "US", city: "", lat: 37, lon: -122, isPrivate: false }],
+    ["1.1.1.1", { ip: "1.1.1.1", country: "United States", countryCode: "US", city: "", lat: 34, lon: -118, isPrivate: false }],
+    ["93.184.216.34", { ip: "93.184.216.34", country: "Ireland", countryCode: "IE", city: "", lat: 53, lon: -6, isPrivate: false }],
+  ])
+
+  it("aggregates an explicit node set by country bytes, ranked desc", () => {
+    const data = deriveMapData([
+      mk(1, "192.168.1.5", "8.8.8.8", 100),
+      mk(2, "192.168.1.5", "93.184.216.34", 50),
+      mk(3, "192.168.1.5", "1.1.1.1", 200),
+    ], geo as never)
+    expect(topCountriesOf(data.nodes)).toEqual([
+      { name: "United States", code: "US", bytes: 300 },
+      { name: "Ireland", code: "IE", bytes: 50 },
+    ])
+    // A search-filtered subset re-ranks from just those nodes.
+    const filtered = topCountriesOf(data.nodes.filter((n) => n.ip === "93.184.216.34"))
+    expect(filtered).toEqual([{ name: "Ireland", code: "IE", bytes: 50 }])
+  })
+
+  it("matches mapPanels.topCountries when given the full node set", () => {
+    const data = deriveMapData([
+      mk(1, PRIVATES[0], PUBLICS[0], 100),
+      mk(2, PRIVATES[1], PUBLICS[1], 50),
+    ], publicGeo())
+    expect(topCountriesOf(data.nodes)).toEqual(mapPanels(data).topCountries)
   })
 })

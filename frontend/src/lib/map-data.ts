@@ -31,7 +31,6 @@ export interface MapNode {
 interface MapArc {
   srcIp: string; dstIp: string; protocol: string
   packets: number; bytes: number
-  timestamps: number[]
   coordinates: [number, number][]
   color: string
 }
@@ -113,15 +112,24 @@ interface CountryRow {
   bytes: number
 }
 
-export function mapPanels(data: MapData): MapPanels {
+// Top Countries aggregation over an EXPLICIT node set. mapPanels ranks all
+// nodes; the interactive map re-uses this on its search-filtered set so a
+// search ("Google", a city, an ASN) filters the sidebar exactly like it
+// filters pins and arcs — the old behavior kept an India-first list next to
+// 2 Google pins (QA).
+export function topCountriesOf(nodes: MapNode[]): CountryRow[] {
   const byCountry = new Map<string, CountryRow>()
-  for (const n of data.nodes) {
+  for (const n of nodes) {
     const name = n.country || n.countryCode || "Unknown"
     const cur = byCountry.get(name) ?? { name, code: n.countryCode || "", bytes: 0 }
     cur.bytes += n.bytes
     byCountry.set(name, cur)
   }
-  const topCountries = [...byCountry.values()].sort((a, b) => b.bytes - a.bytes)
+  return [...byCountry.values()].sort((a, b) => b.bytes - a.bytes)
+}
+
+export function mapPanels(data: MapData): MapPanels {
+  const topCountries = topCountriesOf(data.nodes)
   // "Drawn bytes" includes local↔public traffic (B-71): after the B-69 alias
   // reclassification every flow became local↔public, and drawing only
   // public↔public read "0 B" for 52.2 KB of real traffic.
@@ -346,7 +354,7 @@ export function deriveMapData(
 ): MapData {
   const nodeMap = new Map<string, MapNode>()
   const protoSet = new Set<string>()
-  const flowMap = new Map<string, { packets: number; bytes: number; protocol: string; timestamps: number[] }>()
+  const flowMap = new Map<string, { packets: number; bytes: number; protocol: string }>()
   const privateSeen = new Set<string>()
   const lanStats = new Map<string, { bytes: number; packets: number }>()
   let lanBytes = 0
@@ -384,11 +392,8 @@ export function deriveMapData(
     const existing = flowMap.get(key)
     if (existing) {
       existing.packets++; existing.bytes += p.length || 0
-      const epoch = epochOf(p.timestamp)
-      if (epoch > 0) existing.timestamps.push(epoch)
     } else {
-      const epoch = epochOf(p.timestamp)
-      flowMap.set(key, { packets: 1, bytes: p.length || 0, protocol: p.protocol || "Unknown", timestamps: epoch > 0 ? [epoch] : [] })
+      flowMap.set(key, { packets: 1, bytes: p.length || 0, protocol: p.protocol || "Unknown" })
     }
 
     // One LAN definition everywhere (QA: the map panel read 14.1 KB where the
