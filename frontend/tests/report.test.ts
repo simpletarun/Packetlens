@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion } from "@/lib/report"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
 import type { AdvancedMetrics, AlertEntry, Flow, Packet, Session } from "@/stores/analysis"
@@ -806,5 +806,66 @@ describe("tlsCipherSuiteName", () => {
     expect(tlsCipherSuiteName(0xc02f)).toBe("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
     expect(tlsCipherSuiteName(0xc02c)).toBe("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384")
     expect(tlsCipherSuiteName(0x9999)).toBe("0x9999")
+  })
+})
+
+describe("analystConclusion � the verdict must never call a capture clean while confirmed findings exist", () => {
+  const base = { undecodable: false, decodeRatePct: 100, encapName: "Ethernet", alerts: [], score: 0 }
+
+  it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW + 1 alert)", () => {
+    const text = analystConclusion({ ...base, alerts: [{ signature: "Plaintext HTTP Credentials" }], score: 39 })
+    expect(text).toContain("1 confirmed finding detected (Plaintext HTTP Credentials)")
+    expect(text).toContain("NOT clean")
+    expect(text).not.toContain("No suspicious indicators")
+  })
+
+  it("pluralizes the alert count", () => {
+    const text = analystConclusion({ ...base, alerts: [{ signature: "A" }, { signature: "B" }], score: 0 })
+    expect(text).toContain("2 confirmed findings detected (A)")
+  })
+
+  it("keeps the clean wording only when there are zero alerts and a low score", () => {
+    expect(analystConclusion({ ...base, score: 39 })).toContain("No suspicious indicators")
+  })
+
+  it("keeps score-based wording when no alerts fired", () => {
+    expect(analystConclusion({ ...base, score: 85 })).toContain("Significant malicious activity")
+    expect(analystConclusion({ ...base, score: 55 })).toContain("Suspicious or anomalous behavior")
+  })
+
+  it("always reports UNKNOWN on undecodable captures regardless of score", () => {
+    const text = analystConclusion({ undecodable: true, decodeRatePct: 12, encapName: "Linux SLL", alerts: [], score: 0 })
+    expect(text).toContain("12% of packets could be decoded")
+    expect(text).toContain("No verdict is possible")
+  })
+})
+
+describe("T1040 mapping for plaintext credential alerts", () => {
+  it("recommends rotating the exposed accounts, not generic Network Sniffing investigation", () => {
+    const report = buildReportAnalysis({
+      job: null,
+      jobInfo: {},
+      alerts: [{
+        id: "a1", timestamp: new Date(T0 * 1000).toISOString(),
+        signature: "Plaintext HTTP Credentials", category: "Credential Access",
+        severity: 4, confidence: 75, ruleId: "HTTP-CREDS-001",
+        srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 0, dstPort: 0, protocol: "HTTP",
+        evidence: "1 plaintext credential submission(s) over HTTP Form",
+      }],
+packets: [], flows: [], sessions: [], tls: [], http: [],
+      timeline: [], bandwidth: [],
+      advancedMetrics: {
+        throughputAvg: 0, throughputPeak: 0, burst: null,
+        beaconDetected: false, dnsTunnelingSuspected: false, dataExfiltrationSuspected: false,
+        torVpnProxyDetected: false, portScanEnhanced: false, ja3Suspicious: false,
+        topTalkers: [], iocs: [], mitreMappings: [],
+      },
+    })
+    const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials"))
+    expect(rec?.text).toBe("Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS")
+    expect(rec?.severity).toBe(4)
+    const mitre = report.mitre.find((m) => m.id === "T1040")
+    expect(mitre?.technique).toBe("Network Sniffing")
+    expect(mitre?.description).toContain("cleartext")
   })
 })

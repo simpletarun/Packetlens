@@ -7,7 +7,7 @@ import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass } from "@/lib/risk"
-import { SOURCE_LABELS, buildReportAnalysis, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
+import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_STAMP } from "@/lib/build-stamp"
@@ -457,13 +457,13 @@ export default function ReportsPage() {
   const scoreVal = risk ? risk.normalizedScore : job.riskScore
   const levelLabel = undecodable ? "UNKNOWN" : (risk ? risk.levelLabel : riskLevel(job.riskScore).label)
   const levelColor = undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore)))
-  const conclusionText = undecodable
-    ? `Only ${(decodeRate * 100).toFixed(0)}% of packets could be decoded — the capture uses unsupported encapsulation (${dltName(linkTypes)}), so lengths and timestamps parsed but no headers did. No verdict is possible on undecodable traffic; re-capture with Ethernet encapsulation (or an explicit DLT override) and re-analyze.`
-    : scoreVal >= 70
-      ? "Significant malicious activity was detected. Prioritize immediate remediation and incident response."
-      : scoreVal >= 40
-        ? "Suspicious or anomalous behavior was detected. Review the findings above and apply the recommended mitigations."
-        : "No suspicious indicators were detected by the configured detection rules. The capture is considered clean under those rules; continue routine monitoring."
+  const conclusionText = analystConclusion({
+    undecodable,
+    decodeRatePct: Math.round(decodeRate * 100),
+    encapName: dltName(linkTypes),
+    alerts: report.alerts,
+    score: scoreVal,
+  })
 
   const handleExport = () => {
     const t = document.title

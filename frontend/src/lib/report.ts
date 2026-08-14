@@ -187,7 +187,7 @@ const TECHNIQUE_NAMES: Record<string, { name: string; desc: string }> = {
   "T1071.004": { name: "DNS Tunneling", desc: "Data encoded in DNS queries/responses" },
   T1041: { name: "Exfiltration Over C2 Channel", desc: "Data sent to external server" },
   T1071: { name: "Application Layer Protocol", desc: "Periodic C2 beaconing detected" },
-  T1040: { name: "Network Sniffing", desc: "Capturing credentials in cleartext traffic" },
+  T1040: { name: "Network Sniffing", desc: "Credentials transmitted in cleartext, sniffable over the network" },
   T1552: { name: "Unsecured Credentials", desc: "Credential exposure via authentication traffic" },
   T1105: { name: "Ingress Tool Transfer", desc: "Download of files from remote systems" },
   "T1583.001": { name: "Acquire Infrastructure: Domains", desc: "Suspicious TLS or domain infrastructure" },
@@ -423,6 +423,7 @@ const MITRE_REC: Record<string, string> = {
   T1071: "Isolate beaconing endpoints and hunt for C2 malware on affected hosts",
   T1090: "Enforce blocking of known proxy/TOR/VPN endpoints; review outbound policy",
   T1003: "Rotate exposed credentials and investigate hosts involved in authentication traffic",
+  T1040: "Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS",
   T1213: "Review data-collection endpoints and restrict access to sensitive repositories",
 }
 
@@ -1147,6 +1148,31 @@ export function buildFlowsCsv(
     f.lossPct ?? "",
   ].map(csvCell).join(","))
   return "\uFEFF" + [header, ...rows].join("\n")
+}
+
+// Analyst Conclusion wording — the verdict must NEVER claim the capture is
+// clean while confirmed findings exist (QA: never_end.pcapng reported 1 High
+// alert + IOC yet concluded "No suspicious indicators were detected").
+export function analystConclusion(opts: {
+  undecodable: boolean
+  decodeRatePct: number
+  encapName: string
+  alerts: { signature: string }[]
+  score: number
+}): string {
+  if (opts.undecodable) {
+    return `Only ${opts.decodeRatePct}% of packets could be decoded — the capture uses unsupported encapsulation (${opts.encapName}), so lengths and timestamps parsed but no headers did. No verdict is possible on undecodable traffic; re-capture with Ethernet encapsulation (or an explicit DLT override) and re-analyze.`
+  }
+  if (opts.alerts.length > 0) {
+    return `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${opts.alerts[0].signature}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+  }
+  if (opts.score >= 70) {
+    return "Significant malicious activity was detected. Prioritize immediate remediation and incident response."
+  }
+  if (opts.score >= 40) {
+    return "Suspicious or anomalous behavior was detected. Review the findings above and apply the recommended mitigations."
+  }
+  return "No suspicious indicators were detected by the configured detection rules. The capture is considered clean under those rules; continue routine monitoring."
 }
 
 export function buildReportAnalysis(state: ReportState): ReportAnalysis {

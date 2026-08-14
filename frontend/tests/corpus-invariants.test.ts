@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import { parsePcap } from "@/lib/pcap"
 import { analyzePcap } from "@/lib/analysis"
-import { buildReportAnalysis, dnsLookupCount } from "@/lib/report"
+import { buildReportAnalysis, dnsLookupCount, analystConclusion } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import type { JobSummary } from "@/stores/analysis"
@@ -243,6 +243,18 @@ async function audit(file: string, display: string) {
   assertNoNaN(a1, "", nan)
   assertNoNaN(report, "", nan)
   expect.soft(nan, `${display}: no NaN`).toEqual([])
+
+  // Verdict integrity: a capture with confirmed findings must NEVER be
+  // concluded "clean" (QA: never_end reported 1 High alert + IOC yet its
+  // Analyst Conclusion said no suspicious indicators were detected).
+  const conclusion = analystConclusion({
+    undecodable: false, decodeRatePct: 100, encapName: "Ethernet",
+    alerts: report?.alerts ?? [], score: j.riskScore,
+  })
+  expect.soft(
+    (report?.alerts.length ?? 0) === 0 || conclusion.includes("NOT clean"),
+    `${display}: verdict acknowledges findings (${conclusion.slice(0, 60)})`,
+  ).toBe(true)
 }
 
 describe("corpus invariants — every capture must be internally consistent", () => {
