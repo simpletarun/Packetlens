@@ -375,3 +375,25 @@ describe("Reports page render", () => {
     expect(lines[3]).toContain("8.8.8.8,443,192.168.1.20,42315,TCP,3,,,400")
   })
 })
+
+  it("a CRITICAL-severity SUSPECTED alert renders '0 confirmed · 1 suspected' — never '1 confirmed' (QA: temp.pcapng)", () => {
+    seedStore()
+    const criticalSuspected: AlertEntry = {
+      ...useAnalysisStore.getState().alerts[0],
+      id: "a9",
+      signature: "Data Exfiltration Suspected",
+      category: "Exfiltration",
+      severity: 5,
+      confidence: 70,
+      ruleId: "DATA-EXFIL-001",
+      status: "SUSPECTED",
+      evidenceQuality: "MEDIUM",
+    }
+    useAnalysisStore.getState().setAlerts([criticalSuspected])
+    render(<ReportsPage />)
+    const summary = screen.getByText("1 alert").closest("p")?.textContent ?? ""
+    expect(summary).toContain("1 critical")
+    expect(summary).toContain("0 confirmed")
+    expect(summary).toContain("1 suspected")
+    expect(summary).not.toContain("1 confirmed")
+  })

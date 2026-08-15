@@ -8,7 +8,7 @@ import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, statusLabel, effectiveStatus, findingSourceLabel, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -638,11 +638,11 @@ export default function ReportsPage() {
       `- **File size:** ${formatBytes(job.fileSize)}`,
       `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (typeof job?.rawPacketCount === "number" ? ` analyzed (raw ${job.rawPacketCount.toLocaleString()} · ${(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicates removed)` : "") + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
       `- **Duration:** ${durLabel(durationSec)} · Risk score: ${riskValue()}`,
-      `- **Alerts:** ${report.alerts.length} (${severityCounts(report.alerts)})`,
+      `- **Alerts:** ${report.alerts.length} — Severity: ${severityCounts(report.alerts)} · Status: ${statusCountsLabel(summarizeStatuses(report.alerts))}`,
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
-      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow rows are direction-normalized per conversation: both the CSV export and the flows table list the conversation initiator as source — so summing distinct CSV endpoints still yields different numbers by design.`,
+      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design.`,
       `- DNS queries: ${dnsQueries} (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- ${plural(files.length, "file")} extracted · ${plural(credentials.length, "credential")} · ${plural(certificates.length, "certificate")}`,
@@ -773,7 +773,7 @@ export default function ReportsPage() {
                   ) : (
                     <>
                     <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({devices.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
-                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow rows are direction-normalized per conversation: both the CSV export and the flows table list the conversation initiator as source — so summing distinct CSV endpoints still yields different numbers from these counts by design.</p>
+                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers from these counts by design.</p>
                     </>
                   )}
                   {undecodable && (
@@ -783,7 +783,7 @@ export default function ReportsPage() {
                   {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
                   {files.length > 0 && <p><strong>{plural(files.length, "file")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential")}</strong>, <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
                   {alerts.length > 0 ? (
-                    <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> ({severityCounts(alerts)}). Risk score: <strong>{riskValue()}</strong>.</p>
+                    <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
                     <p>No signature-based alerts. Risk score: <strong>{riskValue()}</strong>.</p>
                   )}
@@ -1473,7 +1473,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={AlertTriangle} title="15. Threats & Alerts" sub={`${alerts.length.toLocaleString()} alerts · ${severityCounts(alerts)} severity`} />
+              <SectionTitle icon={AlertTriangle} title="15. Threats & Alerts" sub={`${alerts.length.toLocaleString()} alerts · Severity: ${severityCounts(alerts)} · Status: ${statusCountsLabel(summarizeStatuses(alerts))}`} />
               <Card>
                 <CardContent className="pt-6 space-y-4">
                   <div className="grid grid-cols-5 gap-4 text-xs">
@@ -2017,7 +2017,7 @@ export default function ReportsPage() {
                         </div>
                         <div>
                           <h4 className="font-semibold mb-2">Threat Summary</h4>
-                          <p><strong>Alerts:</strong> {alerts.length} ({severityCounts(alerts)})</p>
+                          <p><strong>Alerts:</strong> {alerts.length} — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}</p>
                           <p><strong>IOCs:</strong> {report.iocs.length} ({report.iocs.filter((i) => i.source === "CONFIRMED_ALERT").length} confirmed, {report.iocs.filter((i) => i.source === "BEHAVIORAL_METRIC").length} behavioral)</p>
                           <p><strong>MITRE Mappings:</strong> {report.mitre.length}</p>
                           <p><strong>Risk Score:</strong> {riskValue()}</p>

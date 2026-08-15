@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, statusLabel, findingSourceLabel, effectiveStatus } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -1196,19 +1196,21 @@ describe("flowTableRows — the report's flows table and the CSV agree on the in
   })
 })
 
+// Shared fixture: the open.pcapng "Data Exfiltration Suspected" finding shape.
+const exfil = (status: "SUSPECTED" | "CONFIRMED"): AlertEntry => ({
+  id: "a9", timestamp: new Date(T0 * 1000).toISOString(), signature: "Data Exfiltration Suspected",
+  category: "Exfiltration", severity: 4, confidence: status === "CONFIRMED" ? 100 : 70, ruleId: "DATA-EXFIL-001",
+  srcIp: "192.168.1.10", dstIp: "172.64.155.209", srcPort: 0, dstPort: 0, protocol: "TCP",
+  evidence: "1 flow sending >100 KB outbound; 5x received bytes",
+  status, evidenceQuality: status === "CONFIRMED" ? "HIGH" : "MEDIUM",
+})
+const exfilMetrics = {
+  iocs: [{ type: "data-exfiltration", value: "Data Exfiltration", description: "1 flow sending >100 KB", severity: 4, ruleId: "DATA-EXFIL-001" }],
+  mitreMappings: [{ technique: "Exfiltration Over C2 Channel", id: "T1041", description: "Data sent to external server", severity: 4 }],
+}
+
 describe("detection status is the ONE source of truth across every report layer (QA: open.pcapng)", () => {
   const base = { undecodable: false, decodeRatePct: 100, encapName: "Ethernet", alerts: [], score: 0 }
-  const exfil = (status: "SUSPECTED" | "CONFIRMED"): AlertEntry => ({
-    id: "a9", timestamp: new Date(T0 * 1000).toISOString(), signature: "Data Exfiltration Suspected",
-    category: "Exfiltration", severity: 4, confidence: status === "CONFIRMED" ? 100 : 70, ruleId: "DATA-EXFIL-001",
-    srcIp: "192.168.1.10", dstIp: "172.64.155.209", srcPort: 0, dstPort: 0, protocol: "TCP",
-    evidence: "1 flow sending >100 KB outbound; 5x received bytes",
-    status, evidenceQuality: status === "CONFIRMED" ? "HIGH" : "MEDIUM",
-  })
-  const exfilMetrics = {
-    iocs: [{ type: "data-exfiltration", value: "Data Exfiltration", description: "1 flow sending >100 KB", severity: 4, ruleId: "DATA-EXFIL-001" }],
-    mitreMappings: [{ technique: "Exfiltration Over C2 Channel", id: "T1041", description: "Data sent to external server", severity: 4 }],
-  }
 
   it("a SUSPECTED finding stays SUSPECTED in the IOC, recommendation and conclusion; MITRE stays empty (QA: 'Confirmed alert' in IOC/recommendation/conclusion)", () => {
     const alert = exfil("SUSPECTED")
@@ -1275,5 +1277,51 @@ describe("detection status is the ONE source of truth across every report layer 
     expect(findingSourceLabel("BEHAVIORAL_METRIC")).toBe("Behavioral indicator (advanced metrics)")
     expect(effectiveStatus({ status: undefined })).toBe("CONFIRMED")
     expect(effectiveStatus({ status: "SUSPECTED" })).toBe("SUSPECTED")
+  })
+})
+
+describe("severity and status stay visibly separate (QA: 'Alerts: 1 (1 critical)' read as a confirmed finding)", () => {
+  it("summarizeStatuses counts by detection status, legacy alerts as confirmed", () => {
+    expect(summarizeStatuses([
+      { status: "SUSPECTED" }, { status: "CONFIRMED" }, { status: "LIKELY" }, { status: "OBSERVED" }, {},
+    ])).toEqual({ confirmed: 2, likely: 1, suspected: 1, observed: 1 })
+    expect(summarizeStatuses([])).toEqual({ confirmed: 0, likely: 0, suspected: 0, observed: 0 })
+  })
+
+  it("statusCountsLabel always states the confirmed count, zero included", () => {
+    expect(statusCountsLabel({ confirmed: 0, likely: 0, suspected: 1, observed: 0 })).toBe("0 confirmed · 1 suspected")
+    expect(statusCountsLabel({ confirmed: 1, likely: 0, suspected: 1, observed: 0 })).toBe("1 confirmed · 1 suspected")
+    expect(statusCountsLabel({ confirmed: 0, likely: 0, suspected: 0, observed: 0 })).toBe("0 confirmed")
+  })
+
+  it("a CRITICAL-severity SUSPECTED finding renders 0 confirmed, never '1 confirmed'", () => {
+    // Severity answers "how bad if real"; status answers "how strong is the
+    // evidence". The summary must say both without blurring them.
+    const criticalSuspected = exfil("SUSPECTED")
+    const r = buildReportAnalysis({
+      ...state,
+      alerts: [criticalSuspected],
+      advancedMetrics: { ...advancedMetrics, dataExfiltrationSuspected: true, ...exfilMetrics },
+    })
+    const counts = summarizeStatuses(r.alerts)
+    expect(counts).toEqual({ confirmed: 0, likely: 0, suspected: 1, observed: 0 })
+    const label = statusCountsLabel(counts)
+    expect(label).toContain("0 confirmed")
+    expect(label).toContain("1 suspected")
+    expect(label).not.toContain("1 confirmed")
+    // The risk verdict floors on severity (CRITICAL) while the finding stays
+    // SUSPECTED — status is never derived from the score or severity.
+    expect(r.risk!.highestSeverity).toBeGreaterThanOrEqual(4)
+  })
+
+  it("a CONFIRMED finding reports 1 confirmed while severity stays CRITICAL", () => {
+    const r = buildReportAnalysis({
+      ...state,
+      alerts: [exfil("CONFIRMED")],
+      advancedMetrics: { ...advancedMetrics, dataExfiltrationSuspected: true, ...exfilMetrics },
+    })
+    const label = statusCountsLabel(summarizeStatuses(r.alerts))
+    expect(label).toBe("1 confirmed")
+    expect(label).not.toContain("suspected")
   })
 })

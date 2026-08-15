@@ -209,6 +209,40 @@ export function findingSourceLabel(source: FindingSource, status?: DetectionStat
   return status ? statusLabel(status) : SOURCE_LABELS[source]
 }
 
+export interface StatusCounts {
+  confirmed: number
+  likely: number
+  suspected: number
+  observed: number
+}
+
+// ONE shared status census for the whole report (executive summary, markdown,
+// appendix, threats header): severity ("1 critical") and detection status
+// ("0 confirmed · 1 suspected") are different properties and must never blur
+// (QA: "Alerts: 1 (1 critical)" read as if the finding were confirmed).
+export function summarizeStatuses(alerts: { status?: DetectionStatus }[]): StatusCounts {
+  const counts: StatusCounts = { confirmed: 0, likely: 0, suspected: 0, observed: 0 }
+  for (const a of alerts) {
+    const s = effectiveStatus(a)
+    if (s === "CONFIRMED") counts.confirmed++
+    else if (s === "LIKELY") counts.likely++
+    else if (s === "SUSPECTED") counts.suspected++
+    else counts.observed++
+  }
+  return counts
+}
+
+// Always states the confirmed count — even 0 — so a CRITICAL-severity finding
+// can never be misread as a confirmed finding: "Status: 0 confirmed · 1
+// suspected" is unambiguous next to "Severity: 1 critical".
+export function statusCountsLabel(counts: StatusCounts): string {
+  const parts: string[] = [`${counts.confirmed} confirmed`]
+  if (counts.likely) parts.push(`${counts.likely} likely`)
+  if (counts.suspected) parts.push(`${counts.suspected} suspected`)
+  if (counts.observed) parts.push(`${counts.observed} observed`)
+  return parts.join(" · ")
+}
+
 // technique → alert rules backing it. T1071.004 is the metrics module's
 // technique label for DNS tunneling, while the alert rule fires as
 // DNS-TUNNEL-001 (T1048) — both labels describe the same finding.
