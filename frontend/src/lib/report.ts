@@ -176,6 +176,39 @@ export const SOURCE_LABELS: Record<FindingSource, string> = {
   BEHAVIORAL_METRIC: "Behavioral indicator (advanced metrics)",
 }
 
+// Detection status is ONE property owned by the analyzer and carried on every
+// alert; report sections must NEVER re-derive it from severity, title, IOC
+// type or the mere existence of an alert (QA: a SUSPECTED behavioral alert
+// read as "Confirmed alert" in the IOC, recommendation and conclusion layers
+// while the threats table said SUSPECTED).
+export type DetectionStatus = "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
+
+export function statusLabel(status: DetectionStatus): string {
+  switch (status) {
+    case "OBSERVED":
+      return "Observed alert"
+    case "SUSPECTED":
+      return "Suspected alert"
+    case "LIKELY":
+      return "Likely alert"
+    case "CONFIRMED":
+      return "Confirmed alert"
+  }
+}
+
+// Legacy alerts predate the status model and were always treated as
+// established findings (the strongest status in grouping, MITRE gating, risk).
+export function effectiveStatus(a: { status?: DetectionStatus }): DetectionStatus {
+  return a.status ?? "CONFIRMED"
+}
+
+// The one label used by every report section (IOCs, MITRE, recommendations,
+// markdown): the detection's own status when known, the legacy source label
+// otherwise — never "Confirmed" for a SUSPECTED finding.
+export function findingSourceLabel(source: FindingSource, status?: DetectionStatus): string {
+  return status ? statusLabel(status) : SOURCE_LABELS[source]
+}
+
 // technique → alert rules backing it. T1071.004 is the metrics module's
 // technique label for DNS tunneling, while the alert rule fires as
 // DNS-TUNNEL-001 (T1048) — both labels describe the same finding.
@@ -386,6 +419,8 @@ interface IocFinding {
   occurrences?: number
   firstSeen?: string
   lastSeen?: string
+  /** Detection status of the backing alert (undefined = legacy). */
+  status?: DetectionStatus
 }
 
 interface MitreFinding {
@@ -394,12 +429,16 @@ interface MitreFinding {
   description: string
   severity: number
   source: FindingSource
+  /** Detection status of the backing alert (undefined = legacy). */
+  status?: DetectionStatus
 }
 
 interface Recommendation {
   text: string
   severity: number
   source: FindingSource
+  /** Detection status of the backing alert (undefined = legacy/metric). */
+  status?: DetectionStatus
 }
 
 export interface NotableDestination {
@@ -582,17 +621,20 @@ function mitreRec(m: { id: string; technique: string }): string {
   return MITRE_REC[m.id] || `Review activity related to ${m.technique} and verify its legitimacy`
 }
 
-// Severity and source of a flag-based recommendation: the backing alert's
-// when one fired (the engine emits DNS-TUNNEL-001 / DATA-EXFIL-001 /
-// C2-BEACON-001 on these flags), else the metric's own value.
+// Severity, source and status of a flag-based recommendation: the backing
+// alert's when one fired (the engine emits DNS-TUNNEL-001 / DATA-EXFIL-001 /
+// C2-BEACON-001 on these flags), else the metric's own value. The status
+// rides along so the label is "Suspected alert" for a SUSPECTED finding —
+// never a re-derived "Confirmed alert" (QA).
 function flagRec(
   alerts: AlertEntry[],
   ruleId: string,
   defaultSeverity: number
-): { severity: number; source: FindingSource } {
+): { severity: number; source: FindingSource; status?: DetectionStatus } {
   const severity = maxSeverityForAlerts(alerts, [ruleId]) ?? defaultSeverity
-  const source: FindingSource = alerts.some((a) => a.ruleId === ruleId) ? "CONFIRMED_ALERT" : "BEHAVIORAL_METRIC"
-  return { severity, source }
+  const backing = alerts.find((a) => a.ruleId === ruleId)
+  const source: FindingSource = backing ? "CONFIRMED_ALERT" : "BEHAVIORAL_METRIC"
+  return { severity, source, status: backing ? effectiveStatus(backing) : undefined }
 }
 
 // Canonical topic of a recommendation so near-identical advice from different
@@ -642,7 +684,7 @@ function buildRecommendations(
     })
   }
   for (const m of mitre) {
-    items.push({ text: mitreRec(m), severity: m.severity, source: m.source })
+    items.push({ text: mitreRec(m), severity: m.severity, source: m.source, status: m.status })
   }
   // Collapse by topic, keeping the highest-severity variant.
   const best = new Map<string, Recommendation>()
@@ -1459,7 +1501,7 @@ export function analystConclusion(opts: {
   undecodable: boolean
   decodeRatePct: number
   encapName: string
-  alerts: { signature: string }[]
+  alerts: { signature: string; status?: DetectionStatus }[]
   score: number
   quality?: string
 }): string {
@@ -1469,10 +1511,23 @@ export function analystConclusion(opts: {
   if (opts.alerts.length > 0) {
     // Every fired rule is named — the old text cited only the first alert
     // (QA: mic.pcapng concluded "2 confirmed findings detected (Port Scan
-    // Detected)", hiding the SYN flood). "Confirmed" means a configured rule
-    // fired; each alert's evidence states how definitive the finding is.
+    // Detected)", hiding the SYN flood). "Confirmed" once meant "a rule
+    // fired"; the count now comes from each alert's OWN detection status, so
+    // a SUSPECTED behavioral finding is never promoted to confirmed by the
+    // conclusion layer (QA: open.pcapng's "Data Exfiltration Suspected"
+    // read "1 confirmed finding detected" while the threats table said
+    // SUSPECTED). Legacy alerts without a status count as CONFIRMED.
+    const counts: Record<DetectionStatus, number> = { OBSERVED: 0, SUSPECTED: 0, LIKELY: 0, CONFIRMED: 0 }
+    for (const a of opts.alerts) counts[effectiveStatus(a)]++
+    const parts: string[] = []
+    if (counts.CONFIRMED) parts.push(`${counts.CONFIRMED} confirmed`)
+    if (counts.LIKELY) parts.push(`${counts.LIKELY} likely`)
+    if (counts.SUSPECTED) parts.push(`${counts.SUSPECTED} suspected`)
+    if (counts.OBSERVED) parts.push(`${counts.OBSERVED} observed`)
     const names = opts.alerts.map((a) => a.signature).join("; ")
-    const head = `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${names}). The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+    const summary = `${parts.join(", ")} finding${opts.alerts.length === 1 ? "" : "s"} detected`
+    const noneConfirmed = counts.CONFIRMED === 0 ? " No findings were confirmed." : ""
+    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.
@@ -1541,6 +1596,10 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
       lastSeen: group?.lastSeen,
       severity: iocSeverity(i, alerts),
       source: iocSource(i.type, alerts),
+      // The detection's OWN status — never "Confirmed" merely because an
+      // IOC row exists (QA: a SUSPECTED exfil finding was labeled
+      // "Confirmed alert" while MITRE gating correctly dropped its rows).
+      status: group?.status,
     }
   })
 
@@ -1566,15 +1625,27 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
       occurrences: g.occurrences,
       firstSeen: g.firstSeen,
       lastSeen: g.lastSeen,
+      status: g.status,
     })
   }
 
-  const mitre: MitreFinding[] = (advancedMetrics?.mitreMappings ?? [])
+  // Status of the strongest backing alert for a technique's rules (undefined
+// when no rule fired — a metric-only mapping has no detection status).
+function mitreStatusOf(mapping: { id: string }, alerts: AlertEntry[]): DetectionStatus | undefined {
+  const ruleIds = ruleIdsForTechnique(mapping.id)
+  for (const a of alerts) {
+    if (ruleIds.includes(a.ruleId)) return effectiveStatus(a)
+  }
+  return undefined
+}
+
+const mitre: MitreFinding[] = (advancedMetrics?.mitreMappings ?? [])
     .filter((m) => mitreStatusPass(ruleIdsForTechnique(m.id), alerts))
     .map((m) => ({
       ...m,
       severity: mitreSeverity(m, alerts),
       source: mitreSource(m, alerts),
+      status: mitreStatusOf(m, alerts),
     }))
 
   // Alert-derived MITRE mappings for every fired rule's technique.
@@ -1590,6 +1661,7 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
       description: names.desc,
       severity: g.severity,
       source: "CONFIRMED_ALERT",
+      status: g.status,
     })
     mitreIds.add(id)
   }

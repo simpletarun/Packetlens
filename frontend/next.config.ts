@@ -12,14 +12,18 @@ const isTauri = process.env.TAURI_BUILD === "1"
 // (PDF cover, appendix, markdown, flows CSV) so an artifact can always be
 // traced to the code that produced it (QA: reports used to show only a
 // content hash of the analyzer sources, which cannot be mapped to a commit).
-// Falls back to the source hash when .git is unavailable (CI artifact
+// Resolution order: an explicit GIT_COMMIT build-env override (CI, packaged
+// builds where git may not exist) → `git rev-parse HEAD` at config load.
+// Falls back to the source hash when neither is available (CI artifact
 // without history, source tarball) — the stamp then says src: instead of
 // commit: so it never lies about being a Git build.
-let gitCommit = ""
-try {
-  gitCommit = execSync("git rev-parse HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
-} catch {
-  gitCommit = ""
+let gitCommit = process.env.GIT_COMMIT?.trim() || ""
+if (!gitCommit) {
+  try {
+    gitCommit = execSync("git rev-parse HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
+  } catch {
+    gitCommit = ""
+  }
 }
 
 const csp = [

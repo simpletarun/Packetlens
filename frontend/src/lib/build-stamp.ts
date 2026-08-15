@@ -2,7 +2,8 @@
 // flows CSV). Values are baked at build/server-start by next.config.ts:
 //   NEXT_PUBLIC_BUILD_TIME     — when this bundle was compiled
 //   NEXT_PUBLIC_BUILD_COMMIT   — the exact `git rev-parse HEAD` of the build
-//                                (empty when Git is unavailable)
+//                                (GIT_COMMIT overrides it for CI/packaged
+//                                builds without git; empty when neither)
 //   NEXT_PUBLIC_BUILD_SRC_HASH — sha1 of the analysis/report source, kept as a
 //                                secondary fingerprint
 // HTML, PDF (printed HTML) and the flows CSV all consume this ONE object —
@@ -12,7 +13,10 @@
 import { ANALYZER_VERSION } from "@/lib/analysis"
 
 const time = process.env.NEXT_PUBLIC_BUILD_TIME || "development"
-const commit = (process.env.NEXT_PUBLIC_BUILD_COMMIT || "").trim()
+// GIT_COMMIT is honored directly so CI and packaged builds can inject the
+// commit without a git binary (QA: an artifact once read "no Git in build
+// environment" even though the source hash proved the bundle was fresh).
+const commit = (process.env.GIT_COMMIT || process.env.NEXT_PUBLIC_BUILD_COMMIT || "").trim()
 const srcHash = process.env.NEXT_PUBLIC_BUILD_SRC_HASH || ""
 
 export interface BuildInfo {

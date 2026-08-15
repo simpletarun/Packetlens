@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, statusLabel, findingSourceLabel, effectiveStatus } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -1193,5 +1193,87 @@ describe("flowTableRows — the report's flows table and the CSV agree on the in
     const csvLines = csv.split("\n")
     expect(csvLines[2].startsWith("192.168.1.10,13248,104.16.103.112,443,")).toBe(true)
     expect(csvLines[3].startsWith("192.168.1.10,6750,46.101.206.53,443,")).toBe(true)
+  })
+})
+
+describe("detection status is the ONE source of truth across every report layer (QA: open.pcapng)", () => {
+  const base = { undecodable: false, decodeRatePct: 100, encapName: "Ethernet", alerts: [], score: 0 }
+  const exfil = (status: "SUSPECTED" | "CONFIRMED"): AlertEntry => ({
+    id: "a9", timestamp: new Date(T0 * 1000).toISOString(), signature: "Data Exfiltration Suspected",
+    category: "Exfiltration", severity: 4, confidence: status === "CONFIRMED" ? 100 : 70, ruleId: "DATA-EXFIL-001",
+    srcIp: "192.168.1.10", dstIp: "172.64.155.209", srcPort: 0, dstPort: 0, protocol: "TCP",
+    evidence: "1 flow sending >100 KB outbound; 5x received bytes",
+    status, evidenceQuality: status === "CONFIRMED" ? "HIGH" : "MEDIUM",
+  })
+  const exfilMetrics = {
+    iocs: [{ type: "data-exfiltration", value: "Data Exfiltration", description: "1 flow sending >100 KB", severity: 4, ruleId: "DATA-EXFIL-001" }],
+    mitreMappings: [{ technique: "Exfiltration Over C2 Channel", id: "T1041", description: "Data sent to external server", severity: 4 }],
+  }
+
+  it("a SUSPECTED finding stays SUSPECTED in the IOC, recommendation and conclusion; MITRE stays empty (QA: 'Confirmed alert' in IOC/recommendation/conclusion)", () => {
+    const alert = exfil("SUSPECTED")
+    const r = buildReportAnalysis({
+      ...state,
+      alerts: [alert],
+      advancedMetrics: { ...advancedMetrics, dataExfiltrationSuspected: true, ...exfilMetrics },
+    })
+    expect(r.groups[0].status).toBe("SUSPECTED")
+    const ioc = r.iocs.find((i) => i.ruleId === "DATA-EXFIL-001")
+    expect(ioc).toBeDefined()
+    expect(ioc!.status).toBe("SUSPECTED")
+    const rec = r.recommendations.find((x) => x.text.includes("Investigate large outbound transfers"))
+    expect(rec).toBeDefined()
+    expect(rec!.status).toBe("SUSPECTED")
+    expect(r.mitre).toHaveLength(0)
+    const conclusion = analystConclusion({ ...base, alerts: [alert], score: 40 })
+    expect(conclusion).toContain("1 suspected finding detected (Data Exfiltration Suspected)")
+    expect(conclusion).toContain("No findings were confirmed")
+    expect(conclusion).not.toContain("confirmed finding")
+  })
+
+  it("a CONFIRMED finding stays CONFIRMED in every layer and keeps its MITRE mapping", () => {
+    const alert = exfil("CONFIRMED")
+    const r = buildReportAnalysis({
+      ...state,
+      alerts: [alert],
+      advancedMetrics: { ...advancedMetrics, dataExfiltrationSuspected: true, ...exfilMetrics },
+    })
+    const ioc = r.iocs.find((i) => i.ruleId === "DATA-EXFIL-001")
+    expect(ioc!.status).toBe("CONFIRMED")
+    const mitre = r.mitre.find((m) => m.id === "T1041")
+    expect(mitre).toBeDefined()
+    expect(mitre!.status).toBe("CONFIRMED")
+    const rec = r.recommendations.find((x) => x.text.includes("Investigate large outbound transfers"))
+    expect(rec!.status).toBe("CONFIRMED")
+    const conclusion = analystConclusion({ ...base, alerts: [alert], score: 40 })
+    expect(conclusion).toContain("1 confirmed finding detected (Data Exfiltration Suspected)")
+    expect(conclusion).not.toContain("No findings were confirmed")
+  })
+
+  it("mixed statuses list each count from alert.status, never a blanket 'confirmed'", () => {
+    const text = analystConclusion({
+      ...base,
+      alerts: [exfil("CONFIRMED"), { ...exfil("SUSPECTED"), id: "a10" }],
+      score: 60,
+    })
+    expect(text).toContain("1 confirmed, 1 suspected findings detected")
+  })
+
+  it("legacy status-less alerts still count as confirmed (pre-status semantics preserved)", () => {
+    const text = analystConclusion({ ...base, alerts: [portScanAlert], score: 30 })
+    expect(text).toContain("1 confirmed finding detected (TCP Port Scan Detected)")
+    expect(text).not.toContain("No findings were confirmed")
+  })
+
+  it("statusLabel and findingSourceLabel map status to words — the only place labels are written", () => {
+    expect(statusLabel("OBSERVED")).toBe("Observed alert")
+    expect(statusLabel("SUSPECTED")).toBe("Suspected alert")
+    expect(statusLabel("LIKELY")).toBe("Likely alert")
+    expect(statusLabel("CONFIRMED")).toBe("Confirmed alert")
+    expect(findingSourceLabel("CONFIRMED_ALERT", "SUSPECTED")).toBe("Suspected alert")
+    expect(findingSourceLabel("CONFIRMED_ALERT")).toBe("Confirmed alert")
+    expect(findingSourceLabel("BEHAVIORAL_METRIC")).toBe("Behavioral indicator (advanced metrics)")
+    expect(effectiveStatus({ status: undefined })).toBe("CONFIRMED")
+    expect(effectiveStatus({ status: "SUSPECTED" })).toBe("SUSPECTED")
   })
 })

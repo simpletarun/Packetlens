@@ -8,7 +8,7 @@ import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, statusLabel, effectiveStatus, findingSourceLabel, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -119,9 +119,12 @@ const severityCounts = (alerts: { severity: number }[]) => {
   return parts.length ? parts.join(", ") : "0 high"
 }
 
-const sourceBadge = (source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC") => (
-  <Badge variant={source === "CONFIRMED_ALERT" ? "default" : "outline"} className="text-[10px] whitespace-nowrap" title={source === "CONFIRMED_ALERT" ? "Derived from a confirmed signature alert" : "Derived from behavioral analysis of advanced metrics, not a signature alert"}>
-    {SOURCE_LABELS[source]}
+const sourceBadge = (source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC", status?: DetectionStatus) => (
+  // The badge shows the DETECTION'S OWN status (legacy alerts count as
+  // confirmed) — the IOC/MITRE layer never re-derives it from severity or
+  // the existence of the finding (QA: SUSPECTED exfil read "Confirmed").
+  <Badge variant={effectiveStatus({ status }) === "CONFIRMED" ? "default" : "outline"} className="text-[10px] whitespace-nowrap" title={status ? `Detection status: ${status}` : (source === "CONFIRMED_ALERT" ? "Derived from a confirmed signature alert" : "Derived from behavioral analysis of advanced metrics, not a signature alert")}>
+    {findingSourceLabel(source, status)}
   </Badge>
 )
 
@@ -536,9 +539,10 @@ export default function ReportsPage() {
     return obs
   }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job])
   const recs = useMemo(() => {
-    const groups = { High: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[], Medium: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[], Low: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[] }
+    type RecRow = { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC"; status?: DetectionStatus }
+    const groups = { High: [] as RecRow[], Medium: [] as RecRow[], Low: [] as RecRow[] }
     for (const r of report.recommendations.sort((a, b) => b.severity - a.severity)) {
-      groups[r.severity >= 4 ? "High" : r.severity >= 3 ? "Medium" : "Low"].push({ text: r.text, source: r.source })
+      groups[r.severity >= 4 ? "High" : r.severity >= 3 ? "Medium" : "Low"].push({ text: r.text, source: r.source, status: r.status })
     }
     if (undecodable) {
       groups.Medium.push({ text: `Capture not decodable (${dltName(linkTypes)}) — re-capture with an explicit DLT override (e.g. Wireshark: edit capture file settings or dumpcap -L) so headers can be parsed.`, source: "BEHAVIORAL_METRIC" })
@@ -639,7 +643,7 @@ export default function ReportsPage() {
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
       `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow rows are direction-normalized per conversation: both the CSV export and the flows table list the conversation initiator as source — so summing distinct CSV endpoints still yields different numbers by design.`,
-      `- DNS queries: ${dnsQueries} (${dnsLookupCount(dns)} distinct lookups) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
+      `- DNS queries: ${dnsQueries} (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- ${plural(files.length, "file")} extracted · ${plural(credentials.length, "credential")} · ${plural(certificates.length, "certificate")}`,
       ...(report.notables.length ? [`- Notable destinations (neutral, not findings): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
@@ -676,22 +680,22 @@ export default function ReportsPage() {
       lines.push("## Alerts", ...report.alerts.slice(0, 20).map((t) => `- [${sevLabel(t.severity)}] ${t.signature} (${t.srcIp} → ${t.dstIp})`), "")
     }
     if (report.iocs.length) {
-      lines.push("## Indicators of Compromise", ...report.iocs.slice(0, 20).map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${SOURCE_LABELS[i.source]})`), "")
+      lines.push("## Indicators of Compromise", ...report.iocs.slice(0, 20).map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
     }
     if (calls.length) {
       lines.push("## VoIP / SIP Calls", ...mdTable(["Caller", "Callee", "Status", "Start", "Duration", "RTP Packets", "RTP Payload"], calls.map((c) => [c.from, c.to, c.status, formatTime(c.startTime), c.durationSec !== null ? fmtClock(c.durationSec) : "—", c.rtpPackets > 0 ? c.rtpPackets.toLocaleString() : "—", c.rtpPayloadType !== null ? `PT ${c.rtpPayloadType}` : "—"])), "")
     }
     if (mitre.length) {
-      lines.push("## MITRE ATT&CK", ...mitre.map((m) => `- ${m.id} ${m.technique} (${sevLabel(m.severity)}) — ${m.description} (${SOURCE_LABELS[m.source]})`), "")
+      lines.push("## MITRE ATT&CK", ...mitre.map((m) => `- ${m.id} ${m.technique} (${sevLabel(m.severity)}) — ${m.description} (${findingSourceLabel(m.source, m.status)})`), "")
     }
     const recLines: string[] = []
-    if (recs.High.length) recLines.push("### High", ...recs.High.map((r) => `- ${r.text} (${SOURCE_LABELS[r.source]})`))
-    if (recs.Medium.length) recLines.push("### Medium", ...recs.Medium.map((r) => `- ${r.text} (${SOURCE_LABELS[r.source]})`))
-    if (recs.Low.length) recLines.push("### Low", ...recs.Low.map((r) => `- ${r.text} (${SOURCE_LABELS[r.source]})`))
+    if (recs.High.length) recLines.push("### High", ...recs.High.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
+    if (recs.Medium.length) recLines.push("### Medium", ...recs.Medium.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
+    if (recs.Low.length) recLines.push("### Low", ...recs.Low.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: ${BUILD_INFO.sourceHash} (no Git in build environment)`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
 
@@ -775,7 +779,7 @@ export default function ReportsPage() {
                   {undecodable && (
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
                   )}
-                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{dnsQueries}</strong> {plural(dnsQueries, "DNS query packet")} ({dnsLookupCount(dns)} distinct lookups), <strong>{http.length}</strong> {plural(http.length, "HTTP request")}, <strong>{tls.length}</strong> {plural(tls.length, "TLS handshake")}.</p>}
+                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{plural(dnsQueries, "DNS query packet")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
                   {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
                   {files.length > 0 && <p><strong>{plural(files.length, "file")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential")}</strong>, <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
                   {alerts.length > 0 ? (
@@ -1010,8 +1014,8 @@ export default function ReportsPage() {
                     <table className="w-full text-xs">
                       <thead>
                         <tr className="border-b text-muted-foreground">
-                          <th className="text-left py-2 pr-2">Source</th>
-                          <th className="text-left py-2 pr-2">Dest</th>
+                          <th className="text-left py-2 pr-2">Initiator</th>
+                          <th className="text-left py-2 pr-2">Responder</th>
                           <th className="text-left py-2 pr-2">Proto</th>
                           <th className="text-right py-2 pr-2">Pkts</th>
                           <th className="text-right py-2 pr-2">Bytes</th>
@@ -1033,7 +1037,7 @@ export default function ReportsPage() {
                     </table>
                   </div>
                   {sessions.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest sessions of {sessions.length.toLocaleString()} — the Analysis page lists all sessions.</div>}
-                  <p className="text-[10px] text-muted-foreground mt-1">Rows are initiator-first, like the CSV export: the side that sent the first SYN (or the first observed packet) is the Source/Initiator, with its sent/received byte counts. Detection always reads the original packet direction from the wire, never this display order.</p>
+                  <p className="text-[10px] text-muted-foreground mt-1">Rows are initiator-first, like the CSV export: the side that sent the first SYN (or the first observed packet) is the Initiator, with its sent/received byte counts. Detection always reads the original packet direction from the wire, never this display order.</p>
                   <p className="text-xs text-muted-foreground mt-3">Sessions mirror flows one-to-one (one session per direction-normalized conversation; states come from the observed handshake — INITIATED = SYN seen but no completion, HALF_OPEN = SYN-ACK replied but never completed, ESTABLISHED = full handshake or mid-stream capture, RESET/CLOSED, STATELESS = non-TCP). Higher-level, multi-flow session reconstruction is not implemented.</p>
                 </CardContent>
               </Card>
@@ -1880,7 +1884,7 @@ export default function ReportsPage() {
                                   <td className="py-1.5 pr-2 font-mono">{ioc.value}</td>
                                   <td className="py-1.5 pr-2 text-muted-foreground">{ioc.description}</td>
                                   <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{sevLabel(ioc.severity)}</Badge></td>
-                                  <td className="py-1.5">{sourceBadge(ioc.source)}</td>
+                                  <td className="py-1.5">{sourceBadge(ioc.source, ioc.status)}</td>
                                 </tr>
                               ))}
                             </tbody>
@@ -1914,7 +1918,7 @@ export default function ReportsPage() {
                                         <Badge variant={m.severity >= 4 ? "destructive" : m.severity >= 3 ? "warning" : "default"} className="shrink-0">{sevLabel(m.severity)}</Badge>
                                       </div>
                                       <p className="text-xs text-muted-foreground mt-1">{m.description}</p>
-                                      <div className="text-xs mt-1.5 flex items-center gap-1.5">Source: {sourceBadge(m.source)}</div>
+                                      <div className="text-xs mt-1.5 flex items-center gap-1.5">Source: {sourceBadge(m.source, m.status)}</div>
                                     </div>
                                   ))}
                                 </div>
@@ -1945,7 +1949,7 @@ export default function ReportsPage() {
                             {recs.High.map((r, i) => (
                               <div key={i} className="flex gap-2 text-sm">
                                 <AlertTriangle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
-                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({SOURCE_LABELS[r.source]})</span></span>
+                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
                               </div>
                             ))}
                           </div>
@@ -1958,7 +1962,7 @@ export default function ReportsPage() {
                             {recs.Medium.map((r, i) => (
                               <div key={i} className="flex gap-2 text-sm">
                                 <AlertTriangle className="h-4 w-4 text-warning shrink-0 mt-0.5" />
-                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({SOURCE_LABELS[r.source]})</span></span>
+                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
                               </div>
                             ))}
                           </div>
@@ -1971,7 +1975,7 @@ export default function ReportsPage() {
                             {recs.Low.map((r, i) => (
                               <div key={i} className="flex gap-2 text-sm">
                                 <AlertTriangle className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
-                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({SOURCE_LABELS[r.source]})</span></span>
+                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
                               </div>
                             ))}
                           </div>
@@ -2003,7 +2007,7 @@ export default function ReportsPage() {
                           <p><strong>Generation Mode:</strong> {report.metadata.mode}</p>
                           <p><strong>Report Schema Version:</strong> {report.metadata.schemaVersion}</p>
                           <p><strong>Analyzer Version:</strong> {report.metadata.analyzerVersion || ANALYZER_VERSION}</p>
-                          <p><strong>Build:</strong> v{BUILD_INFO.version} · {BUILD_INFO.isGit ? <>Commit: <span className="font-mono">{BUILD_INFO.commit}</span></> : <>Source: <span className="font-mono">{BUILD_INFO.sourceHash || "unknown"}</span> (no Git in build environment)</>} · Built: {BUILD_INFO.builtAt}</p>
+                          <p><strong>Build:</strong> v{BUILD_INFO.version} · {BUILD_INFO.isGit ? <>Commit: <span className="font-mono">{BUILD_INFO.commit}</span></> : <>Source: build env <span className="font-mono">(src:{BUILD_INFO.sourceHash || "unknown"})</span></>} · Built: {BUILD_INFO.builtAt}</p>
                           {BUILD_INFO.isGit && <p><strong>Commit (short):</strong> <span className="font-mono">{BUILD_INFO.commitShort}</span></p>}
                           <p><strong>Signature DB Version:</strong> {report.metadata.ruleVersion || "Behavioral Detection Only"}</p>
                           <p><strong>Risk Spec Version:</strong> {report.metadata.riskSpecVersion || RISK_SPEC_VERSION}</p>
