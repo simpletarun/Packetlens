@@ -1207,8 +1207,10 @@ const handleReset = useCallback(() => {
         )}
       </div>
 
-      {contextMenu && (
-        <div className="fixed z-50 bg-background border rounded shadow-lg py-1 min-w-[160px]" style={{ left: Math.min(contextMenu.x, window.innerWidth - 176), top: Math.min(contextMenu.y, window.innerHeight - 240) }}>
+{contextMenu && (
+        // Clamped into the viewport: on narrow windows Math.min can go NEGATIVE
+        // (window.innerWidth < menu width), pushing the menu off-screen (QA).
+        <div className="fixed z-50 bg-background border rounded shadow-lg py-1 min-w-[160px]" style={{ left: Math.max(0, Math.min(contextMenu.x, Math.max(0, window.innerWidth - 176))), top: Math.max(0, Math.min(contextMenu.y, Math.max(0, window.innerHeight - 240))) }}>
           <button onClick={() => handleContextMenuAction("highlight-neighbors")} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-accent">Highlight Neighbors</button>
           <button onClick={() => handleContextMenuAction("search-highlight")} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-accent">Search Highlight</button>
           <button onClick={() => handleContextMenuAction("focus")} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-accent">Focus Node</button>

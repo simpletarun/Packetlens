@@ -74,7 +74,13 @@ export default function AnalysisPage() {
   // badge/card must not read "0/100 SAFE" on undecodable traffic (QA).
   const undecodable = useMemo(() => decodeRateOf(decode, packets) < 0.05, [decode, packets])
   const riskScore = report.risk?.normalizedScore ?? job?.riskScore ?? 0
-  const riskLevelObj = riskLevel(riskScore)
+  // Verdict label from the report: the score band FLOORED by the strongest
+  // finding severity. The raw band alone would label a capture carrying a
+  // HIGH-severity alert "LOW" at 39/100 — the dashboard badge must agree
+  // with the report verdict (QA).
+  const riskLabel = report.risk?.levelLabel ?? riskLevel(riskScore).label
+  const riskColor = report.risk?.levelColor ?? riskLevel(riskScore).color
+  const riskLevelObj = { label: riskLabel, color: riskColor }
   const displayTimeline = report.timeline
   // Folded loop: Math.max(...spread) over thousands of timeline bins throws
   // RangeError on very long captures (QA).
@@ -109,7 +115,7 @@ export default function AnalysisPage() {
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <Badge variant={undecodable ? "secondary" : riskScore >= 60 ? "destructive" : riskScore >= 40 ? "warning" : "success"}>
+              <Badge variant={undecodable ? "secondary" : riskColor === "red" ? "destructive" : riskColor === "orange" || riskColor === "yellow" ? "warning" : "success"}>
                 {undecodable ? "UNKNOWN / INSUFFICIENT DATA" : `${riskScore}/100 ${riskLevelObj.label}`}
               </Badge>
             </div>

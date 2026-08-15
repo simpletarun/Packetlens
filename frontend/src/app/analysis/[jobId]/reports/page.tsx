@@ -6,6 +6,7 @@ import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
+import { vendorLabel } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
 import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, type DetectionStatus } from "@/lib/report"
@@ -1478,7 +1479,7 @@ export default function ReportsPage() {
                             <td className="py-2 pr-2 font-mono ip-addr" title={d.ip}>{shortIp(d.ip)}</td>
                             <td className="py-2 pr-2 font-mono text-muted-foreground">{offLink ? "—" : (d.mac || "—")}</td>
                             <td className="py-2 pr-2">{d.hostname && d.hostname !== d.ip ? d.hostname : <span className="text-muted-foreground italic">Not resolved</span>}</td>
-                            <td className="py-2 pr-2 text-muted-foreground">{offLink ? "—" : (d.vendor || "—")}</td>
+                            <td className="py-2 pr-2 text-muted-foreground">{offLink ? "—" : (vendorLabel(d.vendor, d.mac) || "—")}</td>
                             <td className="py-2 text-right">{d.packets.toLocaleString()}</td>
                           </tr>
                           )

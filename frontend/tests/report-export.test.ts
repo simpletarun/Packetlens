@@ -84,7 +84,12 @@ describe("report export data layer parity — every capture must feed the export
     expect.soft(stats.totalPackets, `${name}: totalPackets`).toBe(a.packets.length)
     expect.soft(stats.totalFlows, `${name}: totalFlows`).toBe(a.flows.length)
     expect.soft(stats.sessions, `${name}: sessions`).toBe(a.sessions.length)
-    const localRows = a.devices.filter((d) => isPrivateIP(d.ip) && !isNonUnicast(d.ip)).length
+    // Same local rule as computeStats: primary private OR any private alias
+    // (a home-prefix v6 primary on a merged row is still a local device).
+    const localRows = a.devices.filter((d) => {
+      if (isNonUnicast(d.ip)) return false
+      return isPrivateIP(d.ip) || (d.addresses ?? []).some((ad) => isPrivateIP(ad))
+    }).length
     expect.soft(stats.devices, `${name}: devices (local only)`).toBe(localRows)
     const localOwned = new Set<string>()
     for (const d of a.devices) {

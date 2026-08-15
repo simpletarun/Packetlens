@@ -14,7 +14,12 @@ import { Settings, Trash2, RefreshCw, Network, Globe2, Upload, Database } from "
 const DLT_NAMES: Record<number, string> = {
   0: "NULL / Loopback",
   1: "Ethernet",
+  // RAW and OpenBSD loopback are in KNOWN_DLTS (the upload route accepts
+  // them) — the override dropdown must cover every link type the engine can
+  // parse, or the setting silently can't express them (QA).
+  12: "Raw IP (DLT_RAW)",
   101: "Raw IP (IPv4/IPv6)",
+  108: "OpenBSD loopback",
   113: "Linux cooked v1 (SLL)",
   276: "Linux cooked v2 (SLL2)",
 }
@@ -91,8 +96,9 @@ export default function SettingsPage() {
     if (!Number.isFinite(lo) || lo < -180 || lo > 180) { setHomeError("Longitude must be between -180 and 180."); return }
     setSettings({ homeLat: la, homeLon: lo })
     setHomeSaved(true)
-    const t = setTimeout(() => setHomeSaved(false), 2500)
-    return () => clearTimeout(t)
+    // The timeout just flips the "Saved" hint back off; it survives unmount
+    // harmlessly (a returned cleanup would be discarded by the click handler).
+    setTimeout(() => setHomeSaved(false), 2500)
   }
 
   const clearHome = () => {
@@ -340,7 +346,7 @@ export default function SettingsPage() {
                     <RefreshCw className="h-4 w-4" />
                     Clear Analysis
                   </h3>
-                  <p className="text-xs text-muted-foreground mb-3">Remove all loaded analysis data and return to the job list</p>
+                  <p className="text-xs text-muted-foreground mb-3">Remove all loaded analysis data and return to the job list. Preferences (beginner mode, link layer override, geo settings) are kept.</p>
                   {confirming ? (
                     <div className="flex items-center gap-2">
                       <Button variant="destructive" size="sm" onClick={() => { resetAnalysis(); setConfirming(false); router.push("/") }}>

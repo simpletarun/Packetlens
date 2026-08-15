@@ -366,8 +366,11 @@ function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
       signature: first.signature,
       ruleId: first.ruleId,
       category: first.category,
-      severity: Math.max(...list.map((a) => a.severity)),
-      confidence: Math.max(...list.map((a) => a.confidence)),
+      // Folded max, not Math.max(...spread): hundreds of thousands of alerts
+      // on one signature (port-scan probes) would overflow the call stack
+      // (QA: RangeError crashed the Reports page at scale).
+      severity: list.reduce((m, a) => Math.max(m, a.severity), 0),
+      confidence: list.reduce((m, a) => Math.max(m, a.confidence), 0),
       status: list.reduce<AlertGroup["status"]>((m, a) => {
         // Strongest status wins the group badge (CONFIRMED > LIKELY > ...);
         // legacy alerts without a status count as CONFIRMED.
@@ -1439,6 +1442,9 @@ export interface FlowTableRow {
   protocol: string; packets: number
   bytesSent: number | null; bytesRecv: number | null
   duration: number; directionUnknown?: boolean
+  /** Per-flow handshake RTT — carried so the flows page's RTT column and the
+   *  report table can never disagree (absent = no handshake captured). */
+  rttMs?: number
 }
 
 // Initiator-first rows for the report's flows table — mirrors the CSV export
@@ -1469,6 +1475,7 @@ export function flowTableRows(
       bytesRecv: f.directionUnknown ? null : (flip ? f.bytesSent : f.bytesRecv),
       duration: f.duration,
       directionUnknown: f.directionUnknown,
+      rttMs: f.rttMs,
     }
   })
 }

@@ -72,6 +72,39 @@ describe("computeStats — canonical statistics", () => {
     const stats = computeStats({ job, packets: [], flows: [], sessions: [], dns: [], devices, alerts: [], geo: new Map() })
     expect(stats.devices).toBe(2)
   })
+
+  it("counts a home-prefix-IPv6-primary device as LOCAL when any alias is private (QA devices card vs table)", () => {
+    const mk = (n: number, src: string, dst: string) => ({ num: n, timestamp: "", srcIp: src, dstIp: dst, srcPort: 1, dstPort: 2, protocol: "TCP", length: 64, flags: "", ttl: 64, info: "" })
+    const dev = (id: string, ip: string, addresses: string[]) => ({ id, ip, mac: "aa:bb:cc:dd:ee:ff", hostname: "", vendor: "", os: "", firstSeen: "", lastSeen: "", packets: 1, bytes: 1, addresses })
+    const devices = [
+      dev("d1", "2401:4900:1111:2222::308f", ["192.168.1.20"]), // delegated v6 primary, private alias
+      dev("d2", "8.8.8.8", []),
+    ]
+    const stats = computeStats({
+      job: null,
+      packets: [mk(1, "192.168.1.20", "8.8.8.8"), mk(2, "2401:4900:1111:2222::308f", "8.8.8.8")],
+      flows: [], sessions: [], dns: [], devices, alerts: [], geo: new Map(),
+    })
+    expect(stats.devices).toBe(1)
+    expect(stats.externalIps).toBe(1)
+  })
+
+  it("countries never count a local-owned public alias (QA: Countries 1 next to External IPs 0)", () => {
+    const v6 = "2401:4900:1111:2222::308f"
+    const dev = (id: string, ip: string, addresses: string[]) => ({ id, ip, mac: "aa:bb:cc:dd:ee:ff", hostname: "", vendor: "", os: "", firstSeen: "", lastSeen: "", packets: 1, bytes: 1, addresses })
+    const geo = new Map([
+      ["8.8.8.8", { ip: "8.8.8.8", country: "United States", countryCode: "US", city: "x", lat: 0, lon: 0, isPrivate: false }],
+      [v6, { ip: v6, country: "India", countryCode: "IN", city: "x", lat: 0, lon: 0, isPrivate: false }],
+    ])
+    const stats = computeStats({
+      job: null,
+      packets: [],
+      flows: [], sessions: [], dns: [],
+      devices: [dev("d1", "192.168.1.20", [v6])],
+      alerts: [], geo,
+    })
+    expect(stats.countries).toBe(1)
+  })
 })
 
 describe("formatDuration", () => {

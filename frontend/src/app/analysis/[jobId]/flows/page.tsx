@@ -9,7 +9,8 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Search, ArrowRight, Inbox } from "lucide-react"
 import { formatBytes, formatEndpoint } from "@/lib/map-data"
-import { handshakeRttSummary } from "@/lib/report"
+import { handshakeRttSummary, flowTableRows } from "@/lib/report"
+import { DecodeBanner } from "@/components/analysis/decode-banner"
 
 // One shared template so header and rows can never drift out of sync.
 const GRID = "grid-cols-[1fr_auto_1fr_70px_70px_70px_70px_70px_70px] min-w-[880px]"
@@ -18,15 +19,23 @@ export default function FlowsPage() {
   const sidebarOpen = useAnalysisStore((s) => s.sidebarOpen)
   const toggleSidebar = useAnalysisStore((s) => s.toggleSidebar)
   const flows = useAnalysisStore((s) => s.flows)
+  const packets = useAnalysisStore((s) => s.packets)
   const [search, setSearch] = useState("")
 
   const filtered = useMemo(
     () => flows.filter((f) =>
-      !search || f.srcIp.includes(search) || f.dstIp.includes(search) ||
+      !search || f.srcIp.toLowerCase().includes(search.toLowerCase()) || f.dstIp.toLowerCase().includes(search.toLowerCase()) ||
       f.protocol.toLowerCase().includes(search.toLowerCase())
     ),
     [search, flows]
   )
+
+  // Initiator-first rows — the SAME transformation as the CSV export and the
+  // report's flows table (flowTableRows), so this page, the report and the
+  // CSV can never disagree on which endpoint is on the left or which bytes
+  // are "sent" (QA: page showed "Server → Client / Sent" where the CSV
+  // showed "Client → Server / Sent").
+  const displayRows = useMemo(() => flowTableRows(filtered, packets), [filtered, packets])
 
   const protocolColor = (p: string) => {
     const m: Record<string, string> = { TCP: "bg-info/10 text-info border-info/20", UDP: "bg-success/10 text-success border-success/20", DNS: "bg-warning/10 text-warning border-warning/20", TLS: "bg-chart-3/10 text-chart-3 border-chart-3/20" }
@@ -41,8 +50,10 @@ export default function FlowsPage() {
   // disagree on the subset (flows with a measured handshake) or the
   // percentile algorithm (nearest-rank).
   // Memoized filter: an inline flows.filter() would hand the memo a fresh
-  // array every render, defeating it (QA).
-  const tcpFlows = useMemo(() => flows.filter((f) => f.protocol === "TCP"), [flows])
+  // array every render, defeating it (QA). Scoped to the FILTERED set so the
+  // health strip always aggregates the same flows the count above shows
+  // (QA: "3 flows" next to all-capture totals).
+  const tcpFlows = useMemo(() => filtered.filter((f) => f.protocol === "TCP"), [filtered])
   const tcpHealth = useMemo(() => {
     const rtts: number[] = []
     let retrans = 0, ooo = 0, zeroWindow = 0, rst = 0, lossy = 0
@@ -77,6 +88,7 @@ export default function FlowsPage() {
         <main className="flex-1 flex flex-col overflow-hidden">
           <div className="p-4 border-b">
             <h1 className="text-lg font-bold mb-2">{beginnerMode ? "Conversations" : "Flows"}</h1>
+            <DecodeBanner className="mb-2" />
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input placeholder="Filter flows..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" maxLength={200} />
@@ -100,26 +112,26 @@ export default function FlowsPage() {
               <span>{beginnerMode ? "Destination" : "Dst IP"}</span>
               <span>Proto</span>
               <span>{beginnerMode ? "Packets" : "Pkts"}</span>
-              <span>{beginnerMode ? "Sent" : "Sent"}</span>
+              <span>Sent</span>
               <span>{beginnerMode ? "Received" : "Recv"}</span>
               <span>{beginnerMode ? "Response time" : "RTT"}</span>
               <span>Dur</span>
             </div>
-            {filtered.map((f) => (
-              <div key={f.id} className={cn("grid gap-3 px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30", GRID)}>
+            {displayRows.map((f) => (
+              <div key={f.srcIp + f.dstIp + f.srcPort + f.dstPort + f.protocol} className={cn("grid gap-3 px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30", GRID)}>
                 <span className="font-mono hl-src">{formatEndpoint(f.srcIp, f.srcPort)}</span>
                 <ArrowRight className="h-3 w-3 text-muted-foreground" />
                 <span className="font-mono">{formatEndpoint(f.dstIp, f.dstPort)}</span>
                 <Badge variant="outline" className={cn("text-[10px] px-1 py-0 font-mono", protocolColor(f.protocol))}>{f.protocol}</Badge>
                 <span className="text-muted-foreground">{f.packets}</span>
-                <span className="text-muted-foreground">{f.directionUnknown ? "—" : formatBytes(f.bytesSent)}</span>
-                <span className="text-muted-foreground">{f.directionUnknown ? "—" : formatBytes(f.bytesRecv)}</span>
+                <span className="text-muted-foreground">{f.bytesSent == null ? "—" : formatBytes(f.bytesSent)}</span>
+                <span className="text-muted-foreground">{f.bytesRecv == null ? "—" : formatBytes(f.bytesRecv)}</span>
                 {/* Per-flow handshake RTT (TCP only) — the aggregate strip is
                     med/p95; this is the value behind it (F-04 QA). Empty is
                     not data loss: no SYN/SYN-ACK pair was captured (capture
                     started mid-session) so no RTT exists (QA audit). */}
                 <span className="text-muted-foreground" title={f.protocol === "TCP" && typeof f.rttMs !== "number" ? "RTT unavailable — no TCP handshake captured" : undefined}>{f.protocol === "TCP" ? (typeof f.rttMs === "number" ? `${f.rttMs}ms` : "no handshake") : "—"}</span>
-                <span className="text-muted-foreground">{f.duration}s</span>
+                <span className="text-muted-foreground">{f.duration < 1 ? f.duration.toFixed(3) : f.duration.toFixed(1)}s</span>
               </div>
             ))}
             {filtered.length === 0 && (

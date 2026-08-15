@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Search, Globe } from "lucide-react"
+import { DecodeBanner } from "@/components/analysis/decode-banner"
 export default function DnsPage() {
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const sidebarOpen = useAnalysisStore((s) => s.sidebarOpen)
@@ -19,7 +20,7 @@ export default function DnsPage() {
 
   const filtered = useMemo(
     () => dns.filter((d) =>
-      !search || d.query.includes(search) || d.srcIp.includes(search) || d.type.toLowerCase().includes(search.toLowerCase())
+      !search || d.query.toLowerCase().includes(search.toLowerCase()) || d.srcIp.toLowerCase().includes(search.toLowerCase()) || d.type.toLowerCase().includes(search.toLowerCase())
     ),
     [search, dns]
   )
@@ -58,6 +59,7 @@ export default function DnsPage() {
           </div>
           <p className="px-4 pb-3 text-[10px] text-muted-foreground">Distinct Lookups counts each name+type once for the capturing client: a LAN router relaying a query upstream — or the response coming back down — is not a second query. The table below lists every DNS message, with responses marked.</p>
           <div className="px-4 pb-4">
+            <DecodeBanner className="mb-2" />
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input placeholder="Filter by domain, IP, or type..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" maxLength={200} />
@@ -87,11 +89,14 @@ export default function DnsPage() {
                   <Badge variant={d.isResponse ? "secondary" : "default"} className="text-[9px] px-1 py-0">{d.isResponse ? "R" : "Q"}</Badge>
                   <Badge variant="outline" className="text-[10px] px-1 py-0 font-mono">{d.type}</Badge>
                 </span>
-                <Badge variant={d.responseCode !== "NOERROR" ? "destructive" : "success"} className="text-[10px] px-1 py-0">{d.responseCode}</Badge>
+                {/* Queries carry no response code (the analyzer defaults them to
+                  NOERROR) — a green success badge on a query implied an
+                  answered lookup that never happened (QA). */}
+                <Badge variant={d.isResponse ? (d.responseCode !== "NOERROR" ? "destructive" : "success") : "secondary"} className="text-[10px] px-1 py-0">{d.responseCode}</Badge>
                 {/* Queries carry no TTL (there is no answer record); a raw "0s"
                     reads as a real zero-lease record — show a dash instead (D3).
                     Answer-less responses also have no TTL (null), not 0. */}
-                <span className="text-muted-foreground">{d.isResponse && d.ttl !== null ? `${d.ttl}s` : '\u2014'}</span>
+                <span className="text-muted-foreground">{d.isResponse && d.ttl != null ? `${d.ttl}s` : '\u2014'}</span>
               </div>
             ))}
           </div>

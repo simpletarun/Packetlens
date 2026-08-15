@@ -89,10 +89,13 @@ export function formatBytes(b: number): string {
 
 // UI tables and the CSV/report exporters must render endpoints identically:
 // an undecodable address (the "—" placeholder) is never suffixed with a port,
-// which read as "— :0 → — :0" on the Sessions page (QA).
+// which read as "— :0 → — :0" on the Sessions page (QA). Port 0 is the
+// analyzer's "no port" marker for ICMP/ARP/undecodable — rendering "ip:0"
+// would fabricate a port that never existed (QA: flows showed ip:0 beside
+// the packets page's honest dash).
 export function formatEndpoint(ip: string, port?: number | null): string {
   if (!ip || ip === "\u2014") return ip || "\u2014"
-  return port == null || Number.isNaN(port) ? ip : `${ip}:${port}`
+  return port == null || Number.isNaN(port) || port === 0 ? ip : `${ip}:${port}`
 }
 
 // Side-panel aggregates for a map view: Top Countries (by bytes) and the

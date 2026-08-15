@@ -33,6 +33,11 @@ export default function CertificatesPage() {
   const expired = certificates.filter(isExpiredCert).length
   const valid = certificates.filter((c) => c.notAfter !== null && new Date(c.notAfter).getTime() >= refTime).length
 
+  // Key size is a number, not a string: "2048bit" (missing space) and a bare
+  // "0" for an unknown size read as real data (QA). 0 = the parser never saw
+  // the key (e.g. only the Subject/Issuer record) — a dash is honest.
+  const keySizeLabel = (n: number) => (n > 0 ? `${n} bit` : '\u2014')
+
   return (
     <div className="flex h-screen">
       <Sidebar open={sidebarOpen} onToggle={toggleSidebar} />
@@ -61,7 +66,7 @@ export default function CertificatesPage() {
               {certificates.length === 0 && (
                 <p className="px-4 py-8 text-center text-xs text-muted-foreground">No certificates observed</p>
               )}
-              {certificates.map((c) => {
+              {certificates.slice(0, 500).map((c) => {
                 const isExpired = isExpiredCert(c)
                 const isUnknown = c.notAfter === null
                 return (
@@ -75,11 +80,14 @@ export default function CertificatesPage() {
                   >
                     <span className="truncate"><ShieldCheck className="h-3 w-3 inline mr-1 text-chart-3" />{c.subject}</span>
                     <span className="truncate text-muted-foreground">{c.issuer}</span>
-                    <span className="text-muted-foreground">{c.keySize >= 2048 ? c.keySize + "bit" : c.keySize}</span>
+                    <span className="text-muted-foreground">{keySizeLabel(c.keySize)}</span>
                     <Badge variant={isUnknown ? "outline" : isExpired ? "destructive" : "success"} className="text-[10px] px-1 py-0">{isUnknown ? "Unknown" : isExpired ? "Expired" : "Valid"}</Badge>
                   </div>
                 )
               })}
+              {certificates.length > 500 && (
+                <p className="px-4 py-3 text-center text-xs text-muted-foreground">Showing first 500 of {certificates.length} — certificates have no filter; a large capture shows only the most recent set</p>
+              )}
             </div>
             {selectedCert && (
               <div className="w-96 border-l pl-4 space-y-3 overflow-y-auto">
@@ -95,7 +103,7 @@ export default function CertificatesPage() {
                     { label: "Not Before", value: selectedCert.notBefore ? new Date(selectedCert.notBefore).toISOString() : "Unknown" },
                     { label: "Not After", value: selectedCert.notAfter ? new Date(selectedCert.notAfter).toISOString() : "Unknown" },
                     { label: "Signature Algorithm", value: selectedCert.signatureAlgorithm },
-                    { label: "Key Size", value: String(selectedCert.keySize) },
+                    { label: "Key Size", value: keySizeLabel(selectedCert.keySize) },
                     { label: "SANs", value: (selectedCert.san ?? []).join(", ") },
                   ].map(({ label, value }) => (
                     <div key={label} className="flex justify-between">

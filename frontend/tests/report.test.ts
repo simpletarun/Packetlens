@@ -1229,7 +1229,7 @@ describe("flowTableRows — the report's flows table and the CSV agree on the in
       // Already initiator-first.
       { id: "f2", srcIp: "192.168.1.10", dstIp: "46.101.206.53", srcPort: 6750, dstPort: 443, protocol: "TCP", packets: 5, bytesTotal: 500, bytesSent: 100, bytesRecv: 400, duration: 3, startTime: "", endTime: "" },
     ]
-    const rows = flowTableRows(flows, packets)
+const rows = flowTableRows(flows, packets)
     expect(rows[0].srcIp).toBe("192.168.1.10")
     expect(rows[0].dstIp).toBe("104.16.103.112")
     expect(rows[0].srcPort).toBe(13248)
@@ -1242,6 +1242,16 @@ describe("flowTableRows — the report's flows table and the CSV agree on the in
     const csvLines = csv.split("\n")
     expect(csvLines[2].startsWith("192.168.1.10,13248,104.16.103.112,443,")).toBe(true)
     expect(csvLines[3].startsWith("192.168.1.10,6750,46.101.206.53,443,")).toBe(true)
+  })
+
+  it("carries the per-flow RTT through to the page rows", () => {
+    const flows: Flow[] = [
+      { id: "f1", srcIp: "10.0.0.1", dstIp: "10.0.0.2", srcPort: 1234, dstPort: 443, protocol: "TCP", packets: 4, bytesTotal: 400, bytesSent: 100, bytesRecv: 300, duration: 2, startTime: "", endTime: "", rttMs: 42.5 },
+      { id: "f2", srcIp: "10.0.0.1", dstIp: "10.0.0.3", srcPort: 1235, dstPort: 53, protocol: "UDP", packets: 2, bytesTotal: 100, bytesSent: 50, bytesRecv: 50, duration: 1, startTime: "", endTime: "" },
+    ]
+    const rows = flowTableRows(flows, [])
+    expect(rows[0].rttMs).toBe(42.5)
+    expect(rows[1].rttMs).toBeUndefined()
   })
 })
 

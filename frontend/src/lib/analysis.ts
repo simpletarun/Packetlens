@@ -2091,15 +2091,24 @@ export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {})
       // rawPacketCount/duplicateFrameCount.
       for (let i = 0; i < raw.length; i++) raw[i].num = i + 1
       duplicateFrameCount = duplicates
+      // Folded loops, not Math.min/max(...spread): a 500 MB capture easily
+      // exceeds the ~125k-argument stack limit and throws RangeError, turning
+      // a valid upload into a generic 500 (QA).
+      let startTime = Infinity
+      let endTime = -Infinity
+      for (const p of eff) {
+        if (p.timestamp < startTime) startTime = p.timestamp
+        if (p.timestamp > endTime) endTime = p.timestamp
+      }
       stats = {
         ...stats,
         totalPackets: eff.length,
         totalBytes: eff.reduce((s, p) => s + p.length, 0),
         decodedPackets: Math.max(0, (stats.decodedPackets ?? eff.length) - duplicates),
         protocols: eff.reduce<Record<string, number>>((acc, p) => { if (p.protocol) acc[p.protocol] = (acc[p.protocol] ?? 0) + 1; return acc }, {}),
-        startTime: eff.length ? Math.min(...eff.map((p) => p.timestamp)) : stats.startTime,
-        endTime: eff.length ? Math.max(...eff.map((p) => p.timestamp)) : stats.endTime,
-        duration: eff.length ? Math.max(0, Math.max(...eff.map((p) => p.timestamp)) - Math.min(...eff.map((p) => p.timestamp))) : 0,
+        startTime: eff.length ? startTime : stats.startTime,
+        endTime: eff.length ? endTime : stats.endTime,
+        duration: eff.length ? Math.max(0, endTime - startTime) : 0,
       }
     }
   }

@@ -299,7 +299,7 @@ interface AnalysisState {
   setAlerts: (a: AlertEntry[]) => void
   setTimeline: (t: TimelineEntry[]) => void
   setBandwidth: (b: BandwidthPoint[]) => void
-  setAdvancedMetrics: (m: AdvancedMetrics) => void
+  setAdvancedMetrics: (m: AdvancedMetrics | null) => void
   setGeoMap: (geo: Map<string, GeoLocation>) => void
   setDltOverride: (dlt: number | null) => void
   setSettings: (patch: Partial<AnalysisSettings>) => void
@@ -404,6 +404,16 @@ export const useAnalysisStore = create<AnalysisState>((set, get) => {
     setSettings: (patch) => { set((s) => ({ settings: { ...s.settings, ...patch } })); savePrefs() },
     toggleBeginnerMode: () => { set((s) => ({ beginnerMode: !s.beginnerMode })); savePrefs() },
     toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
-    resetAnalysis: () => set((s) => ({ ...initialState, settings: s.settings })),
+    // Clear the ANALYSIS, keep the analyst's preferences. Preferences are
+    // stored in localStorage (packetlens-settings); leaving the persisted
+    // copy untouched keeps memory and storage consistent, so a reload never
+    // resurrects a stale value the reset just cleared (QA: beginnerMode
+    // flipped back to on after reload).
+    resetAnalysis: () => set((s) => ({
+      ...initialState,
+      beginnerMode: s.beginnerMode,
+      dltOverride: s.dltOverride,
+      settings: s.settings,
+    })),
   }
 })

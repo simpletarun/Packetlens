@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Search } from "lucide-react"
 import { formatBytes, formatEndpoint } from "@/lib/map-data"
+import { DecodeBanner } from "@/components/analysis/decode-banner"
 export default function SessionsPage() {
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const sidebarOpen = useAnalysisStore((s) => s.sidebarOpen)
@@ -18,13 +19,13 @@ export default function SessionsPage() {
 
   const filtered = useMemo(
     () => sessions.filter((s) =>
-      !search || s.srcIp.includes(search) || s.dstIp.includes(search) || s.state.toLowerCase().includes(search.toLowerCase())
+      !search || s.srcIp.toLowerCase().includes(search.toLowerCase()) || s.dstIp.toLowerCase().includes(search.toLowerCase()) || s.state.toLowerCase().includes(search.toLowerCase())
     ),
     [search, sessions]
   )
 
   const stateColor = (s: string) => {
-    const m: Record<string, string> = { ESTABLISHED: "bg-success/10 text-success", CLOSED: "bg-muted text-muted-foreground", HALF_OPEN: "bg-warning/10 text-warning", INITIATED: "bg-info/10 text-info", RESET: "bg-destructive/10 text-destructive", STATELESS: "bg-chart-3/10 text-chart-3" }
+    const m: Record<string, string> = { ESTABLISHED: "bg-success/10 text-success", CLOSED: "bg-muted text-muted-foreground", HALF_OPEN: "bg-warning/10 text-warning", INITIATED: "bg-info/10 text-info", RESET: "bg-destructive/10 text-destructive", STATELESS: "bg-chart-3/10 text-chart-3", TIME_WAIT: "bg-info/10 text-info", SYN_SENT: "bg-warning/10 text-warning" }
     return m[s] || "bg-muted text-muted-foreground"
   }
 
@@ -36,6 +37,7 @@ export default function SessionsPage() {
         <main className="flex-1 flex flex-col overflow-hidden">
           <div className="p-4 border-b">
             <h1 className="text-lg font-bold mb-2">{beginnerMode ? "Connections" : "Sessions"}</h1>
+            <DecodeBanner className="mb-2" />
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input placeholder="Filter sessions..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" maxLength={200} />
@@ -53,13 +55,18 @@ export default function SessionsPage() {
               <span>{beginnerMode ? "Size" : "Bytes"}</span>
               <span>State</span>
             </div>
+            {filtered.length === 0 && (
+              <p className="px-4 py-8 text-center text-xs text-muted-foreground">
+                {search ? "No sessions match your filter" : "No sessions in this capture"}
+              </p>
+            )}
             {filtered.map((s) => (
               <div key={s.id} className="grid grid-cols-[1fr_1fr_70px_60px_80px_80px_70px_90px] gap-3 min-w-[880px] px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
                 <span className="font-mono hl-src">{formatEndpoint(s.srcIp, s.srcPort)}</span>
                 <span className="font-mono">{formatEndpoint(s.dstIp, s.dstPort)}</span>
                 <Badge variant="outline" className="text-[10px] px-1 py-0 font-mono">{s.protocol}</Badge>
-                <span className="text-muted-foreground">{s.srcPort}</span>
-                <span className="text-muted-foreground">{s.dstPort}</span>
+                <span className="text-muted-foreground">{s.srcPort || '\u2014'}</span>
+                <span className="text-muted-foreground">{s.dstPort || '\u2014'}</span>
                 <span className="text-muted-foreground">{s.packets}</span>
                 <span className="text-muted-foreground">{formatBytes(s.bytes)}</span>
                 <Badge variant="outline" className={cn("text-[10px] px-1 py-0", stateColor(s.state))}>{s.state}</Badge>

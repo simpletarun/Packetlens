@@ -5,7 +5,7 @@ import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn } from "@/lib/utils"
-import { binPackets, buildBandwidth, packetEpochSec } from "@/lib/report"
+import { binPackets, buildBandwidth } from "@/lib/report"
 import { formatBytes } from "@/lib/map-data"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Zap } from "lucide-react"
@@ -22,6 +22,8 @@ export default function TimelinePage() {
   const packets = useAnalysisStore((s) => s.packets)
   const decode = useAnalysisStore((s) => s.decode)
   const burst = useAnalysisStore((s) => s.burst)
+  const advancedMetrics = useAnalysisStore((s) => s.advancedMetrics)
+  const currentJob = useAnalysisStore((s) => s.currentJob)
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const sidebarOpen = useAnalysisStore((s) => s.sidebarOpen)
   const toggleSidebar = useAnalysisStore((s) => s.toggleSidebar)
@@ -34,22 +36,29 @@ export default function TimelinePage() {
     return packets.filter((p) => p.srcIp !== "\u2014" || p.dstIp !== "\u2014").length / packets.length < 0.05
   }, [decode, packets])
 
+  // Duration from the CANONICAL metrics engine (real min/max packet span,
+  // null when no time interval exists — single packet or identical
+  // timestamps). Never derived from first/last array elements (out-of-order
+  // pcapng reads a false span) and never fabricated with a 1 s fallback
+  // denominator: a one-packet capture has no rates (QA: 66 B/s over a fake
+  // 1 s interval).
+  const durationSec = useMemo(() => {
+    const canonical = advancedMetrics?.rates?.durationSec ?? currentJob?.captureDuration ?? null
+    return canonical !== null && canonical > 0 ? canonical : null
+  }, [advancedMetrics, currentJob])
+
   // The store timeline is 5-minute buckets — for short captures that
   // collapses an 88s capture into ONE bar. Rebin from the packets (1s/5s bins
   // like the report) so the page matches the report's shape (M4).
-  const durationSec = useMemo(() => {
-    if (packets.length < 2) return 1
-    const span = packetEpochSec(packets[packets.length - 1]) - packetEpochSec(packets[0])
-    return Math.max(Math.round(span), 1)
-  }, [packets])
-
   const displayTimeline = useMemo(
-    () => (durationSec > 600 && timeline.length >= 2 ? timeline : binPackets(packets, durationSec)),
+    () => (durationSec !== null && durationSec > 600 && timeline.length >= 2 ? timeline : binPackets(packets, durationSec ?? 0)),
     [timeline, packets, durationSec]
   )
   // buildBandwidth always: long captures keep the store's 5-min series (with
   // each bucket divided by its real overlap), short ones rebin — the raw
-  // store path rendered 5-min SUMS as "/s", 300x the true rate (QA).
+  // store path rendered 5-min SUMS as "/s", 300x the true rate (QA). A null
+  // duration (single packet / zero span) yields an empty series: no rates
+  // exist, and an empty state is honest.
   const displayBandwidth = useMemo(
     () => buildBandwidth(packets, bandwidth, durationSec),
     [bandwidth, packets, durationSec]
@@ -99,6 +108,9 @@ export default function TimelinePage() {
                   <span className="w-14">Time</span>
                   <span className="flex-1">Packets</span>
                 </div>
+                {displayTimeline.length === 0 && (
+                  <p className="py-6 text-center text-xs text-muted-foreground">No timeline data in this capture</p>
+                )}
                 {displayTimeline.map((t) => (
                   <div key={t.time} className="flex items-center gap-3 text-xs">
                     <span className="w-14 text-muted-foreground font-mono">{t.time}</span>
@@ -128,6 +140,9 @@ export default function TimelinePage() {
                   <span className="w-8 text-right">TLS</span>
                   <span className="w-10 text-right">Other</span>
                 </div>
+                {displayTimeline.length === 0 && (
+                  <p className="py-6 text-center text-xs text-muted-foreground">No timeline data in this capture</p>
+                )}
                 {displayTimeline.map((t) => {
                   const other = Math.max(t.packets - t.tcp - t.udp - t.dns - t.tls, 0)
                   const total = t.packets || 1
@@ -173,6 +188,9 @@ export default function TimelinePage() {
                   {!undecodable && <span className="w-20 text-right">In</span>}
                   {undecodable && <span className="w-44 text-right">Direction unknown</span>}
                 </div>
+                {displayBandwidth.length === 0 && (
+                  <p className="py-6 text-center text-xs text-muted-foreground">No bandwidth data — a single-packet or zero-duration capture has no time interval to measure rates over.</p>
+                )}
                 {displayBandwidth.map((b) => (
                   <div key={b.time} className="flex items-center gap-3 text-xs">
                     <span className="w-14 text-muted-foreground font-mono">{b.time}</span>

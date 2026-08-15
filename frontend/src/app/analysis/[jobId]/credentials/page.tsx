@@ -20,10 +20,21 @@ export default function CredentialsPage() {
 
   const filtered = useMemo(
     () => credentials.filter((c) =>
-      !search || c.username.includes(search) || c.service.includes(search) || c.srcIp.includes(search)
+      !search || c.username.toLowerCase().includes(search.toLowerCase()) || c.service.toLowerCase().includes(search.toLowerCase()) || c.srcIp.toLowerCase().includes(search.toLowerCase())
     ),
     [search, credentials]
   )
+
+  // Password-only matches carry the "—" username placeholder (no username was
+  // seen) — counting it as a unique username inflates the count by one (QA).
+  const uniqueUsernames = useMemo(() => {
+    const names = new Set<string>()
+    for (const c of credentials) {
+      const name = (c.username || "").replace(/^[\u2014\s]+$/, "")
+      if (name) names.add(name)
+    }
+    return names.size
+  }, [credentials])
 
   return (
     <div className="flex h-screen">
@@ -37,7 +48,7 @@ export default function CredentialsPage() {
           </div>
           <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Submissions</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{credentials.length}</div></CardContent></Card>
-            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Usernames</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(credentials.map((c) => c.username)).size}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Usernames</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{uniqueUsernames}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Services</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(credentials.map((c) => c.service)).size}</div></CardContent></Card>
           </div>
           <div className="px-4 pb-4 flex items-center gap-3">

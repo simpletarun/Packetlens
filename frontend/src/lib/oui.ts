@@ -17,7 +17,16 @@ function isLocallyAdministered(mac: string): boolean {
 export function lookupVendor(mac: string, ouiTable: Map<string, string>): string {
   const oui = normalizeOui(mac)
   if (!oui) return ""
-  const vendor = ouiTable.get(oui)
+  return ouiTable.get(oui) ?? ""
+}
+
+// Display-only placeholder for an unresolved MAC: "Locally administered" or
+// "Unknown vendor". Callers must never COUNT these as resolved vendors — only
+// lookupVendor's real names belong in vendor tallies (QA: "Vendors 1" when
+// zero vendors actually resolved, e.g. a missing OUI table).
+export function vendorLabel(vendor: string, mac: string): string {
   if (vendor) return vendor
+  const oui = normalizeOui(mac)
+  if (!oui) return ""
   return isLocallyAdministered(mac) ? "Locally administered" : "Unknown vendor"
 }

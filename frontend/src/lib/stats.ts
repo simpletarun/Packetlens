@@ -65,7 +65,12 @@ export function computeStats(input: {
     if (p.dstIp && !isNonUnicast(p.dstIp) && !isPrivateIP(p.dstIp) && !localOwned.has(p.dstIp)) externalIps.add(p.dstIp)
   }
   const countries = new Set<string>()
-  for (const loc of input.geo.values()) {
+  for (const [ip, loc] of input.geo) {
+    // The geoMap holds EVERY resolved address, including the LAN's own
+    // delegated-prefix public aliases (folded into local device rows above) —
+    // counting those would show "Countries 1" next to "External IPs 0" and a
+    // map with no pins (QA). Same exclusion as the report's countryCountsByDst.
+    if (localOwned.has(ip)) continue
     if (loc.countryCode && loc.countryCode !== "??" && loc.countryCode !== "LOC") countries.add(loc.countryCode)
   }
   return {
@@ -75,9 +80,16 @@ export function computeStats(input: {
     // "Devices" = LOCAL endpoints. The devices array also holds every remote
     // service IP (Cloudflare/Akamai/WhatsApp CDN), which would otherwise
     // inflate the device count to "28 devices" for a 2-host LAN. Falls back to
-    // the job summary only when no device rows were loaded at all.
+    // the job summary only when no device rows were loaded at all. Local = the
+    // SAME rule as localOwned above: a row whose primary is a LAN delegated-
+    // prefix IPv6 (engine merge leaves the home v6 as primary on a byte-tie)
+    // is local when any alias is private — otherwise the "Local Devices" card
+    // reads one lower than the device table (QA).
     devices: input.devices.some((d) => d.ip)
-      ? input.devices.filter((d) => isPrivateIP(d.ip) && !isNonUnicast(d.ip)).length
+      ? input.devices.filter((d) => {
+          if (isNonUnicast(d.ip)) return false
+          return isPrivateIP(d.ip) || (d.addresses ?? []).some((a) => isPrivateIP(a))
+        }).length
       : (j?.devices ?? 0),
     externalIps: externalIps.size || j?.externalIps || 0,
     countries: countries.size,

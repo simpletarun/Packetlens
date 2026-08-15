@@ -54,8 +54,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // (up to ~2-3× the file size in peak memory, and a streamed body with no
     // Content-Length could grow until OOM).
     const declaredLength = Number(request.headers.get('content-length') ?? 0)
-    if (!declaredLength || declaredLength > MAX_SIZE) {
+    if (declaredLength > MAX_SIZE) {
       return NextResponse.json({ error: 'File exceeds 500 MB limit' }, { status: 413 })
+    }
+    if (!declaredLength) {
+      // Chunked/streamed bodies carry no Content-Length — the 500 MB guard
+      // can't run pre-buffer, so reject with the real reason instead of a
+      // misleading size message (QA).
+      return NextResponse.json({ error: 'Request has no Content-Length header — streamed uploads are not supported' }, { status: 411 })
     }
 
     const formData = await request.formData()

@@ -7,7 +7,7 @@ import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn } from "@/lib/utils"
-import { riskLevel, riskColorClass } from "@/lib/risk"
+import { riskLevel, riskColorClass, verdictLevel } from "@/lib/risk"
 import { formatBytes, isLanFlow } from "@/lib/map-data"
 import { packetProtocolCounts } from "@/lib/analysis"
 import { localOwnedAddresses, decodeRateOf } from "@/lib/report"
@@ -43,6 +43,14 @@ export default function VisualizationsPage() {
   // Statistics Risk block must not read "0/100 SAFE" on undecodable traffic
   // while the report says UNKNOWN (QA).
   const undecodable = useMemo(() => decodeRateOf(decode, packets) < 0.05, [decode, packets])
+
+  // Verdict level = score band floored by the strongest finding severity,
+  // identical to the report's buildReportRisk — a HIGH-severity alert at a
+  // 39/100 LOW score must read HIGH here too (QA).
+  const riskLevelObj = useMemo(() => {
+    const highest = alerts.reduce((m, a) => Math.max(m, a.severity), 0)
+    return verdictLevel(riskLevel(stats.riskScore), highest)
+  }, [stats.riskScore, alerts])
 
   // Home = the analyst's own location, known only from an online self-lookup
   // (offline databases cannot tell you where you are). A MANUAL lat/lon set
@@ -298,7 +306,7 @@ export default function VisualizationsPage() {
                       {undecodable ? (
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold text-muted-foreground">UNKNOWN / INSUFFICIENT DATA</span>
                       ) : (
-                        <span className={cn("px-2 py-0.5 rounded-full text-[10px] font-semibold", riskColorClass(riskLevel(stats.riskScore)))}>{riskLevel(stats.riskScore).label.toUpperCase()}</span>
+                        <span className={cn("px-2 py-0.5 rounded-full text-[10px] font-semibold", riskColorClass(riskLevelObj))}>{riskLevelObj.label.toUpperCase()}</span>
                       )}
                     </div>
                     {undecodable ? (
@@ -333,7 +341,7 @@ export default function VisualizationsPage() {
                   <div className="flex h-[200px] flex-col items-center justify-center gap-1.5 rounded border border-dashed text-center">
                     <span className="text-2xl leading-none">🛡️</span>
                     <span className="text-xs font-medium text-success">No alerts detected</span>
-                    <span className="text-[10px] text-muted-foreground">Threat score {stats.riskScore}/100 &middot; last alert: never</span>
+                    <span className="text-[10px] text-muted-foreground">{undecodable ? "Only " + (decodeRateOf(decode, packets) * 100).toFixed(0) + "% decoded — no verdict on undecodable traffic" : `Threat score ${stats.riskScore}/100 · last alert: never`}</span>
                   </div>
                 ) : (
                 <div className="flex items-end gap-2 h-[200px]">
@@ -436,10 +444,13 @@ export default function VisualizationsPage() {
             <CardContent>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 {[
-                  { label: "Total Packets", value: packets.length, color: "text-info", bg: "bg-info/10" },
-                  { label: "Total Flows", value: flows.length, color: "text-chart-2", bg: "bg-chart-2/10" },
+                  // Job-summary counts (authoritative) — array lengths would
+                  // drift if payload caps ever retain fewer rows (QA: latent
+                  // divergence from the dashboard cards).
+                  { label: "Total Packets", value: stats.totalPackets, color: "text-info", bg: "bg-info/10" },
+                  { label: "Total Flows", value: stats.totalFlows, color: "text-chart-2", bg: "bg-chart-2/10" },
                   { label: "DNS Queries", value: dnsQueryCount, color: "text-warning", bg: "bg-warning/10" },
-                  { label: "Threats Detected", value: alerts.length, color: "text-danger", bg: "bg-danger/10" },
+                  { label: "Threats Detected", value: stats.alerts, color: "text-danger", bg: "bg-danger/10" },
                 ].map(({ label, value, color, bg }) => (
                   <div key={label} className={cn("rounded-lg p-4 text-center", bg)}>
                     <div className={cn("text-4xl font-bold tabular-nums", color)}>{value.toLocaleString()}</div>

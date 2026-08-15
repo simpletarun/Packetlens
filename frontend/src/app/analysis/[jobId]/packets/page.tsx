@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Search, X, Bookmark, Code, FileText, ChevronDown, ChevronRight } from "lucide-react"
+import { DecodeBanner } from "@/components/analysis/decode-banner"
 import type { AnalysisPacket } from "@/lib/analysis"
 
 const COLUMNS = [
@@ -80,13 +81,20 @@ export default function PacketsPage() {
 
   const filtered = useMemo(
     () => packets.filter((p) =>
-      !search || (p.srcIp || "").includes(search) || (p.dstIp || "").includes(search) ||
+      !search || (p.srcIp || "").toLowerCase().includes(search.toLowerCase()) || (p.dstIp || "").toLowerCase().includes(search.toLowerCase()) ||
       p.protocol.toLowerCase().includes(search.toLowerCase()) ||
       String(p.srcPort).includes(search) || String(p.dstPort).includes(search) ||
       (p.info || "").toLowerCase().includes(search.toLowerCase())
     ),
     [search, packets]
   )
+
+  // A filter that narrows the list must not leave the scroll position beyond
+  // the new total — the virtualizer would render nothing until the user
+  // scrolls (QA: 50k → 10 rows showed an empty viewport).
+  useEffect(() => {
+    parentRef.current?.scrollTo({ top: 0 })
+  }, [search])
 
   const gridCols = COLUMNS.map((c) => c.width).join(" ")
 
@@ -134,6 +142,9 @@ export default function PacketsPage() {
   const followStream = useCallback(() => {
     if (!selectedPacketData) return
     const p = selectedPacketData
+    // Port-less protocols (ICMP/ARP carry port 0) would assemble EVERY
+    // port-0 packet between the pair into a fake "stream" (QA).
+    if (p.protocol !== "TCP" && p.protocol !== "UDP") return
     const key = streamConversationKey(p)
     setStreamPair(prev => prev === key ? null : key)
     setActiveTab("stream")
@@ -162,10 +173,11 @@ export default function PacketsPage() {
           <div className="flex-1 flex flex-col min-w-0">
             <div className="p-4 border-b shrink-0">
               <h1 className="text-lg font-bold mb-2">Packets</h1>
+              <DecodeBanner className="mb-2" />
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                 <Input
-                  placeholder={beginnerMode ? "Search by address, protocol, or port..." : "Filter packets (IP, port, protocol, regex)..."}
+                  placeholder={beginnerMode ? "Search by address, protocol, or port..." : "Filter packets (IP, port, protocol, info)..."}
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   className="pl-10" maxLength={200}
@@ -185,6 +197,19 @@ export default function PacketsPage() {
               </div>
 
               <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
+                {filtered.length === 0 && (
+                  <div className="flex flex-col items-center gap-2 py-16 text-center">
+                    <Search className="h-8 w-8 text-muted-foreground/40" />
+                    <p className="text-sm text-muted-foreground">
+                      {search ? `No packets match "${search}"` : "No packets in this capture"}
+                    </p>
+                    {search && (
+                      <button onClick={() => setSearch("")} className="text-xs text-primary hover:underline">
+                        Clear filter
+                      </button>
+                    )}
+                  </div>
+                )}
                 {virtualizer.getVirtualItems().map((virtualItem) => {
                   const p = filtered[virtualItem.index]
                   if (!p) return null

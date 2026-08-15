@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useMemo } from "react"
+import { useState, useMemo, useEffect } from "react"
 import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
@@ -20,7 +20,7 @@ export default function TlsPage() {
 
   const filtered = useMemo(
     () => tls.filter((t) =>
-      !search || t.sni.includes(search) || t.srcIp.includes(search) || t.version.includes(search)
+      !search || t.sni.toLowerCase().includes(search.toLowerCase()) || t.srcIp.toLowerCase().includes(search.toLowerCase()) || t.version.toLowerCase().includes(search.toLowerCase())
     ),
     [search, tls]
   )
@@ -31,7 +31,23 @@ export default function TlsPage() {
   const isTls12 = (v: string) => /1\.2/.test(v)
   const tls13 = tls.filter((t) => isTls13(t.version)).length
   const tls12 = tls.filter((t) => isTls12(t.version)).length
-  const selectedCert = selected ? tls.find((t) => t.id === selected) : null
+  // Case variants and trailing dots are the same name — the Unique SNIs card
+  // must not inflate for them (QA, mirrors the HTTP hosts rule).
+  const uniqueSnis = useMemo(() => {
+    const snis = new Set<string>()
+    for (const t of tls) {
+      const sni = (t.sni || "").replace(/\.$/, "").toLowerCase()
+      if (sni) snis.add(sni)
+    }
+    return snis.size
+  }, [tls])
+  // Resolve against the FILTERED list and drop the stale selection once the
+  // row leaves the filter — the details panel must not stick to a handshake
+  // no longer in the table (same fix as the packets page, QA).
+  const selectedCert = selected ? filtered.find((t) => t.id === selected) ?? null : null
+  useEffect(() => {
+    if (selected !== null && !filtered.some((t) => t.id === selected)) setSelected(null)
+  }, [filtered, selected])
 
   return (
     <div className="flex h-screen">
@@ -47,7 +63,7 @@ export default function TlsPage() {
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Handshakes</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{tls.length}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">TLSv1.3</CardTitle></CardHeader><CardContent><div className={"text-2xl font-bold" + (tls13 > 0 ? " text-success" : " text-muted-foreground")}>{tls13}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">TLSv1.2</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{tls12}</div></CardContent></Card>
-            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique SNIs</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(tls.map((t) => t.sni)).size}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique SNIs</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{uniqueSnis}</div></CardContent></Card>
           </div>
           <div className="px-4 pb-4">
             <div className="relative">
@@ -81,9 +97,11 @@ export default function TlsPage() {
                 >
                   <span className="font-mono text-muted-foreground hl-time">{formatTime(t.timestamp)}</span>
                   <span className="font-mono hl-src">{t.srcIp}</span>
-                  <span className="truncate"><Shield className="h-3 w-3 inline mr-1 text-chart-3" />{t.sni}</span>
+                  <span className="truncate"><Shield className="h-3 w-3 inline mr-1 text-chart-3" />{t.sni || "—"}</span>
                   <Badge variant={isTls13(t.version) ? "success" : "default"} className="text-[10px] px-1 py-0">{t.version}</Badge>
-                  <span className="truncate text-muted-foreground">{t.cipherSuite}</span>
+                  {/* No ServerHello captured → no cipher suite; an empty cell
+                      reads as data loss (QA). */}
+                  <span className="truncate text-muted-foreground">{t.cipherSuite || "—"}</span>
                 </div>
               ))}
               {filtered.length > 500 && (

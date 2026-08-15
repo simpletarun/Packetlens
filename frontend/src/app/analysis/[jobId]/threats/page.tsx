@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Search, AlertTriangle, X } from "lucide-react"
+import { DecodeBanner } from "@/components/analysis/decode-banner"
 export default function ThreatsPage() {
   const beginnerMode = useAnalysisStore((s) => s.beginnerMode)
   const sidebarOpen = useAnalysisStore((s) => s.sidebarOpen)
@@ -19,8 +20,8 @@ export default function ThreatsPage() {
 
   const filtered = useMemo(
     () => alerts.filter((t) =>
-      !search || t.signature.includes(search) || t.category.includes(search) ||
-      t.srcIp.includes(search) || t.dstIp.includes(search)
+      !search || t.signature.toLowerCase().includes(search.toLowerCase()) || t.category.toLowerCase().includes(search.toLowerCase()) ||
+      t.srcIp.toLowerCase().includes(search.toLowerCase()) || t.dstIp.toLowerCase().includes(search.toLowerCase())
     ),
     [search, alerts]
   )
@@ -61,6 +62,7 @@ export default function ThreatsPage() {
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Signatures</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(alerts.map((t) => t.signature)).size}</div></CardContent></Card>
           </div>
           <div className="px-4 pb-4">
+            <DecodeBanner className="mb-2" />
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input placeholder="Filter by signature, category, or IP..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" maxLength={200} />
@@ -111,8 +113,10 @@ export default function ThreatsPage() {
                     { label: "Signature", value: selectedThreat.signature },
                     { label: "Category", value: selectedThreat.category },
                     { label: "Severity", value: sevLabel(selectedThreat.severity) + " (" + selectedThreat.severity + "/5)" },
-                    { label: "Source", value: selectedThreat.srcIp + ":" + selectedThreat.srcPort },
-                    { label: "Destination", value: selectedThreat.dstIp + ":" + selectedThreat.dstPort },
+                    // Flag-derived alerts use 'multiple'/'external' with port 0
+                    // — never render a fabricated "multiple:0" port (QA).
+                    { label: "Source", value: selectedThreat.srcPort > 0 ? selectedThreat.srcIp + ":" + selectedThreat.srcPort : selectedThreat.srcIp },
+                    { label: "Destination", value: selectedThreat.dstPort > 0 ? selectedThreat.dstIp + ":" + selectedThreat.dstPort : selectedThreat.dstIp },
                     { label: "Confidence", value: selectedThreat.confidence + "%" },
                     { label: "Protocol", value: selectedThreat.protocol },
                     { label: "Evidence", value: selectedThreat.evidence },

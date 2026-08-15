@@ -18,9 +18,13 @@ export default function FilesPage() {
   const files = useAnalysisStore((s) => s.files)
   const [search, setSearch] = useState("")
 
+  // The search must match what the UI SHOWS: rows display "file upload"/"form
+  // body" but the store carries "file-transfer"/"form-body" — searching on the
+  // raw token silently hid rows the count still showed (QA).
+  const kindLabel = (kind: string) => (kind === "file-transfer" ? "file upload" : kind === "form-body" ? "form body" : kind)
   const filtered = useMemo(
     () => files.filter((f) =>
-      !search || f.filename.includes(search) || f.mimeType.includes(search) || f.srcIp.includes(search) || f.kind.includes(search)
+      !search || f.filename.toLowerCase().includes(search.toLowerCase()) || f.mimeType.toLowerCase().includes(search.toLowerCase()) || f.srcIp.toLowerCase().includes(search.toLowerCase()) || kindLabel(f.kind).includes(search.toLowerCase())
     ),
     [search, files]
   )
@@ -50,14 +54,13 @@ export default function FilesPage() {
           </div>
           <div className="px-4 pb-4"><DecodeBanner /></div>
           <div className="flex-1 overflow-auto px-4">
-            <div className="grid grid-cols-[100px_70px_1fr_1fr_90px_70px_1fr] gap-3 min-w-[700px] px-4 py-2 text-xs font-medium text-muted-foreground border-b bg-background shadow-sm sticky top-0">
+            <div className="grid grid-cols-[100px_70px_1fr_1fr_90px_70px] gap-3 min-w-[620px] px-4 py-2 text-xs font-medium text-muted-foreground border-b bg-background shadow-sm sticky top-0">
               <span>Time</span>
               <span>Kind</span>
               <span>{beginnerMode ? "Filename" : "File"}</span>
               <span>MIME Type</span>
               <span>Size</span>
               <span>Protocol</span>
-              <span>MD5</span>
             </div>
             {filtered.length === 0 && (
               <p className="px-4 py-8 text-center text-xs text-muted-foreground">
@@ -65,14 +68,13 @@ export default function FilesPage() {
               </p>
             )}
             {filtered.slice(0, 500).map((f) => (
-              <div key={f.id} className="grid grid-cols-[100px_70px_1fr_1fr_90px_70px_1fr] gap-3 min-w-[700px] px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
+              <div key={f.id} className="grid grid-cols-[100px_70px_1fr_1fr_90px_70px] gap-3 min-w-[620px] px-4 py-2 text-xs items-center border-b border-border/50 hover:bg-accent/30">
                 <span className="font-mono text-muted-foreground hl-time">{formatTime(f.timestamp)}</span>
-                <span>{f.kind === "file-transfer" ? "file upload" : "form body"}</span>
+                <span>{kindLabel(f.kind)}</span>
                 <span className="truncate"><FileIcon className="h-3 w-3 inline mr-1 text-muted-foreground" />{f.filename || '\u2014'}</span>
                 <span className="truncate text-muted-foreground">{f.mimeType}</span>
                 <span className="text-muted-foreground">{formatBytes(f.size)}</span>
                 <Badge variant="outline" className="text-[10px] px-1 py-0 font-mono">{f.protocol}</Badge>
-                <span className="font-mono text-muted-foreground text-[10px]">{f.md5 || '\u2014'}</span>
               </div>
             ))}
             {filtered.length > 500 && (

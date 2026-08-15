@@ -49,7 +49,9 @@ export async function GET(
     timeline: d.timeline,
     bandwidth: d.bandwidth,
     advancedMetrics: d.advancedMetrics,
-    burst: d.advancedMetrics.burst ?? null,
+    // Defensive: a stored/corrupt job without the field must not 500 the one
+    // route every analysis page reads (QA).
+    burst: d.advancedMetrics?.burst ?? null,
     decode: d.decode,
     // Canonical contract fields — the export path re-validates the complete
     // result with these before producing HTML/PDF/JSON.

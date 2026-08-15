@@ -10,16 +10,21 @@ import type { AnalysisDevice } from "./analysis"
 let table: Map<string, string> | null = null
 
 function loadOuiTable(): Map<string, string> {
+  // Cache only on SUCCESS: a table missing at first load (or regenerated
+  // later) must be picked up without a server restart, while a loaded table
+  // is reused across requests (QA: every device stayed "unknown" until
+  // restart when public/oui.json appeared after the first request).
   if (table) return table
-  table = new Map()
+  let fresh = new Map<string, string>()
   try {
     const file = path.join(process.cwd(), "public", "oui.json")
     const entries = JSON.parse(fs.readFileSync(file, "utf8")) as [string, string][]
-    table = new Map(entries)
+    fresh = new Map(entries)
+    table = fresh
   } catch {
-    /* missing/unreadable table — vendors stay empty */
+    /* missing/unreadable table — vendors stay empty, retried next call */
   }
-  return table
+  return fresh
 }
 
 export function enrichDeviceVendors(devices: AnalysisDevice[]): AnalysisDevice[] {

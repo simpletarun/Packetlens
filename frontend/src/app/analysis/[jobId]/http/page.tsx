@@ -20,11 +20,22 @@ export default function HttpPage() {
 
   const filtered = useMemo(
     () => http.filter((h) =>
-      !search || h.uri.includes(search) || h.host.includes(search) ||
+      !search || h.uri.toLowerCase().includes(search.toLowerCase()) || h.host.toLowerCase().includes(search.toLowerCase()) ||
       h.method.toLowerCase().includes(search.toLowerCase()) || String(h.status).includes(search)
     ),
     [search, http]
   )
+
+  // Case variants ("Example.com" vs "example.com") and trailing dots are the
+  // same host — the Unique Hosts card must not inflate for them (QA).
+  const uniqueHosts = useMemo(() => {
+    const hosts = new Set<string>()
+    for (const h of http) {
+      const host = (h.host || "").replace(/\.$/, "").toLowerCase()
+      if (host) hosts.add(host)
+    }
+    return hosts.size
+  }, [http])
 
   const statusColor = (s: number) => {
     if (s < 300) return "bg-success/10 text-success"
@@ -52,7 +63,7 @@ export default function HttpPage() {
           </div>
           <div className="p-4 grid grid-cols-1 md:grid-cols-4 gap-4">
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Requests</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{http.length}</div></CardContent></Card>
-            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Hosts</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(http.map((h) => h.host).filter(Boolean)).size}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Hosts</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{uniqueHosts}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Error Responses</CardTitle></CardHeader><CardContent><div className={"text-2xl font-bold" + (errorCount > 0 ? " text-danger" : " text-muted-foreground")}>{errorCount}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Data</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{formatBytes(http.reduce((s, h) => s + (h.length ?? 0), 0))}</div></CardContent></Card>
           </div>
@@ -61,6 +72,7 @@ export default function HttpPage() {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input placeholder="Filter by URI, host, method, or status..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" maxLength={200} />
             </div>
+            <p className="text-xs text-muted-foreground mt-1">{filtered.length} of {http.length} requests</p>
           </div>
           <div className="px-4 pb-4"><DecodeBanner /></div>
           <div className="flex-1 overflow-auto px-4">
