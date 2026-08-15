@@ -78,7 +78,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
           "totalPackets": 4,
           "totalFlows": 2,
           "alerts": 1,
-          "riskScore": 39,
+          "riskScore": 53,
           "captureQuality": "VALID",
           "captureDuration": 3
         },
@@ -141,7 +141,7 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
           {
             "ruleId": "HTTP-CREDS-001",
             "severity": 4,
-            "confidence": 75,
+            "confidence": 100,
             "srcIp": "192.168.1.5",
             "dstIp": "8.8.8.8",
             "packetNums": [

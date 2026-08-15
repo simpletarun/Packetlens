@@ -8,10 +8,10 @@ import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml } from "@/lib/report"
+import { SOURCE_LABELS, buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
-import { BUILD_STAMP } from "@/lib/build-stamp"
+import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -638,10 +638,10 @@ export default function ReportsPage() {
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
-      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow rows are direction-normalized per conversation: the CSV export lists the conversation initiator as source, the flows table keeps canonical endpoint order — so summing distinct CSV endpoints yields different numbers by design.`,
+      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow rows are direction-normalized per conversation: both the CSV export and the flows table list the conversation initiator as source — so summing distinct CSV endpoints still yields different numbers by design.`,
       `- DNS queries: ${dnsQueries} (${dnsLookupCount(dns)} distinct lookups) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
-      `- Files extracted: ${files.length} · Credentials: ${credentials.length} · Certificates: ${certificates.length}`,
+      `- ${plural(files.length, "file")} extracted · ${plural(credentials.length, "credential")} · ${plural(certificates.length, "certificate")}`,
       ...(report.notables.length ? [`- Notable destinations (neutral, not findings): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
@@ -691,7 +691,7 @@ export default function ReportsPage() {
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: ${BUILD_STAMP}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: ${BUILD_INFO.sourceHash} (no Git in build environment)`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
 
@@ -750,7 +750,8 @@ export default function ReportsPage() {
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Duration</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{durLabel(durationSec)}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Risk Score</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{riskValue()}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Generated</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{new Date().toISOString().slice(0, 10)}</td></tr>
-                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Build</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{BUILD_STAMP}</td></tr>
+                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Build</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>v{BUILD_INFO.version} · {BUILD_INFO.isGit ? `commit:${BUILD_INFO.commitShort}` : `src:${BUILD_INFO.sourceHash || "unknown"}`} · {BUILD_INFO.builtAt}</td></tr>
+                  {BUILD_INFO.isGit && <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Commit</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{BUILD_INFO.commit}</td></tr>}
                 </tbody>
               </table>
               <div style={{ marginTop: "40pt", fontSize: "8pt", color: "#aaa" }}>PacketLens Report &middot; Detection Engine: Behavioral &middot; Analyzer: {report.metadata.analyzerVersion || ANALYZER_VERSION} &middot; Generated By: PacketLens &middot; Generated {new Date().toISOString().slice(0, 10)} &middot; Build {BUILD_STAMP}</div>
@@ -767,18 +768,18 @@ export default function ReportsPage() {
                     <p><strong>{stats.totalFlows}</strong> undecodable traffic bucket{stats.totalFlows === 1 ? "" : "s"} — no endpoints were parsed (unsupported encapsulation).</p>
                   ) : (
                     <>
-                    <p><strong>{stats.totalFlows}</strong> flows, <strong>{stats.sessions}</strong> sessions, <strong>{stats.devices}</strong> local devices ({devices.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
-                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow rows are direction-normalized per conversation: the CSV export lists the conversation initiator as source, while the flows table keeps canonical endpoint order — so summing distinct CSV endpoints yields different numbers from these counts by design.</p>
+                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({devices.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
+                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow rows are direction-normalized per conversation: both the CSV export and the flows table list the conversation initiator as source — so summing distinct CSV endpoints still yields different numbers from these counts by design.</p>
                     </>
                   )}
                   {undecodable && (
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
                   )}
-                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{dnsQueries}</strong> DNS query packets ({dnsLookupCount(dns)} distinct lookups), <strong>{http.length}</strong> HTTP requests, <strong>{tls.length}</strong> TLS handshakes.</p>}
+                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{dnsQueries}</strong> {plural(dnsQueries, "DNS query packet")} ({dnsLookupCount(dns)} distinct lookups), <strong>{http.length}</strong> {plural(http.length, "HTTP request")}, <strong>{tls.length}</strong> {plural(tls.length, "TLS handshake")}.</p>}
                   {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
-                  {files.length > 0 && <p><strong>{files.length}</strong> files extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{credentials.length}</strong> credentials, <strong>{certificates.length}</strong> certificates observed.</p>}
+                  {files.length > 0 && <p><strong>{plural(files.length, "file")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential")}</strong>, <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
                   {alerts.length > 0 ? (
-                    <p><span className="text-danger font-medium">{alerts.length} alerts</span> ({severityCounts(alerts)}). Risk score: <strong>{riskValue()}</strong>.</p>
+                    <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> ({severityCounts(alerts)}). Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
                     <p>No signature-based alerts. Risk score: <strong>{riskValue()}</strong>.</p>
                   )}
@@ -921,8 +922,8 @@ export default function ReportsPage() {
                     <table className="w-full text-xs">
                       <thead>
                         <tr className="border-b text-muted-foreground">
-                          <th className="text-left py-2 pr-2">Source</th>
-                          <th className="text-left py-2 pr-2">Destination</th>
+                          <th className="text-left py-2 pr-2">Initiator</th>
+                          <th className="text-left py-2 pr-2">Responder</th>
                           <th className="text-left py-2 pr-2">Proto</th>
                           <th className="text-right py-2 pr-2">Packets</th>
                           <th className="text-right py-2 pr-2">Sent</th>
@@ -931,14 +932,14 @@ export default function ReportsPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {flows.slice(0, 15).map((f) => (
-                          <tr key={f.id} className="border-b border-border/30">
+                        {flowTableRows(flows, packets).slice(0, 15).map((f) => (
+                          <tr key={f.srcIp + ":" + f.srcPort + "→" + f.dstIp + ":" + f.dstPort} className="border-b border-border/30">
                             <td className="py-1.5 pr-2 font-mono hl-src">{f.srcIp}:{f.srcPort}</td>
                             <td className="py-1.5 pr-2 font-mono">{f.dstIp}:{f.dstPort}</td>
                             <td className="py-1.5 pr-2"><Badge variant="outline" className="text-[10px] font-mono">{f.protocol}</Badge></td>
                             <td className="py-1.5 pr-2 text-right">{f.packets}</td>
-                            <td className="py-1.5 pr-2 text-right text-muted-foreground">{f.directionUnknown ? "—" : formatBytes(f.bytesSent)}</td>
-                            <td className="py-1.5 pr-2 text-right text-muted-foreground">{f.directionUnknown ? "—" : formatBytes(f.bytesRecv)}</td>
+                            <td className="py-1.5 pr-2 text-right text-muted-foreground">{f.directionUnknown ? "—" : formatBytes(f.bytesSent ?? 0)}</td>
+                            <td className="py-1.5 pr-2 text-right text-muted-foreground">{f.directionUnknown ? "—" : formatBytes(f.bytesRecv ?? 0)}</td>
                             <td className="py-1.5 text-right text-muted-foreground">{f.duration}s</td>
                           </tr>
                         ))}
@@ -946,7 +947,7 @@ export default function ReportsPage() {
                     </table>
                   </div>
                   {flows.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest flows of {flows.length.toLocaleString()} — the CSV export lists all flows.</div>}
-                  <p className="text-[10px] text-muted-foreground mt-1">Endpoint order here is canonical (service-side first); the CSV export lists the conversation initiator as source — the same conversation therefore reads mirrored across the two artifacts.</p>
+                  <p className="text-[10px] text-muted-foreground mt-1">Initiator = the endpoint that sent the conversation&rsquo;s SYN (TCP) or its first observed packet — this table and the CSV export list the same endpoint first, and Sent/Recv are relative to the initiator. Detection always reads the original packet direction from the wire, never this display order.</p>
                   {/* TCP health mirrors the CSV export: per-flow RTT, retrans,
                       loss, OoO, zero-window and RST. Shows the worst flows —
                       a summary without rows reads as "nothing measured". */}
@@ -969,7 +970,7 @@ export default function ReportsPage() {
                                 <th className="text-right py-1.5 pr-2">Pkts</th>
                                 <th className="text-right py-1.5 pr-2">RTT (ms)</th>
                                 <th className="text-right py-1.5 pr-2">Retrans</th>
-                                <th className="text-right py-1.5 pr-2">Loss %</th>
+                                <th className="text-right py-1.5 pr-2">Est. Loss %</th>
                                 <th className="text-right py-1.5 pr-2">Loss Conf</th>
                                 <th className="text-right py-1.5 pr-2">OoO</th>
                                 <th className="text-right py-1.5 pr-2">Zero Win</th>
@@ -1032,7 +1033,7 @@ export default function ReportsPage() {
                     </table>
                   </div>
                   {sessions.length > 15 && <div className="text-[10px] text-muted-foreground mt-1">Showing the 15 largest sessions of {sessions.length.toLocaleString()} — the Analysis page lists all sessions.</div>}
-                  <p className="text-[10px] text-muted-foreground mt-1">Endpoint order here is canonical (service-side first); the CSV export lists the conversation initiator as source — the same conversation therefore reads mirrored across the two artifacts.</p>
+                  <p className="text-[10px] text-muted-foreground mt-1">Rows are initiator-first, like the CSV export: the side that sent the first SYN (or the first observed packet) is the Source/Initiator, with its sent/received byte counts. Detection always reads the original packet direction from the wire, never this display order.</p>
                   <p className="text-xs text-muted-foreground mt-3">Sessions mirror flows one-to-one (one session per direction-normalized conversation; states come from the observed handshake — INITIATED = SYN seen but no completion, HALF_OPEN = SYN-ACK replied but never completed, ESTABLISHED = full handshake or mid-stream capture, RESET/CLOSED, STATELESS = non-TCP). Higher-level, multi-flow session reconstruction is not implemented.</p>
                 </CardContent>
               </Card>
@@ -1504,7 +1505,7 @@ export default function ReportsPage() {
                         {report.groups.map((g) => (
                           <tr key={g.ruleId + "::" + g.signature} className="border-b border-border/30">
                             <td className="py-1.5 pr-2 font-mono text-muted-foreground whitespace-nowrap hl-time text-xs">{g.occurrences > 1 ? `${formatTime(g.firstSeen)} – ${formatTime(g.lastSeen)}` : formatTime(g.firstSeen)}</td>
-                            <td className="py-1.5 pr-2 text-xs">{g.signature} <span className="text-muted-foreground">×{g.occurrences}</span> <Badge variant={g.status === "CONFIRMED" ? "default" : g.status === "LIKELY" ? "warning" : "outline"} className="text-[9px]">{g.status ?? "CONFIRMED"}</Badge></td>
+                            <td className="py-1.5 pr-2 text-xs">{g.signature} <span className="text-muted-foreground">×{g.occurrences}</span> <Badge variant={g.status === "CONFIRMED" ? "default" : g.status === "LIKELY" ? "warning" : "outline"} className="text-[9px]">{g.status ?? "CONFIRMED"}</Badge>{g.evidenceQuality && <Badge variant="outline" className="text-[9px] ml-1" title="Evidence quality — the strength of the underlying evidence, separate from the numeric confidence">Evidence {g.evidenceQuality}</Badge>}</td>
                             <td className="py-1.5 pr-2 font-mono text-xs">{g.srcHosts.join(", ")} → {g.dstHosts.join(", ")}</td>
                             <td className="py-1.5 pr-2 text-right text-muted-foreground" title={g.packets == null ? "Full capture packet rows were not retained for this flow" : undefined}>{g.packets == null ? "N/A" : g.packets.toLocaleString()}</td>
                             <td className="py-1.5 pr-2 text-right text-muted-foreground" title={g.bytes == null ? "Full capture packet rows were not retained for this flow" : undefined}>{g.bytes == null ? "N/A" : formatBytes(g.bytes)}</td>
@@ -1516,7 +1517,7 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="text-[10px] text-muted-foreground mt-1">Detection states come from evidence quality: CONFIRMED = payload-verified (e.g. cleartext credentials decoded from the wire); LIKELY = strong multi-indicator or high-evidence behavioral findings; SUSPECTED = a rule crossed its threshold on weaker evidence (scans, floods and behavioral heuristics can never reach CONFIRMED — the evidence is pattern-based, and the finding text says so). Confidence is derived from the same evidence (more probed ports / higher SYN burst rate = higher confidence); C2-beacon, exfil and DNS-tunnel rules that fire during a detected traffic burst get a bonus in the Risk Breakdown (e.g. 70% base can appear there as 85%), and behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;. MITRE mappings are attached only to LIKELY/CONFIRMED detections. Pkts/Bytes read N/A when an alert spans multiple flows &mdash; the Evidence column then carries the measured numbers.</div>
+                  <div className="text-[10px] text-muted-foreground mt-1">Detection states come from evidence quality: CONFIRMED = payload-verified (e.g. cleartext credentials decoded from the wire); LIKELY = strong multi-indicator or high-evidence behavioral findings; SUSPECTED = a rule crossed its threshold on weaker evidence (scans, floods and behavioral heuristics can never reach CONFIRMED — the evidence is pattern-based, and the finding text says so). The Evidence badge (LOW/MEDIUM/HIGH) is the strength of that evidence — separate from the numeric confidence, which is the detector&rsquo;s calibration: payload-verified findings carry 100% and HIGH, a 24-port scan reads ~62% and MEDIUM. C2-beacon, exfil and DNS-tunnel rules that fire during a detected traffic burst get a bonus in the Risk Breakdown (e.g. 70% base can appear there as 85%), and behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;. MITRE mappings are attached only to LIKELY/CONFIRMED detections. Pkts/Bytes read N/A when an alert spans multiple flows &mdash; the Evidence column then carries the measured numbers.</div>
                 </CardContent>
               </Card>
             </section>
@@ -2002,7 +2003,8 @@ export default function ReportsPage() {
                           <p><strong>Generation Mode:</strong> {report.metadata.mode}</p>
                           <p><strong>Report Schema Version:</strong> {report.metadata.schemaVersion}</p>
                           <p><strong>Analyzer Version:</strong> {report.metadata.analyzerVersion || ANALYZER_VERSION}</p>
-                          <p><strong>Build Fingerprint:</strong> <span className="font-mono">{BUILD_STAMP}</span></p>
+                          <p><strong>Build:</strong> v{BUILD_INFO.version} · {BUILD_INFO.isGit ? <>Commit: <span className="font-mono">{BUILD_INFO.commit}</span></> : <>Source: <span className="font-mono">{BUILD_INFO.sourceHash || "unknown"}</span> (no Git in build environment)</>} · Built: {BUILD_INFO.builtAt}</p>
+                          {BUILD_INFO.isGit && <p><strong>Commit (short):</strong> <span className="font-mono">{BUILD_INFO.commitShort}</span></p>}
                           <p><strong>Signature DB Version:</strong> {report.metadata.ruleVersion || "Behavioral Detection Only"}</p>
                           <p><strong>Risk Spec Version:</strong> {report.metadata.riskSpecVersion || RISK_SPEC_VERSION}</p>
                           <p><strong>GeoIP DB (DB-IP City Lite):</strong> {jobInfo?.geoDbVersion || "Lookup Unavailable"}</p>

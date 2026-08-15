@@ -2025,3 +2025,65 @@ describe("direction regression tests (QA: Test A/B/C) — detection reads the wi
     expect(a.threats.filter((t) => t.ruleId === "PORT-SCAN-001")).toHaveLength(0)
   })
 })
+
+describe("credential findings — field-level evidence, redaction, and the field-requirement gate", () => {
+  const hex = (s: string) => Buffer.from(s, "latin1").toString("hex")
+  const httpPacket = (payload: string): ParsedPacket =>
+    makePacket({
+      num: 1, timestamp: 1000000, srcIp: "192.168.1.10", dstIp: "23.155.129.172",
+      srcPort: 52000, dstPort: 80, protocol: "TCP", tcpFlags: "PSH ACK",
+      httpMethod: "POST", appPayloadConfirmed: true, payload: hex(payload),
+    })
+  const run = (packets: ParsedPacket[]) =>
+    analyzePcap({
+      packets,
+      stats: {
+        totalPackets: packets.length,
+        totalBytes: packets.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { TCP: packets.length }, linkTypes: [1], decodedPackets: packets.length,
+      },
+    })
+
+  it("a login POST with credential fields is CONFIRMED with field-level evidence and a REDACTED password", () => {
+    const a = run([httpPacket(
+      "POST /login/login_results.asp HTTP/1.1\r\nHost: vbsca.ca\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nuser=admin&pass=s3cr3t&submit=Login",
+    )])
+    const t = a.threats.find((x) => x.ruleId === "HTTP-CREDS-001")
+    expect(t).toBeDefined()
+    expect(t!.status).toBe("CONFIRMED")
+    expect(t!.evidenceQuality).toBe("HIGH")
+    expect(t!.confidence).toBe(100)
+    expect(t!.payloadConfirmed).toBe(true)
+    // Structured evidence: method, path, field names, content type, transport.
+    expect(t!.evidence).toContain("method POST /login/login_results.asp")
+    expect(t!.evidence).toContain('username field user="admin"')
+    expect(t!.evidence).toContain('password field pass="[REDACTED]"')
+    expect(t!.evidence).toContain("Content-Type application/x-www-form-urlencoded")
+    expect(t!.evidence).toContain("transport HTTP (unencrypted)")
+    // The password VALUE must never leave the detector.
+    expect(t!.evidence).not.toContain("s3cr3t")
+    expect(JSON.stringify(t!.evidence)).not.toContain("s3cr3t")
+    const cred = a.credentials[0]
+    expect(cred.usernameField).toBe("user")
+    expect(cred.passwordField).toBe("pass")
+    expect(cred.path).toBe("/login/login_results.asp")
+    expect(cred.method).toBe("POST")
+    expect(cred.contentType).toBe("application/x-www-form-urlencoded")
+  })
+
+  it("a POST to a /login/ URL with NO credential-like field never fires (QA: the oncemore detector must not trigger on URL shape)", () => {
+    const a = run([httpPacket(
+      "POST /login/login_results.asp HTTP/1.1\r\nHost: vbsca.ca\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nfoo=bar&x=1&remember=yes",
+    )])
+    expect(a.threats.filter((x) => x.ruleId === "HTTP-CREDS-001")).toHaveLength(0)
+    expect(a.job.riskScore).toBe(0)
+  })
+
+  it("a GET to a login page with no fields never fires", () => {
+    const a = run([httpPacket(
+      "GET /login/login.asp HTTP/1.1\r\nHost: vbsca.ca\r\n\r\n",
+    )])
+    expect(a.threats).toHaveLength(0)
+  })
+})

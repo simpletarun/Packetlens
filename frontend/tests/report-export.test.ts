@@ -69,7 +69,7 @@ function parseCsv(text: string): string[][] {
   return rows
 }
 
-const HEADER = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,lossPct"
+const HEADER = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct"
 
 describe("report export data layer parity — every capture must feed the export the same numbers the engine computed", () => {
   const files = corpusFiles()
@@ -154,16 +154,18 @@ describe("flows CSV artifact — the exported file must mirror the engine flows 
     const parsed = await parsePcap(readFileSync(file))
     const a = analyzePcap(parsed)
     const csv = buildFlowsCsv(a.flows, new Map(), a.packets)
-    expect.soft(csv.startsWith("\uFEFF" + HEADER), `${name}: BOM + exact header`).toBe(true)
+    expect.soft(csv.startsWith("\uFEFF# PacketLens "), `${name}: BOM + build-identity comment`).toBe(true)
+    expect.soft(csv.includes("\n" + HEADER), `${name}: header row after comment`).toBe(true)
     const rows = parseCsv(csv)
-    expect.soft(rows.length, `${name}: row count`).toBe(a.flows.length + 1)
-    expect.soft(rows[0].join(","), `${name}: header row`).toBe(HEADER)
+    expect.soft(rows.length, `${name}: row count`).toBe(a.flows.length + 2)
+    expect.soft(rows[0].join(","), `${name}: comment row`).toContain("PacketLens")
+    expect.soft(rows[1].join(","), `${name}: header row`).toBe(HEADER)
     const totalLen = a.packets.reduce((s, p) => s + (p.length || 0), 0)
     let csvBytes = 0
     const flows = a.flows
     for (let i = 0; i < flows.length; i++) {
       const f = flows[i]
-      const r = rows[i + 1]
+      const r = rows[i + 2]
       const idx = (ip: string) => (ip === "\u2014" ? "Undecoded/unknown endpoint" : ip)
       // CSV rows are direction-normalized to the conversation INITIATOR
       // (SYN sender for TCP, else first observed packet; canonical order kept

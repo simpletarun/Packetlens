@@ -151,6 +151,14 @@ export interface AnalysisCredential {
    *  the report's HTTP table shows (QA: alerts cited only raw IPs, so a
    *  finding on 23.155.129.172 could not be correlated to vbsca.ca). */
   host?: string
+  /** Field-level evidence: the request line (method + path), the form
+   *  Content-Type, and the NAMES of the matched credential fields — the
+   *  report prints these, plus the username, but NEVER the password value. */
+  method?: string
+  path?: string
+  contentType?: string
+  usernameField?: string
+  passwordField?: string
 }
 
 export interface AnalysisCertificate {
@@ -183,6 +191,11 @@ export interface AnalysisThreat {
   // OBSERVED. MITRE mappings require LIKELY or CONFIRMED. Absent on legacy
   // results (treated as CONFIRMED for compatibility).
   status?: ThreatStatus
+  // Evidence quality — deliberately separate from the numeric confidence:
+  // a finding can be CONFIRMED with very high evidence quality (payload
+  // proof) while its numeric confidence stays a detector calibration
+  // (QA: "CONFIRMED but 75%?" — the report now shows both dimensions).
+  evidenceQuality?: "LOW" | "MEDIUM" | "HIGH"
   // Evidence provenance: the exact packets that triggered the finding (first
   // few, ascending; count lives in the evidence text). Absent for behavioral
   // aggregates (DNS tunnel, beacon) that span many packets.
@@ -1014,13 +1027,24 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
     if (body && !/multipart\/form-data/i.test(head)) pairs.push(...parseFormPairs(body))
 
     // 'bypass'/'compass'/'surpass' keys contain "pass" but are not passwords.
+    // Field names are REQUIRED evidence — a bare POST to /login/ with no
+    // credential-like field never fires (QA: oncemore.pcapng's login POST
+    // had to prove itself by carrying user=admin + a password field).
     let user: string | undefined
+    let userField: string | undefined
     let pass: string | undefined
+    let passField: string | undefined
     for (const [key, value] of pairs) {
-      if (/user|login|email/i.test(key)) user = value
-      else if (/pass/i.test(key) && !/bypass|compass|surpass/i.test(key)) pass = value
+      if (/user|login|email/i.test(key)) { user = value; userField = key }
+      else if (/pass/i.test(key) && !/bypass|compass|surpass/i.test(key)) { pass = value; passField = key }
     }
     if (!user && !pass) continue
+    // The user field, the password field or both must be present — the
+    // evidence cites their names, and the password VALUE never leaves the
+    // detector (the report redacts it; QA: field-level evidence demanded).
+    const method = requestLine.split(' ')[0] ?? ''
+    const path = target.split('?')[0] || ''
+    const contentType = (head.match(/Content-Type:\s*([^\r\n]+)/i)?.[1] ?? '').trim()
     creds.push({
       id: `cred-${++idx}`,
       timestamp: safeIso(p.timestamp * 1000),
@@ -1031,6 +1055,9 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
       service: 'HTTP Form',
       packetNum: p.num,
       host: p.httpHost || '',
+      method, path, contentType,
+      usernameField: userField,
+      passwordField: passField,
     })
   }
   return creds
@@ -1518,6 +1545,7 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       signature: 'Port Scan Detected', category: 'Reconnaissance', severity: 3,
       confidence: conf, ruleId: 'PORT-SCAN-001',
       status: e.ports.size >= 50 ? 'LIKELY' : 'SUSPECTED',
+      evidenceQuality: e.ports.size >= 50 ? 'HIGH' : 'MEDIUM',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} scanned ${e.ports.size} ports on ${e.dsts.size} host(s) over ${dur}s (${e.syn} SYN, ${e.rst} RST, ${e.fin} FIN; e.g. ${samples})`,
@@ -1546,6 +1574,7 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       signature: 'SYN Flood Attempt', category: 'Denial of Service', severity: 4,
       confidence: conf, ruleId: 'SYN-FLOOD-001',
       status: e.peakSynPerSec >= 100 ? 'LIKELY' : 'SUSPECTED',
+      evidenceQuality: e.peakSynPerSec >= 100 ? 'HIGH' : 'MEDIUM',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (peak ${e.peakSynPerSec}/s; possible SYN flood)`,
@@ -1572,6 +1601,7 @@ export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, exis
       // Behavioral heuristics are SUSPECTED by definition: they aggregate
       // traffic patterns, not payload proof — "confirmed" would overstate.
       status: 'SUSPECTED',
+      evidenceQuality: 'MEDIUM',
       srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
       protocol: 'TCP', evidence,
     })
@@ -2154,14 +2184,23 @@ export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {})
         timestamp: creds.map((x) => x.timestamp).sort().pop()!,
         signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
         category: isHttp ? 'Credential Theft' : 'Credential Leak',
-        severity: 4, confidence: isHttp ? 75 : 70,
+        severity: 4,
+        // Payload-verified: the plaintext credential bytes were decoded, so
+        // the detector's confidence is maximal and the state is CONFIRMED —
+        // there is no statistical guess in a decoded password field.
+        confidence: 100,
         ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
         // Payload-verified: the plaintext credential bytes were decoded, so
         // this is CONFIRMED evidence, not an inferred pattern.
         status: 'CONFIRMED',
+        evidenceQuality: 'HIGH',
         srcIp: c.srcIp, dstIp: c.dstIp, srcPort: 0, dstPort: 0,
         protocol: c.protocol || 'TCP',
-        evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''} (user: ${c.username})`,
+        // Structured field-level evidence; the PASSWORD VALUE is never
+        // printed — only its field name and presence (QA: report must show
+        // "Credential field detected" with username + field names, redacted
+        // password, content type and transport).
+        evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''}; method ${c.method ?? '?'}${c.path ? ` ${c.path}` : ''}; username field ${c.usernameField ?? '?'}="${c.username}"${c.passwordField ? `, password field ${c.passwordField}="[REDACTED]"` : ''}; ${c.contentType ? `Content-Type ${c.contentType}; ` : ''}transport ${isHttp ? 'HTTP' : c.protocol || 'TCP'} (unencrypted)`,
         packetNums: [...new Set(creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))],
         // Credentials exist only because payload content was decoded: this is
         // payload proof, not port inference.
@@ -2319,6 +2358,16 @@ export function analysisProblems(a: AnalysisResult): string[] {
   const flowIds = new Set(a.flows.map((f) => f.id))
   for (const t of a.threats) {
     if (t.flowId !== undefined && !flowIds.has(t.flowId)) fail(`threat ${t.id}: flowId ${t.flowId} does not exist`)
+    const STATUSES = ["OBSERVED", "SUSPECTED", "LIKELY", "CONFIRMED"]
+    if (t.status !== undefined && !STATUSES.includes(t.status)) fail(`threat ${t.id}: status ${t.status} not in enum`)
+    const EVIDENCE = ["LOW", "MEDIUM", "HIGH"]
+    if (t.evidenceQuality !== undefined && !EVIDENCE.includes(t.evidenceQuality)) fail(`threat ${t.id}: evidenceQuality ${t.evidenceQuality} not in enum`)
+    // CONFIRMED is a claim of payload proof — it must carry decoder evidence
+    // (QA: the credential finding is CONFIRMED only because the plaintext
+    // fields were decoded from the wire; a rule firing is never proof).
+    if (t.status === "CONFIRMED" && t.payloadConfirmed !== true) {
+      fail(`threat ${t.id}: CONFIRMED status without payloadConfirmed evidence`)
+    }
     for (const num of t.packetNums ?? []) {
       if (!Number.isInteger(num) || num < 1 || num > n) {
         fail(`threat ${t.id}: packetNum ${num} out of range 1..${n}`)

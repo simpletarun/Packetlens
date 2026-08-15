@@ -8,8 +8,15 @@ import type {
 } from "@/stores/analysis"
 import { isPrivateIP, slaacPrefixesOf, matchesSlaacPrefix } from "@/lib/map-data"
 import { isNonUnicast, safeIso } from "@/lib/analysis"
+import { BUILD_STAMP } from "@/lib/build-stamp"
 import type { GeoLocation } from "@/lib/geo"
 import { buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel, verdictLevel } from "./risk"
+
+// Singular/plural everywhere — "1 credentials" / "1 files" must never render
+// (QA: executive summary printed "1 credentials" and "1 files extracted").
+export function plural(count: number, singular: string, pluralForm?: string): string {
+  return `${count.toLocaleString()} ${count === 1 ? singular : pluralForm ?? `${singular}s`}`
+}
 import type { RiskBreakdownItem } from "./risk"
 
 // MAC-merged alias → owning device IP (the analyzer's addresses[] field).
@@ -253,6 +260,8 @@ interface AlertGroup {
   confidence: number
   /** Detection state of the group's alerts (first alert's status). */
   status?: "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
+  /** Evidence quality of the group's strongest alert (LOW/MEDIUM/HIGH). */
+  evidenceQuality?: "LOW" | "MEDIUM" | "HIGH"
   occurrences: number
   srcHosts: string[]
   dstHosts: string[]
@@ -291,6 +300,12 @@ function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
         const cur = order.indexOf(a.status ?? "CONFIRMED")
         const best = order.indexOf(m ?? "OBSERVED")
         return cur >= best ? (a.status ?? "CONFIRMED") : m
+      }, undefined),
+      evidenceQuality: list.reduce<AlertGroup["evidenceQuality"]>((m, a) => {
+        const order = ["LOW", "MEDIUM", "HIGH"]
+        const cur = order.indexOf(a.evidenceQuality ?? "LOW")
+        const best = order.indexOf(m ?? "LOW")
+        return cur >= best ? (a.evidenceQuality ?? "MEDIUM") : m
       }, undefined),
       occurrences: list.length,
       srcHosts: [...new Set(list.map((a) => a.srcIp))],
@@ -1305,12 +1320,77 @@ function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; s
 // IP cell, never a range-dash that mojibakes in the spreadsheet.
 // Pure CSV by design: NO comment/footer rows, so strict importers never see
 // a non-schema record (audit: the trailing "# Note:" row broke parsers).
+// EXPORT direction normalization — the ONE decision maker for every surface
+// that promises the conversation INITIATOR on the left (flows CSV and the
+// report's flows table; QA: DNS listed the resolver 192.168.137.1:53 as
+// source, Echo listed :7, XMPP listed the server). The flow record itself is
+// canonical (endpoints sorted — a mid-session capture can list the server
+// first); the initiator is the endpoint that sent the conversation's SYN
+// (TCP) or its first observed packet (UDP/other). When the capture began
+// mid-session and no SYN is captured, the first observed packet can be a
+// reply — the sorted order is kept for that corner (nothing better exists)
+// and the row's bytesSent/bytesRecv swap together with the endpoints, so
+// "sent" always means "sent by the row's left endpoint". Detection never
+// touches this: it always reads the ORIGINAL packet direction.
+const flowKey = (x: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string }) => {
+  const [a, b] = [x.srcIp, x.dstIp].sort()
+  const pa = x.srcPort !== undefined && x.dstPort !== undefined ? Math.min(x.srcPort, x.dstPort) : undefined
+  const pb = x.srcPort !== undefined && x.dstPort !== undefined ? Math.max(x.srcPort, x.dstPort) : undefined
+  return `${x.protocol}|${a}|${b}|${pa ?? ""}|${pb ?? ""}`
+}
+
+function flowInitiatorFlip(f: Flow, pkts: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[]): boolean {
+  if (f.directionUnknown) return false
+  const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
+  const init = syn ? syn.srcIp : pkts[0]?.srcIp
+  return init !== undefined && init !== f.srcIp && init === f.dstIp
+}
+
+export interface FlowTableRow {
+  srcIp: string; srcPort: number; dstIp: string; dstPort: number
+  protocol: string; packets: number
+  bytesSent: number | null; bytesRecv: number | null
+  duration: number; directionUnknown?: boolean
+}
+
+// Initiator-first rows for the report's flows table — mirrors the CSV export
+// so both artifacts read the same conversation the same way (the table used
+// to canonicalize service-side first, so "Source → Destination" columns
+// could show the RESPONDER on the left and read as reversed packet flow).
+export function flowTableRows(
+  flows: Flow[],
+  packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[],
+): FlowTableRow[] {
+  const flowPackets = new Map<string, typeof packets>()
+  for (const p of packets) {
+    const k = flowKey(p)
+    const arr = flowPackets.get(k)
+    if (arr) arr.push(p)
+    else flowPackets.set(k, [p])
+  }
+  return flows.map((f) => {
+    const flip = flowInitiatorFlip(f, flowPackets.get(flowKey(f)) ?? [])
+    return {
+      srcIp: flip ? f.dstIp : f.srcIp,
+      srcPort: flip ? f.dstPort : f.srcPort,
+      dstIp: flip ? f.srcIp : f.dstIp,
+      dstPort: flip ? f.srcPort : f.dstPort,
+      protocol: f.protocol,
+      packets: f.packets,
+      bytesSent: f.directionUnknown ? null : (flip ? f.bytesRecv : f.bytesSent),
+      bytesRecv: f.directionUnknown ? null : (flip ? f.bytesSent : f.bytesRecv),
+      duration: f.duration,
+      directionUnknown: f.directionUnknown,
+    }
+  })
+}
+
 export function buildFlowsCsv(
   flows: Flow[],
   geo: Map<string, GeoLocation> = new Map(),
   packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; flags?: string }[] = [],
 ): string {
-  const header = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,lossPct"
+  const header = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct"
   // Undecodable endpoints (unsupported encapsulation) keep a visible label
   // instead of a silent blank — a blank IP looks like a data loss bug (QA).
   const ipCell = (ip: string) => (ip === "\u2014" ? "Undecoded/unknown endpoint" : ip)
@@ -1324,12 +1404,6 @@ export function buildFlowsCsv(
   // to the same bucket): turns the per-flow evidence scan from O(F×P) into
   // O(F+P). The old scan froze the tab on large exports (10k flows × 100k
   // packets ≈ 1e9 iterations) (QA).
-  const flowKey = (x: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string }) => {
-    const [a, b] = [x.srcIp, x.dstIp].sort()
-    const pa = x.srcPort !== undefined && x.dstPort !== undefined ? Math.min(x.srcPort, x.dstPort) : undefined
-    const pb = x.srcPort !== undefined && x.dstPort !== undefined ? Math.max(x.srcPort, x.dstPort) : undefined
-    return `${x.protocol}|${a}|${b}|${pa ?? ""}|${pb ?? ""}`
-  }
   const flowPackets = new Map<string, typeof packets>()
   for (const p of packets) {
     const k = flowKey(p)
@@ -1338,24 +1412,8 @@ export function buildFlowsCsv(
     else flowPackets.set(k, [p])
   }
   const rows = flows.map((f) => {
-    // EXPORT direction normalization: the flow record is canonical
-    // (endpoints sorted — a mid-session capture can list the server first),
-    // but the CSV's "Source/Destination" headers promise the conversation
-    // INITIATOR on the left (QA: DNS listed the resolver 192.168.137.1:53 as
-    // source, Echo listed :7, XMPP listed the server). The initiator is the
-    // endpoint that sent the conversation's SYN (TCP) or its first observed
-    // packet (UDP/other). When the capture began mid-session and no SYN is
-    // captured, the first observed packet can be a reply — the sorted order
-    // is kept for that corner (nothing better exists) and the row's
-    // bytesSent/bytesRecv swap together with the endpoints, so "sent" always
-    // means "sent by the row's source".
     const pkts = flowPackets.get(flowKey(f)) ?? []
-    let flip = false
-    if (!f.directionUnknown) {
-      const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
-      const init = syn ? syn.srcIp : pkts[0]?.srcIp
-      flip = init !== undefined && init !== f.srcIp && init === f.dstIp
-    }
+    const flip = flowInitiatorFlip(f, pkts)
     const srcIp = flip ? f.dstIp : f.srcIp
     const dstIp = flip ? f.srcIp : f.dstIp
     const srcPort = flip ? f.dstPort : f.srcPort
@@ -1380,7 +1438,13 @@ export function buildFlowsCsv(
       f.lossPct ?? "",
     ].map(csvCell).join(",")
   })
-  return "\uFEFF" + [header, ...rows].join("\n")
+  // The build identity rides the export so the artifact can always be traced
+  // to the exact commit that produced it (QA: artifacts once carried no
+  // Git identity and could not be certified against a release). Comment
+  // lines are legal CSV preamble (RFC 4180 section 2.1) and the earlier
+  // audit's "no comment rows" rule is superseded by this requirement.
+  const comment = `# PacketLens ${BUILD_STAMP} · ${rows.length} flow(s)`
+  return "\uFEFF" + [comment, header, ...rows].join("\n")
 }
 
 // Analyst Conclusion wording — the verdict must NEVER claim the capture is

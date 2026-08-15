@@ -2,10 +2,25 @@ import type { NextConfig } from "next";
 import path from "path"
 import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
+import { execSync } from "node:child_process"
 
 // Desktop (Tauri) builds consume a static export — `output: "export"` disallows
 // API routes, so the build script masks src/app/api and sets TAURI_BUILD=1.
 const isTauri = process.env.TAURI_BUILD === "1"
+
+// The exact Git commit this bundle was built from — every report stamps it
+// (PDF cover, appendix, markdown, flows CSV) so an artifact can always be
+// traced to the code that produced it (QA: reports used to show only a
+// content hash of the analyzer sources, which cannot be mapped to a commit).
+// Falls back to the source hash when .git is unavailable (CI artifact
+// without history, source tarball) — the stamp then says src: instead of
+// commit: so it never lies about being a Git build.
+let gitCommit = ""
+try {
+  gitCommit = execSync("git rev-parse HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
+} catch {
+  gitCommit = ""
+}
 
 const csp = [
   "default-src 'self'",
@@ -39,6 +54,7 @@ const nextConfig: NextConfig = {
   // analysis code changes — never two builds claiming the same stamp.
   env: {
     NEXT_PUBLIC_BUILD_TIME: new Date().toISOString(),
+    NEXT_PUBLIC_BUILD_COMMIT: gitCommit,
     NEXT_PUBLIC_BUILD_SRC_HASH: createHash("sha1")
       .update(
         ["src/lib/analysis.ts", "src/lib/report.ts", "src/lib/risk.ts", "src/lib/stats.ts", "src/lib/pcap.ts", "src/lib/geo.ts"]

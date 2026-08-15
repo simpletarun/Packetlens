@@ -152,6 +152,9 @@ export interface AlertEntry {
   /** Detection state from evidence quality (OBSERVED/SUSPECTED/LIKELY/
    *  CONFIRMED). Absent on legacy results (treated as CONFIRMED). */
   status?: "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
+  /** Evidence quality (LOW/MEDIUM/HIGH) — separate from the numeric
+   *  confidence band: CONFIRMED payload-verified findings carry HIGH. */
+  evidenceQuality?: "LOW" | "MEDIUM" | "HIGH"
   payloadConfirmed?: boolean
 }
 

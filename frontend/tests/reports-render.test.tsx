@@ -365,13 +365,13 @@ describe("Reports page render", () => {
     fireEvent.click(screen.getByTitle("Export flows as CSV"))
     const csv = await captured!.text()
     const lines = csv.split("\n")
-    // BOM is pinned at string level in report.test.ts (jsdom's Blob.text()
-    // strips it, so the round-tripped artifact starts at the header).
-    expect(lines[0]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,lossPct")
-    // One real data row per flow; the artifact round-trips through the store.
-    // Pure CSV — no comment/footer rows, so strict importers parse it cleanly.
-    expect(lines).toHaveLength(3)
-    expect(lines[1]).toContain("192.168.1.20,42315,8.8.8.8,443,TCP,5,300,300,600")
-    expect(lines[2]).toContain("8.8.8.8,443,192.168.1.20,42315,TCP,3,,,400")
+    // Build-identity comment rides the export (jsdom's Blob.text() strips
+    // the BOM, so the round-tripped artifact starts at the comment line);
+    // one data row per flow follows.
+    expect(lines[0]).toMatch(/^# PacketLens v\d+\.\d+\.\d+ · (commit|src):.* · 2 flow\(s\)$/)
+    expect(lines[1]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct")
+    expect(lines).toHaveLength(4)
+    expect(lines[2]).toContain("192.168.1.20,42315,8.8.8.8,443,TCP,5,300,300,600")
+    expect(lines[3]).toContain("8.8.8.8,443,192.168.1.20,42315,TCP,3,,,400")
   })
 })
