@@ -259,7 +259,7 @@ export interface AnalysisAdvancedMetrics {
   dnsTunnelEvidence?: string
   beaconEvidence?: string
   topTalkers: { ip: string; bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }[]
-  iocs: { type: string; value: string; description: string; severity: number }[]
+  iocs: { type: string; value: string; description: string; severity: number; ruleId?: string }[]
   mitreMappings: { technique: string; id: string; description: string; severity: number }[]
 }
 
@@ -1413,18 +1413,32 @@ const BENIGN_POLLER_DOMAINS = [
   'windscribe.com',
 ]
 
+// A SYN flood needs flood-level intensity, not just a raw count: 131 SYNs
+// spread over 15 minutes is ordinary outbound client behavior (QA:
+// mic.pcapng 192.168.1.10 — 131 SYNs / 948.6s → 0.14/s, falsely flagged).
+// Local constant, NOT shared/risk-spec.json: that file is shared with the
+// Rust analyzer, whose rule schema has no rate parameter — adding one here
+// would silently diverge from the engine's rule definition.
+export const SYN_FLOOD_MIN_PEAK_RATE = 20
+
 function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
   const threats: AnalysisThreat[] = []
-  const scans = new Map<string, { ports: Set<number>; dsts: Set<string>; syn: number; rst: number; fin: number; first: number; last: number; packetNums: number[] }>()
+  const scans = new Map<string, { ports: Set<number>; dsts: Set<string>; syn: number; rst: number; fin: number; first: number; last: number; packetNums: number[]; synTimes: number[]; peakSynPerSec: number }>()
   for (const p of packets) {
     if (!p.srcIp) continue
-    if (p.dstPort && p.tcpFlags?.includes('SYN')) {
+    if (p.dstPort && p.tcpFlags === 'SYN') {
       // Parity with the Rust engine (PortScanRule over syn_probes): only TCP
-      // SYN probes constitute a port scan. Counting any unique destination
-      // port fired on plain UDP traffic (WebRTC/STUN/NAT traversal).
+      // SYN probes constitute a port scan. A PURE SYN (SYN without ACK) is a
+      // probe — "SYN-ACK" is the other side completing the handshake and is
+      // never a probe. Counting it reversed the finding's direction (the
+      // responder "scanned" the client's ephemeral source ports) and flagged
+      // ordinary conversations as scans (QA: mic.pcapng 46.101.206.53 had 0
+      // pure SYNs, 68 SYN-ACK replies → false PORT-SCAN-001 over 68 client
+      // ephemeral ports). The exact 'SYN' test also excludes flag-games
+      // (SYN|FIN, SYN|RST) from probe counting, matching the scan semantics.
       let e = scans.get(p.srcIp)
       if (!e) {
-        e = { ports: new Set(), dsts: new Set(), syn: 0, rst: 0, fin: 0, first: p.timestamp, last: p.timestamp, packetNums: [] }
+        e = { ports: new Set(), dsts: new Set(), syn: 0, rst: 0, fin: 0, first: p.timestamp, last: p.timestamp, packetNums: [], synTimes: [], peakSynPerSec: 0 }
         scans.set(p.srcIp, e)
       }
       e.ports.add(p.dstPort)
@@ -1436,6 +1450,14 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       e.packetNums.push(p.num)
       e.first = Math.min(e.first, p.timestamp)
       e.last = Math.max(e.last, p.timestamp)
+      // Peak pure-SYN rate over any sliding 1s window (packets arrive in
+      // capture order, timestamps non-decreasing): the flood gate needs the
+      // burst intensity, not the total spread over the whole capture. Every
+      // maximal 1s window ends at some packet's timestamp, so pruning per
+      // packet and keeping the max of the resulting sizes is exact.
+      e.synTimes.push(p.timestamp)
+      while (e.synTimes.length > 1 && e.synTimes[0] < p.timestamp - 1) e.synTimes.shift()
+      if (e.synTimes.length > e.peakSynPerSec) e.peakSynPerSec = e.synTimes.length
     } else if (p.tcpFlags?.includes('RST') || p.tcpFlags?.includes('FIN')) {
       // RST/FIN from a scanner count toward the scan evidence even when the
       // probe handshake was already covered (or the capture missed the SYN).
@@ -1466,9 +1488,13 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
   // blasting SYN segments past the spec threshold is a flood regardless of
   // port spread (spec rule_params.syn_flood_min_syns). The rule existed in
   // risk-spec/risk.ts but the local engine never emitted it (QA: audit —
-  // SYN-FLOOD-001 was dead code on the local path).
+  // SYN-FLOOD-001 was dead code on the local path). The count gate alone
+  // misfired on ordinary clients that made many connections slowly (QA:
+  // mic.pcapng: 131 SYNs over 948.6s = 0.14/s) — flood-level intensity is
+  // the peak pure-SYN rate over any 1s window, and BOTH gates must pass.
   for (const [ip, e] of scans) {
     if (e.syn < RISK_PARAMS.syn_flood_min_syns) continue
+    if (e.peakSynPerSec < SYN_FLOOD_MIN_PEAK_RATE) continue
     const dur = (e.last - e.first).toFixed(1)
     threats.push({
       id: `alert-${threats.length + 1}`,
@@ -1477,7 +1503,7 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
       confidence: 65, ruleId: 'SYN-FLOOD-001',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
-      evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (possible SYN flood)`,
+      evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (peak ${e.peakSynPerSec}/s; possible SYN flood)`,
       packetNums: e.packetNums,
     })
   }
@@ -1865,7 +1891,10 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
 
   const iocs: AnalysisAdvancedMetrics['iocs'] = []
   for (const t of threats) {
-    iocs.push({ type: "threat", value: t.signature, description: t.evidence, severity: t.severity })
+    // ruleId lets the report pair each seeded threat IOC with its fired rule
+    // and dedupe the alert-derived IOC rows (QA: mic.pcapng showed 4 IOCs
+    // for 2 alerts — "threat" ≠ IOC_RULE_TYPE's "port-scan"/"syn-flood").
+    iocs.push({ type: "threat", value: t.signature, description: t.evidence, severity: t.severity, ruleId: t.ruleId })
   }
   if (dnsTunnelingSuspected) {
     iocs.push({ type: "dns-tunneling", value: "Suspicious DNS patterns", description: dnsTunnelEvidence, severity: 3 })

@@ -81,13 +81,31 @@ describe("report consistency \u2014 single canonical analysis", () => {
     expect(r.alerts).toBe(state.alerts)
   })
 
-  it("IOC sources: signature-backed type is CONFIRMED_ALERT; flag types are CONFIRMED when the backing alert fired, else BEHAVIORAL", () => {
+it("IOC sources: signature-backed type is CONFIRMED_ALERT; flag types are CONFIRMED when the backing alert fired, else BEHAVIORAL", () => {
     const r = buildReportAnalysis(state)
     const iocs = new Map(r.iocs.map((i) => [i.type, i.source]))
     expect(iocs.get("threat")).toBe("CONFIRMED_ALERT")
     expect(iocs.get("dns-tunneling")).toBe("BEHAVIORAL_METRIC")
     expect(iocSource("beaconing", [beaconAlert])).toBe("CONFIRMED_ALERT")
     expect(iocSource("beaconing", [portScanAlert])).toBe("BEHAVIORAL_METRIC")
+  })
+
+  it("one IOC row per fired alert — alert-derived IOCs dedupe against the seeded threat IOC (QA: mic.pcapng showed 4 IOCs for 2 alerts)", () => {
+    const r = buildReportAnalysis(state)
+    // Fixture's seeded threat IOC predates the ruleId field: the signature
+    // match must still stop the alert-only pass from appending a second row.
+    const portScanRows = r.iocs.filter((i) => i.value === "TCP Port Scan Detected")
+    expect(portScanRows).toHaveLength(1)
+    expect(portScanRows[0].source).toBe("CONFIRMED_ALERT")
+  })
+
+  it("ruleId-keyed seeded IOCs dedupe the alert-only pass on fresh analyses", () => {
+    const r = buildReportAnalysis({
+      ...state,
+      advancedMetrics: { ...advancedMetrics, iocs: [{ type: "threat", value: "Port Scan Detected", description: "28 unique ports scanned", severity: 3, ruleId: "PORT-SCAN-001" }] },
+    })
+    const portScanRows = r.iocs.filter((i) => i.ruleId === "PORT-SCAN-001")
+    expect(portScanRows).toHaveLength(1)
   })
 
   it("IOC, MITRE and alert severities agree for the same finding (alert severity is canonical)", () => {
@@ -957,9 +975,10 @@ describe("analystConclusion � the verdict must never call a capture clean whil
     expect(text).not.toContain("No suspicious indicators")
   })
 
-  it("pluralizes the alert count", () => {
+it("pluralizes the alert count and names EVERY fired rule (QA: mic.pcapng hid the SYN flood behind 'Port Scan Detected')", () => {
     const text = analystConclusion({ ...base, alerts: [{ signature: "A" }, { signature: "B" }], score: 0 })
-    expect(text).toContain("2 confirmed findings detected (A)")
+    expect(text).toContain("2 confirmed findings detected (A; B)")
+    expect(text).not.toContain("detected (A).")
   })
 
   it("uses the configured-rules wording when zero alerts fire and no score-driven branch matches", () => {

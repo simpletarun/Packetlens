@@ -209,8 +209,12 @@ describe("burst semantics — unevaluable bursts stay null and never boost risk"
 
 describe("alert deduplication — one event, one alert, counts kept as evidence", () => {
   const hex = (s: string) => Buffer.from(s, "latin1").toString("hex")
-  const synPkt = (i: number, dstPort: number, srcIp = "10.0.0.5") =>
-    makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp, dstIp: "8.8.8.8", dstPort, tcpFlags: "SYN" })
+  const synPkt = (i: number, dstPort: number, srcIp = "10.0.0.5", ts = 1000000 + i) =>
+    makePacket({ num: i + 1, timestamp: ts, srcIp, dstIp: "8.8.8.8", dstPort, tcpFlags: "SYN" })
+  // A flood needs burst intensity (SYN-FLOOD-001 requires a ≥20 SYNs/s peak
+  // in addition to the ≥100-SYN count) — the "many SYNs" fixtures must all
+  // land inside a couple of seconds, or they read as a slow client.
+  const burstTs = (i: number) => 1000000 + Math.floor(i / 50)
   const httpPacket = (payload: string, overrides: Partial<ParsedPacket> = {}): ParsedPacket =>
     makePacket({
       num: 1,
@@ -240,12 +244,30 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
     })
 
   it("150 SYNs to ONE port = a single SYN-FLOOD-001, not 150 alerts", () => {
-    const a = run(Array.from({ length: 150 }, (_, i) => synPkt(i, 443)))
+    const a = run(Array.from({ length: 150 }, (_, i) => synPkt(i, 443, "10.0.0.5", burstTs(i))))
     const floods = a.threats.filter((t) => t.ruleId === "SYN-FLOOD-001")
     expect(floods).toHaveLength(1)
     expect(floods[0].evidence).toContain("150 SYN")
+    expect(floods[0].evidence).toContain("peak 100/s")
     expect(a.threats.filter((t) => t.ruleId === "PORT-SCAN-001")).toHaveLength(0)
     expect(a.job.alerts).toBe(a.threats.length)
+  })
+
+  it("SYN-ACK replies are handshake responses, never scan probes (QA: mic.pcapng server-side reply burst)", () => {
+    // A server answering 68 distinct client ephemeral ports (69 HTTPS
+    // conversations) must NOT read as "the server scanned 68 ports" — the
+    // ports belong to the clients' side of each conversation. Timestamps are
+    // irregular and the responders vary so no beacon cadence forms either.
+    const a = run(Array.from({ length: 68 }, (_, i) =>
+      makePacket({ num: i + 1, timestamp: 1000000 + i * 7 + (i % 3) * 2.5, srcIp: "46.101.206.53", dstIp: ["192.168.1.10", "192.168.1.11", "192.168.1.12"][i % 3] ?? "192.168.1.10", srcPort: 443, dstPort: 1043 + i, tcpFlags: "SYN-ACK" })))
+    expect(a.threats.filter((t) => t.ruleId === "PORT-SCAN-001")).toHaveLength(0)
+    expect(a.threats.filter((t) => t.ruleId === "SYN-FLOOD-001")).toHaveLength(0)
+    expect(a.job.riskScore).toBe(0)
+  })
+
+  it("120 SYNs spread over 2 minutes are NOT a SYN flood (QA: mic.pcapng 131 SYNs / 948.6s)", () => {
+    const a = run(Array.from({ length: 120 }, (_, i) => synPkt(i, 443, "192.168.1.10")))
+    expect(a.threats.filter((t) => t.ruleId === "SYN-FLOOD-001")).toHaveLength(0)
   })
 
   it("25 SYNs to 25 ports = a single PORT-SCAN-001 with the port count", () => {
@@ -266,7 +288,7 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
 
   it("no two displayed threats share (ruleId, srcIp, dstIp)", () => {
     const a = run([
-      ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443)),
+      ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443, "10.0.0.5", burstTs(i))),
       ...Array.from({ length: 25 }, (_, i) => synPkt(150 + i, 2000 + i)),
     ])
     const keys = new Set(a.threats.map((t) => `${t.ruleId}|${t.srcIp}|${t.dstIp}`))
@@ -275,7 +297,7 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
 
   it("provenance: findings cite the exact triggering packet numbers", () => {
     const a = run([
-      ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443)),
+      ...Array.from({ length: 150 }, (_, i) => synPkt(i, 443, "10.0.0.5", burstTs(i))),
       ...Array.from({ length: 25 }, (_, i) => synPkt(150 + i, 2000 + i, "10.0.0.6")),
     ])
     const flood = a.threats.find((t) => t.ruleId === "SYN-FLOOD-001")!
@@ -1691,22 +1713,28 @@ describe("v3.2 QA regression fixes", () => {
     expect(analysis.threats.find((t) => t.ruleId === "C2-BEACON-001")).toBeDefined()
   })
 
-  it("SYN-FLOOD-001 fires only past the 100-SYN threshold (QA: rule was dead code locally)", () => {
+  it("SYN-FLOOD-001 fires only past the 100-SYN count AND the 20-SYNs/s peak gate (QA: rule was dead code locally)", () => {
     const t0 = 1_700_000_000
-    const mk = (n: number) => {
+    const mk = (n: number, spread: boolean) => {
       const packets: ParsedPacket[] = []
       for (let i = 0; i < n; i++) {
-        packets.push(makePacket({ num: i + 1, timestamp: t0 + i, srcIp: "10.0.0.50", dstIp: "8.8.8.8", srcPort: 40000 + (i % 100), dstPort: 80, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+        packets.push(makePacket({ num: i + 1, timestamp: spread ? t0 + i : t0 + Math.floor(i / 50), srcIp: "10.0.0.50", dstIp: "8.8.8.8", srcPort: 40000 + (i % 100), dstPort: 80, tcpFlags: "SYN", tcpSeq: 1000 + i }))
       }
       return analyzePcap(mkResult(packets))
     }
-    const under = mk(99)
+    const under = mk(99, false)
     expect(under.threats.find((t) => t.ruleId === "SYN-FLOOD-001")).toBeUndefined()
-    const over = mk(100)
+    // 100+ SYNs but spread 1/s: a slow client, never a flood (the regular
+    // cadence may legitimately trip the C2 beacon rule — that is a separate
+    // finding, and not what this test asserts).
+    const spread = mk(100, true)
+    expect(spread.threats.find((t) => t.ruleId === "SYN-FLOOD-001")).toBeUndefined()
+    const over = mk(100, false)
     const t = over.threats.find((x) => x.ruleId === "SYN-FLOOD-001")
     expect(t).toBeDefined()
     expect(t!.severity).toBe(4)
     expect(t!.evidence).toContain("100 SYN packets")
+    expect(t!.evidence).toContain("peak 100/s")
     expect(over.job.riskScore).toBeGreaterThan(0)
   })
 

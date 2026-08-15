@@ -172,7 +172,7 @@ export interface AdvancedMetrics {
   portScanEnhanced: boolean
   ja3Suspicious: boolean
   topTalkers: { ip: string; bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }[]
-  iocs: { type: string; value: string; description: string; severity: number }[]
+  iocs: { type: string; value: string; description: string; severity: number; ruleId?: string }[]
   mitreMappings: { technique: string; id: string; description: string; severity: number }[]
 }
 

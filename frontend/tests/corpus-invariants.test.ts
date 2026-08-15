@@ -3,7 +3,7 @@ import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import { parsePcap } from "@/lib/pcap"
-import { analyzePcap } from "@/lib/analysis"
+import { analyzePcap, SYN_FLOOD_MIN_PEAK_RATE } from "@/lib/analysis"
 import { buildReportAnalysis, dnsLookupCount, analystConclusion } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel, verdictLevel } from "@/lib/risk"
@@ -229,14 +229,34 @@ async function audit(file: string, display: string) {
   const synCounts = new Map<string, number>()
   const synPorts = new Map<string, Set<number>>()
   const synDsts = new Map<string, Set<string>>()
+  const synTimes = new Map<string, number[]>()
   for (const p of pkts) {
-    if (p.srcIp && p.tcpFlags?.includes("SYN")) {
+    // Detector parity: only PURE SYNs (SYN without ACK) are probes — a
+    // "SYN-ACK" is a handshake reply, never a scan/flood probe.
+    if (p.srcIp && p.tcpFlags === "SYN") {
       synCounts.set(p.srcIp, (synCounts.get(p.srcIp) ?? 0) + 1)
       if (!synPorts.has(p.srcIp)) synPorts.set(p.srcIp, new Set())
       synPorts.get(p.srcIp)!.add(p.dstPort ?? 0)
       if (!synDsts.has(p.srcIp)) synDsts.set(p.srcIp, new Set())
       if (p.dstIp) synDsts.get(p.srcIp)!.add(p.dstIp)
+      if (!synTimes.has(p.srcIp)) synTimes.set(p.srcIp, [])
+      synTimes.get(p.srcIp)!.push(p.timestamp)
     }
+  }
+  // Peak pure-SYN count inside any 1s window per source (sliding window over
+  // sorted timestamps) — the flood rule's intensity gate, checked against
+  // the same constant the detector uses.
+  const synPeakPerSec = new Map<string, number>()
+  for (const [ip, times] of synTimes) {
+    times.sort((a, b) => a - b)
+    let hi = 0
+    let lo = 0
+    let peak = 0
+    for (; hi < times.length; hi++) {
+      while (times[lo] < times[hi] - 1) lo++
+      if (hi - lo + 1 > peak) peak = hi - lo + 1
+    }
+    synPeakPerSec.set(ip, peak)
   }
   const expectTor = pkts.some((p) => (p.srcIp ?? "").startsWith("185.220.101.") || (p.dstIp ?? "").startsWith("185.220.101."))
 
@@ -288,7 +308,9 @@ async function audit(file: string, display: string) {
       }
     }
     if (t.ruleId === "SYN-FLOOD-001") {
+      // Both gates must hold: ≥100 pure SYNs AND a ≥20-SYNs/s 1s-window peak.
       expect.soft([...synCounts.values()].some((c) => c >= 100), `${display}: syn flood threshold`).toBe(true)
+      expect.soft([...synPeakPerSec.values()].some((r) => r >= SYN_FLOOD_MIN_PEAK_RATE), `${display}: syn flood peak rate`).toBe(true)
     }
   }
   expect.soft(a1.advancedMetrics.torVpnProxyDetected, `${display}: tor parity`).toBe(expectTor)
@@ -300,8 +322,8 @@ async function audit(file: string, display: string) {
     // mime has exactly one '/' and no whitespace or header-name residue.
     expect.soft(/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(f.mimeType), `${display}: file mime well-formed (${f.mimeType})`).toBe(true)
   }
-  const floodSrcs = [...synCounts.entries()].filter(([, c]) => c >= 100).map(([ip]) => ip)
-  expect.soft(floodSrcs.length === 0 || a1.threats.some((t) => t.ruleId === "SYN-FLOOD-001"), `${display}: 100+ SYNs => SYN-FLOOD-001`).toBe(true)
+  const floodSrcs = [...synCounts.entries()].filter(([ip, c]) => c >= 100 && (synPeakPerSec.get(ip) ?? 0) >= SYN_FLOOD_MIN_PEAK_RATE).map(([ip]) => ip)
+  expect.soft(floodSrcs.length === 0 || a1.threats.some((t) => t.ruleId === "SYN-FLOOD-001"), `${display}: 100+ SYNs at flood rate => SYN-FLOOD-001`).toBe(true)
 
   // Definite-assignment (no null union): TS narrows a `let x: T | null = null`
   // that is assigned only inside a callback to `never` after the call.

@@ -470,7 +470,7 @@ export default function ReportsPage() {
       packets.some((p) => p.dstPort === 5222 || p.appProtocol === "XMPP") &&
       (dns.some((d) => /mmx-ds\.whatsapp\.net|(^|\.)whatsapp\.(com|net)$/i.test(d.query)) ||
         tls.some((t) => /mmx-ds\.whatsapp\.net|(^|\.)whatsapp\.(com|net)$/i.test(t.sni || "")))
-    if (whatsappLike) obs.push("WhatsApp-style messaging detected (XMPP + STUN + WhatsApp chat/media domains)")
+    if (whatsappLike) obs.push("WhatsApp-related traffic observed (XMPP on port 5222 — port-inferred, not payload-verified — plus STUN and WhatsApp chat/media domains); no message or session content was reconstructed")
     if (packets.some((p) => (p.srcIp || "").includes(":") || (p.dstIp || "").includes(":"))) obs.push("IPv6 communication")
     // Multicast/broadcast requires DECODED addresses — undecodable packets
     // carry the "—" placeholder, which must not count as multicast (QA:
@@ -492,7 +492,7 @@ export default function ReportsPage() {
       const os = osFromUserAgent(h.userAgent || "")
       if (os) uaOses.add(os)
     }
-    if (uaOses.size > 0) obs.push(`Client OS fingerprint${uaOses.size > 1 ? "s" : ""} from HTTP User-Agent: ${[...uaOses].sort().join(", ")}`)
+    if (uaOses.size > 0) obs.push(`HTTP User-Agent${uaOses.size > 1 ? "s" : ""} consistent with ${[...uaOses].sort().join(", ")} (application/stack clue — the User-Agent is not a definitive OS fingerprint)`)
     // CRL/OCSP endpoints of Microsoft/DigiCert/Google trust stores: routine
     // background cert validation on Windows hosts, not suspicious activity.
     if (tls.some((t) => /(^|\.)ctldl\.windowsupdate\.com$|\.c\.lencr\.org$|(^|\.)crl\d*\.digicert\.com$|ocsp\.\w+\.(digicert\.com|pki\.goog|msocsp\.com)/i.test(t.sni || ""))) {
@@ -502,18 +502,23 @@ export default function ReportsPage() {
     // verdict next to 66.7% loss reads as "loss is fine" (QA). These are
     // observations, not findings — the verdict stays risk-based.
     const tcpFlowsAll = flows.filter((f) => f.protocol === "TCP")
-    const lossyFlows = tcpFlowsAll.filter((f) => (f.retrans ?? 0) > 0)
+    // Parity with the TCP Health card: "with measurements" = the subset that
+    // captured a handshake or recorded at least one health signal — never
+    // every TCP flow (QA: mic.pcapng showed "48 of 152" next to the card's
+    // "150 flows with measurements", two denominators for one number).
+    const measuredTcp = tcpFlowsAll.filter((f) => typeof f.rttMs === "number" || f.retrans || f.ooo || f.zeroWindow || f.rstCount)
+    const lossyFlows = measuredTcp.filter((f) => (f.retrans ?? 0) > 0)
     if (lossyFlows.length > 0) {
       const worst = [...lossyFlows].sort((a, b) => (b.lossPct ?? 0) - (a.lossPct ?? 0))[0]
       const rsts = tcpFlowsAll.filter((f) => (f.rstCount ?? 0) > 0).length
       const high = lossyFlows.filter((f) => (f.lossPct ?? 0) >= 20).length
-      obs.push(`Network health: ${lossyFlows.length} of ${tcpFlowsAll.length} TCP flows show packet loss or retransmission (worst ${worst.lossPct}% to ${worst.dstIp}${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} flow${rsts === 1 ? "" : "s"} reset by RST` : ""}) — no detection rule triggered`)
+      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% to ${worst.dstIp}${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST` : ""}) — no detection rule triggered`)
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
     // must (QA: frames #1/#3 and #2/#4 identical ACKs went unmentioned).
     if (duplicateFrames > 0) {
-      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} (identical source/destination/length/sequence) — consistent with a double-capture artifact; consider de-duplicating the capture before re-analysis`)
+      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} (identical source/destination/length/sequence) — consistent with a double-capture artifact. Detections and the risk score are computed on the raw frame set, including these duplicates, and may be affected; de-duplicate the capture before relying on a final verdict`)
     }
     return obs
   }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames])
@@ -1719,7 +1724,7 @@ export default function ReportsPage() {
                   </CardContent>
                 </Card>
                 <Card>
-                  <CardHeader><CardTitle className="text-sm">Top Countries (by destination traffic)</CardTitle></CardHeader>
+                  <CardHeader><CardTitle className="text-sm">Top Countries (packet-direction: by each packet&rsquo;s destination)</CardTitle></CardHeader>
                   <CardContent className="space-y-2">
                     {topCountries.length === 0 && <p className="text-xs text-muted-foreground">{stats.externalIps === 0 ? "Countries resolved: 0 — no public IP addresses found (nothing to geolocate)" : jobInfo?.geoDbVersion ? "Countries resolved: 0 — captured public IPs have no location entries in the installed database" : "Countries resolved: 0 — GeoIP database unavailable. Install the bundled DB-IP City Lite database to enable country analysis"}</p>}
                     {topCountries.length > 0 && (
@@ -1748,6 +1753,7 @@ export default function ReportsPage() {
                       </table>
                     )}
                     {topCountries.length < allCountries.length && <p className="text-[10px] text-muted-foreground pt-1">+{allCountries.length - topCountries.length} more countries (top {topCountries.length} shown)</p>}
+                    <p className="text-[10px] text-muted-foreground pt-1">Methodology: each packet is counted once, by its destination address&rsquo;s country (the destination leg of each conversation). The CSV export&rsquo;s dstCountry column totals whole conversations including both directions, so its country sums are larger than these packet counts by design — the two artifacts are not directly comparable.</p>
                   </CardContent>
                 </Card>
               </div>

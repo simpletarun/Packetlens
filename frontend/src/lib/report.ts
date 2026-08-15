@@ -1336,7 +1336,12 @@ export function analystConclusion(opts: {
     return `Only ${opts.decodeRatePct}% of packets could be decoded — the capture uses unsupported encapsulation (${opts.encapName}), so lengths and timestamps parsed but no headers did. No verdict is possible on undecodable traffic; re-capture with Ethernet encapsulation (or an explicit DLT override) and re-analyze.`
   }
   if (opts.alerts.length > 0) {
-    const head = `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${opts.alerts[0].signature}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+    // Every fired rule is named — the old text cited only the first alert
+    // (QA: mic.pcapng concluded "2 confirmed findings detected (Port Scan
+    // Detected)", hiding the SYN flood). "Confirmed" means a configured rule
+    // fired; each alert's evidence states how definitive the finding is.
+    const names = opts.alerts.map((a) => a.signature).join("; ")
+    const head = `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${names}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.
@@ -1394,7 +1399,7 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
   })
 
   const iocs: IocFinding[] = (advancedMetrics?.iocs ?? []).map((i) => {
-    const ruleId = IOC_TO_RULE[i.type]
+    const ruleId = i.ruleId ?? IOC_TO_RULE[i.type]
     const group = ruleId ? enriched.find((g) => g.ruleId === ruleId) : undefined
     return {
       ...i,
@@ -1409,10 +1414,16 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
   })
 
   // Alert-only IOCs: rules that fired but have no pre-seeded metric IOC entry.
+  // The dedup must key on the RULE and the alert, not just the type: the
+  // metrics module seeds threat IOCs with type "threat" while IOC_RULE_TYPE
+  // maps the same rule to "port-scan"/"syn-flood", so the type check alone
+  // doubled every alert into two IOC rows (QA: mic.pcapng showed 4 IOCs for
+  // 2 alerts). ruleId covers fresh analyses; the signature match covers
+  // legacy persisted results whose seeded IOCs predate the ruleId field.
   for (const g of enriched) {
     const type = IOC_RULE_TYPE[g.ruleId]
     if (!type) continue
-    if (iocs.some((i) => i.type === type)) continue
+    if (iocs.some((i) => i.ruleId === g.ruleId || i.type === type || i.value === g.signature)) continue
     iocs.push({
       type,
       value: shortAlertName(g.signature),
