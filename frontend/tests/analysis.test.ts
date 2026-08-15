@@ -1958,3 +1958,70 @@ describe("v3.2 QA regression fixes", () => {
     expect(t?.evidence).not.toMatch(/2401:4900/)
   })
 })
+
+describe("direction regression tests (QA: Test A/B/C) — detection reads the wire, not the display", () => {
+  const run = (packets: ParsedPacket[]) =>
+    analyzePcap({
+      packets,
+      stats: {
+        totalPackets: packets.length,
+        totalBytes: packets.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { TCP: packets.length },
+        linkTypes: [1], decodedPackets: packets.length,
+      },
+    })
+  const client = "192.168.1.10"
+  const server = "8.8.8.8"
+
+// Test A — normal outbound HTTPS browsing: client connects to ONE port,
+  // completes handshakes, exchanges data. Timestamps carry real browsing
+  // jitter so the cadence never reads as beaconing. Must produce zero alerts.
+  it("Test A: normal outbound HTTPS browsing produces zero alerts", () => {
+    const packets: ParsedPacket[] = []
+    for (let i = 0; i < 20; i++) {
+      // Irregular arrival offsets (2-7s gaps) — a machine-perfect cadence
+      // would legitimately trip C2-BEACON-001, so the fixture must not be one.
+      const base = i * 4 + (i * 7) % 5
+      const t = 1000000 + base
+      packets.push(makePacket({ num: base + 1, timestamp: t, srcIp: client, dstIp: server, srcPort: 50000 + i, dstPort: 443, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+      packets.push(makePacket({ num: base + 2, timestamp: t + 1, srcIp: server, dstIp: client, srcPort: 443, dstPort: 50000 + i, tcpFlags: "SYN-ACK", tcpSeq: 9000 + i, tcpAck: 1001 + i }))
+      packets.push(makePacket({ num: base + 3, timestamp: t + 2, srcIp: client, dstIp: server, srcPort: 50000 + i, dstPort: 443, tcpFlags: "ACK", tcpSeq: 1001 + i, tcpAck: 9001 + i }))
+      packets.push(makePacket({ num: base + 4, timestamp: t + 3, srcIp: client, dstIp: server, srcPort: 50000 + i, dstPort: 443, tcpFlags: "PSH ACK", tcpSeq: 1001 + i, tcpAck: 9001 + i, appProtocol: "TLS", payload: "160301" }))
+    }
+    const a = run(packets)
+    expect(a.threats).toHaveLength(0)
+    expect(a.job.riskScore).toBe(0)
+  })
+
+  // Test B — genuine scan: server SYN-probes 24 client ports. The ALERT must
+  // name the attacker (8.8.8.8) and the probed ports, exactly as in a real
+  // scan report — detection never flips to "client scanned the server".
+  it("Test B: inbound SYN sweep probes the attacker and the probed ports", () => {
+    const packets: ParsedPacket[] = []
+    for (let i = 0; i < 24; i++) {
+      packets.push(makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp: server, dstIp: client, srcPort: 4000 + i, dstPort: 22 + i, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+    }
+    const a = run(packets)
+    const scan = a.threats.find((t) => t.ruleId === "PORT-SCAN-001")
+    expect(scan).toBeDefined()
+    expect(scan!.srcIp).toBe(server)
+    expect(scan!.evidence).toContain("24 ports")
+    expect(scan!.evidence).toContain("on 1 host(s)")
+    expect(scan!.status).toBe("SUSPECTED")
+    expect(a.threats.filter((t) => t.ruleId === "SYN-FLOOD-001")).toHaveLength(0)
+  })
+
+  // Test C — client connects OUT to many ports on one server (20 ports): a
+  // client can legitimately reach many services; only inbound sweeps against
+  // ONE host read as a scan. Detection must not fire on the client either way.
+  it("Test C: client probing 20 ports outbound is not an alert", () => {
+    const packets: ParsedPacket[] = []
+    for (let i = 0; i < 20; i++) {
+      packets.push(makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp: client, dstIp: server, srcPort: 50000, dstPort: 1000 + i, tcpFlags: "SYN", tcpSeq: 1000 + i }))
+      packets.push(makePacket({ num: 21 + i, timestamp: 1000000 + i + 1, srcIp: server, dstIp: client, srcPort: 1000 + i, dstPort: 50000, tcpFlags: "SYN-ACK", tcpSeq: 9000 + i, tcpAck: 1001 + i }))
+    }
+    const a = run(packets)
+    expect(a.threats.filter((t) => t.ruleId === "PORT-SCAN-001")).toHaveLength(0)
+  })
+})

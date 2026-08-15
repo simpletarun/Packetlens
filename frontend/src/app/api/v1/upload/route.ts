@@ -90,7 +90,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     if (parseResult.stats.totalPackets === 0) {
       return NextResponse.json({ error: 'No packets found in capture file' }, { status: 400 })
     }
-    const analysisResult = analyzePcap(parseResult)
+    // Dedupe consecutive duplicate frames BEFORE any detection or risk
+    // scoring (double-capture artifacts must never inflate flows, SYN counts
+    // or rates); raw/duplicate/analyzed counts ride on the job for the report.
+    const analysisResult = analyzePcap(parseResult, { dedupe: true })
     analysisResult.devices = enrichDeviceVendors(analysisResult.devices)
     analysisResult.job.id = crypto.randomUUID()
     analysisResult.job.filename = sanitizeFilename(file.name)

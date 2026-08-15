@@ -18,7 +18,7 @@ import { Button } from "@/components/ui/button"
 import {
   Download, FileText, AlertTriangle, Globe, Shield, ShieldAlert, Monitor,
   Package, GitFork, MessagesSquare, FolderOpen, Key, Verified, BarChart3, History, Zap,
-  Phone
+  Phone, Compass
 } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 import type { AlertEntry } from "@/stores/analysis"
@@ -255,7 +255,20 @@ export default function ReportsPage() {
   // is visible, not hidden (QA: rule text promised exclusion while UDP/40714
   // kept 159 pkts from 49161→40714).
   const p2pExcluded = useMemo(() => packets.reduce((s, p) => s + ((p.srcPort && p.dstPort) ? 1 : 0), 0) - portTotal, [packets, portTotal])
-  const duplicateFrames = useMemo(() => countDuplicateFrames(packets), [packets])
+  // Legacy jobs stored raw frames (dedupe absent): count on the stored set.
+  // Fresh jobs record the removal in job.duplicateFrameCount and store the
+  // ANALYZED set — the count then comes from the job, not a re-count.
+  const duplicateFrames = useMemo(() => job?.duplicateFrameCount ?? countDuplicateFrames(packets), [job, packets])
+  // Capture-quality grade from the duplicate ratio (double-capture artifact):
+  // >=25% Poor, >=5% Degraded, else Good. Only when dedupe accounting exists.
+  const dedupeGrade = useMemo(() => {
+    const raw = job?.rawPacketCount
+    if (typeof raw !== "number" || typeof job?.duplicateFrameCount !== "number" || raw === 0) return null
+    const ratio = job.duplicateFrameCount / raw
+    if (ratio >= 0.25) return { label: "POOR" as const, color: "text-danger" }
+    if (ratio >= 0.05) return { label: "DEGRADED" as const, color: "text-warning" }
+    return { label: "GOOD" as const, color: "text-success" }
+  }, [job])
 
   const allCountries = useMemo(() =>
     [...countryCountsByDst(packets, geoMap, localOwned).entries()].sort((a, b) => b[1] - a[1]),
@@ -470,20 +483,20 @@ export default function ReportsPage() {
       packets.some((p) => p.dstPort === 5222 || p.appProtocol === "XMPP") &&
       (dns.some((d) => /mmx-ds\.whatsapp\.net|(^|\.)whatsapp\.(com|net)$/i.test(d.query)) ||
         tls.some((t) => /mmx-ds\.whatsapp\.net|(^|\.)whatsapp\.(com|net)$/i.test(t.sni || "")))
-    if (whatsappLike) obs.push("WhatsApp-related traffic observed (XMPP on port 5222 — port-inferred, not payload-verified — plus STUN and WhatsApp chat/media domains); no message or session content was reconstructed")
+    if (whatsappLike) obs.push("WhatsApp-related endpoints and port-5222 traffic observed — the XMPP classification is port-inferred only, not payload-verified; STUN and WhatsApp chat/media domains also seen; no message or session content was reconstructed")
     if (packets.some((p) => (p.srcIp || "").includes(":") || (p.dstIp || "").includes(":"))) obs.push("IPv6 communication")
     // Multicast/broadcast requires DECODED addresses — undecodable packets
     // carry the "—" placeholder, which must not count as multicast (QA:
     // large/verylarge reported a fabricated multicast observation).
     if (!undecodable && packets.some((p) => p.dstIp && p.dstIp !== "\u2014" && isNonUnicast(p.dstIp))) obs.push("multicast/broadcast traffic")
     if (undecodable) obs.push(`capture payloads undecodable (${dltName(linkTypes)} — unsupported encapsulation); only lengths and timestamps parsed`)
-    if (dnsQueries > 0) obs.push(`${dnsLookupCount(dns)} distinct DNS lookups (${stats.domains.toLocaleString()} unique domain${stats.domains === 1 ? "" : "s"}, ${dnsQueries} query packets)`)
+    if (dnsQueries > 0) obs.push(`${dns.length.toLocaleString()} DNS packets — ${dnsQueries.toLocaleString()} query packets, ${dnsLookupCount(dns).toLocaleString()} distinct name/type lookups for the capturing client, ${stats.domains.toLocaleString()} unique domain${stats.domains === 1 ? "" : "s"}`)
     // 0 DNS + any hostname-bearing traffic = the capture began mid-session:
     // the resolution phase predates the capture, so hostname↔IP correlation
     // and PTR lookups are unavailable (QA: login.pcapng talks to 4+ named
     // domains yet holds 0 DNS packets).
     if (dnsQueries === 0 && (http.length > 0 || tls.length > 0)) obs.push("0 DNS queries captured — capture likely began mid-session; hostname/IP correlation and PTR resolution unavailable")
-    if (http.length > 0) obs.push(`${http.length} plaintext HTTP requests`)
+    if (http.length > 0) obs.push(`${http.length} plaintext HTTP request${http.length === 1 ? "" : "s"}`)
     // HTTP User-Agents fingerprint client OSes even without MAC OUI data.
     // Microsoft-CryptoAPI/10.0 is a Windows component and must count as
     // Windows (its UA string never says "Windows").
@@ -518,10 +531,10 @@ export default function ReportsPage() {
     // counts can't see them (every packet is counted once) so the report
     // must (QA: frames #1/#3 and #2/#4 identical ACKs went unmentioned).
     if (duplicateFrames > 0) {
-      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} (identical source/destination/length/sequence) — consistent with a double-capture artifact. Detections and the risk score are computed on the raw frame set, including these duplicates, and may be affected; de-duplicate the capture before relying on a final verdict`)
+      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} removed before analysis (double-capture artifact) — detections and the risk score are computed on the analyzed set${typeof job?.rawPacketCount === "number" ? ` (${job.rawPacketCount.toLocaleString()} raw → ${(job.rawPacketCount - duplicateFrames).toLocaleString()} analyzed)` : ""}`)
     }
     return obs
-  }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames])
+  }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job])
   const recs = useMemo(() => {
     const groups = { High: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[], Medium: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[], Low: [] as { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC" }[] }
     for (const r of report.recommendations.sort((a, b) => b.severity - a.severity)) {
@@ -619,7 +632,7 @@ export default function ReportsPage() {
       `- **Analysis ID:** \`${job.id}\`${jobInfo?.isDemo ? " (Demo Dataset)" : ""}`,
       `- **Capture file:** \`${job.filename}\`` + (job.sha256 ? `\n- **SHA256:** \`${job.sha256}\`` : "") + (job.sha1 ? `\n- **SHA1:** \`${job.sha1}\`` : "") + (job.md5 ? `\n- **MD5:** \`${job.md5}\`` : ""),
       `- **File size:** ${formatBytes(job.fileSize)}`,
-      `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
+      `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (typeof job?.rawPacketCount === "number" ? ` analyzed (raw ${job.rawPacketCount.toLocaleString()} · ${(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicates removed)` : "") + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
       `- **Duration:** ${durLabel(durationSec)} · Risk score: ${riskValue()}`,
       `- **Alerts:** ${report.alerts.length} (${severityCounts(report.alerts)})`,
       "",
@@ -629,6 +642,7 @@ export default function ReportsPage() {
       `- DNS queries: ${dnsQueries} (${dnsLookupCount(dns)} distinct lookups) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- Files extracted: ${files.length} · Credentials: ${credentials.length} · Certificates: ${certificates.length}`,
+      ...(report.notables.length ? [`- Notable destinations (neutral, not findings): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
       ...(undecodable ? [`## Data Quality`, `- **WARNING:** only ${(decodeRate * 100).toFixed(0)}% of packets decoded (${linkTypes.length > 0 ? dltName(linkTypes) : "encapsulation unknown"}). Lengths and timestamps were parsed; headers were not. Verdict is UNKNOWN — re-capture with a decodable link type or explicit DLT override.`, ""] : []),
@@ -677,7 +691,7 @@ export default function ReportsPage() {
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: ${BUILD_STAMP}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames (double-capture artifact)` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: ${BUILD_STAMP}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
 
@@ -776,7 +790,16 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={Package} title="2. Traffic Summary" sub={`${stats.totalPackets.toLocaleString()} packets over ${durLabel(durationSec)}`} />
+              <SectionTitle icon={Package} title="2. Traffic Summary" sub={`${stats.totalPackets.toLocaleString()} analyzed packets over ${durLabel(durationSec)}`} />
+              {typeof job?.rawPacketCount === "number" && (
+                <div className="mb-3 text-[11px] text-muted-foreground space-y-1">
+                  <p>
+                    Raw frames: <strong>{job.rawPacketCount.toLocaleString()}</strong> · Consecutive duplicate frames removed: <strong>{job.duplicateFrameCount?.toLocaleString() ?? 0}</strong> · Analyzed: <strong>{stats.totalPackets.toLocaleString()}</strong>
+                    {dedupeGrade && <span className={`ml-2 font-medium ${dedupeGrade.color}`}>Capture quality: {dedupeGrade.label}</span>}
+                  </p>
+                  <p>Every metric, detection and risk score is computed on the analyzed set — duplicate capture artifacts never inflate flows, SYN counts or rates.</p>
+                </div>
+              )}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 {[
                   { label: "Total Packets", value: stats.totalPackets.toLocaleString(), icon: Package, color: "text-info" },
@@ -943,9 +966,11 @@ export default function ReportsPage() {
                             <thead>
                               <tr className="border-b text-muted-foreground">
                                 <th className="text-left py-1.5 pr-2">Flow</th>
+                                <th className="text-right py-1.5 pr-2">Pkts</th>
                                 <th className="text-right py-1.5 pr-2">RTT (ms)</th>
                                 <th className="text-right py-1.5 pr-2">Retrans</th>
                                 <th className="text-right py-1.5 pr-2">Loss %</th>
+                                <th className="text-right py-1.5 pr-2">Loss Conf</th>
                                 <th className="text-right py-1.5 pr-2">OoO</th>
                                 <th className="text-right py-1.5 pr-2">Zero Win</th>
                                 <th className="text-right py-1.5">RST</th>
@@ -954,10 +979,12 @@ export default function ReportsPage() {
                             <tbody>
                               {worst.map((f) => (
                                 <tr key={f.id} className="border-b border-border/30">
-                                  <td className="py-1.5 pr-2 font-mono truncate max-w-[220px]">{f.srcIp}:{f.srcPort} → {f.dstIp}:{f.dstPort}</td>
+                                  <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{f.srcIp}:{f.srcPort} → {f.dstIp}:{f.dstPort}</td>
+                                  <td className="py-1.5 pr-2 text-right font-mono">{f.packets}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.rttMs ? f.rttMs : "n/a"}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.retrans ?? 0}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.lossPct ?? "—"}</td>
+                                  <td className="py-1.5 pr-2 text-right">{f.lossPct != null && <Badge variant={f.packets >= 100 ? "default" : f.packets >= 20 ? "warning" : "outline"} className="text-[9px]" title="Loss confidence from the observed packet sample: >=100 pkts High, 20-99 Medium, <20 Low — a 50% estimate from 4 packets is far weaker than from 10,000">{f.packets >= 100 ? "HIGH" : f.packets >= 20 ? "MED" : "LOW"}</Badge>}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.ooo ?? 0}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.zeroWindow ?? 0}</td>
                                   <td className="py-1.5 text-right font-mono">{f.rstCount ?? 0}</td>
@@ -966,6 +993,7 @@ export default function ReportsPage() {
                             </tbody>
                           </table>
                         </div>
+                        <p className="text-[10px] text-muted-foreground mt-1">Loss % is estimated from retransmission evidence on the observed packet sample; the Loss Confidence column scales with the sample size (&ge;100 pkts HIGH, 20&ndash;99 MED, &lt;20 LOW) — a 50% estimate from 4 packets is far weaker than from 10,000.</p>
                       </div>
                     )
                   })()}
@@ -1016,13 +1044,19 @@ export default function ReportsPage() {
                 <CardContent className="pt-6 space-y-4">
                   <div className="grid grid-cols-4 gap-4 text-xs">
                     <StatGrid items={[
-                      { label: "Query Packets", value: dnsQueries.toLocaleString() },
-                      { label: "Distinct Lookups", value: dnsLookupCount(dns).toLocaleString(), sub: "relay/resolver copies collapsed" },
-                      { label: "Unique Domains", value: new Set(dns.map((d) => d.query)).size.toLocaleString() },
-                      { label: "Failed (NXDOMAIN)", value: dns.filter((d) => d.responseCode === "NXDOMAIN").length.toLocaleString() },
+                      { label: "DNS Messages", value: dns.length.toLocaleString(), sub: "queries + responses" },
+                      { label: "Query Packets", value: dnsQueries.toLocaleString(), sub: "client-originated" },
+                      { label: "Distinct Lookups", value: dnsLookupCount(dns).toLocaleString(), sub: "name+type, relay copies collapsed" },
+                      { label: "Unique Domains", value: new Set(dns.map((d) => d.query)).size.toLocaleString(), sub: "distinct names" },
                     ]} />
                   </div>
-                  <p className="text-[10px] text-muted-foreground">Distinct Lookups counts each name+type once for the capturing client — a LAN router relaying a query upstream is not counted as a second querier{dns.length <= 15 ? " (the table below still lists every DNS message: queries and responses)" : ""}.</p>
+                  <div className="grid grid-cols-2 gap-4 text-xs">
+                    <StatGrid tint items={[
+                      { label: "Failed (NXDOMAIN)", value: dns.filter((d) => d.responseCode === "NXDOMAIN").length.toLocaleString() },
+                      { label: "Resolution Source", value: dns.filter((d) => d.isResponse && (d.answer && d.answer !== '\u2014')).length.toLocaleString(), sub: "responses carrying an answer" },
+                    ]} />
+                  </div>
+                  <p className="text-[10px] text-muted-foreground">Terminology: every decoded DNS message counts once (DNS Messages); of those, the messages carrying a question count as Query Packets; Distinct Lookups counts each name+type once for the capturing client — a LAN router relaying a query upstream is not counted as a second querier; Unique Domains counts distinct queried names. The four numbers therefore describe different scopes and should not be expected to agree{dns.length <= 15 ? " (the table below still lists every DNS message: queries and responses)" : ""}.</p>
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
@@ -1149,7 +1183,38 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={FolderOpen} title="9. Extracted Files" />
+              <SectionTitle icon={Compass} title="9. Notable Destinations" sub={`${report.notables.length.toLocaleString()} curated families — not security findings`} />
+              <Card>
+                <CardContent className="pt-6">
+                  {report.notables.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No destinations matched the curated notable families (threat-intelligence services, disposable/temporary email providers, DNS-over-HTTPS resolvers, Tor/anonymization projects, user-hosted github.io content).</p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b text-muted-foreground">
+                            <th className="text-left py-2 pr-2">Destination</th>
+                            <th className="text-left py-2">Category</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {report.notables.map((n) => (
+                            <tr key={n.domain} className="border-b border-border/30">
+                              <td className="py-1.5 pr-2 font-mono text-[10px]">{n.domain}</td>
+                              <td className="py-1.5"><Badge variant="outline" className="text-[10px]">{n.category}</Badge></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  <p className="text-[10px] text-muted-foreground mt-2">Neutral context, never a finding: these destinations appear in both benign and malicious traffic (e.g. urlhaus-api.abuse.ch is a threat-intelligence lookup service — querying it does not mean the host is infected). The families are curated and not exhaustive; they are listed so notable traffic does not disappear into a SAFE verdict.</p>
+                </CardContent>
+              </Card>
+            </section>
+
+            <section>
+              <SectionTitle icon={FolderOpen} title="10. Extracted Files" />
               <Card>
                 <CardContent className="pt-6">
                   <div className="grid grid-cols-3 gap-4 text-xs mb-4">
@@ -1195,7 +1260,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={Phone} title="10. VoIP / SIP Calls" sub={calls.length > 0 ? `${calls.length.toLocaleString()} SIP dialogs observed` : undefined} />
+              <SectionTitle icon={Phone} title="11. VoIP / SIP Calls" sub={calls.length > 0 ? `${calls.length.toLocaleString()} SIP dialogs observed` : undefined} />
               <Card>
                 <CardContent className="pt-6">
                   <div className="overflow-x-auto">
@@ -1241,7 +1306,7 @@ export default function ReportsPage() {
 
             <section>
               <div className="flex items-center justify-between">
-                <SectionTitle icon={Key} title="11. Credentials" />
+                <SectionTitle icon={Key} title="12. Credentials" />
                 {credentials.length > 0 && (
                   <Button variant="ghost" size="sm" onClick={() => setShowPasswords(!showPasswords)}>
                     {showPasswords ? "Hide passwords" : "Show passwords"}
@@ -1286,7 +1351,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={Verified} title="12. Certificates" />
+              <SectionTitle icon={Verified} title="13. Certificates" />
               <Card>
                 <CardContent className="pt-6">
                   <div className="grid grid-cols-3 gap-4 text-xs mb-4">
@@ -1332,7 +1397,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={Monitor} title="13. Endpoints" sub={`${endpointRows.length.toLocaleString()} endpoints observed on the network`} />
+              <SectionTitle icon={Monitor} title="14. Endpoints" sub={`${endpointRows.length.toLocaleString()} endpoints observed on the network`} />
               <Card>
                 <CardContent className="pt-6">
                   <div className="grid grid-cols-4 gap-4 text-xs mb-4">
@@ -1403,7 +1468,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={AlertTriangle} title="14. Threats & Alerts" sub={`${alerts.length.toLocaleString()} alerts · ${severityCounts(alerts)} severity`} />
+              <SectionTitle icon={AlertTriangle} title="15. Threats & Alerts" sub={`${alerts.length.toLocaleString()} alerts · ${severityCounts(alerts)} severity`} />
               <Card>
                 <CardContent className="pt-6 space-y-4">
                   <div className="grid grid-cols-5 gap-4 text-xs">
@@ -1439,7 +1504,7 @@ export default function ReportsPage() {
                         {report.groups.map((g) => (
                           <tr key={g.ruleId + "::" + g.signature} className="border-b border-border/30">
                             <td className="py-1.5 pr-2 font-mono text-muted-foreground whitespace-nowrap hl-time text-xs">{g.occurrences > 1 ? `${formatTime(g.firstSeen)} – ${formatTime(g.lastSeen)}` : formatTime(g.firstSeen)}</td>
-                            <td className="py-1.5 pr-2 text-xs">{g.signature} <span className="text-muted-foreground">×{g.occurrences}</span></td>
+                            <td className="py-1.5 pr-2 text-xs">{g.signature} <span className="text-muted-foreground">×{g.occurrences}</span> <Badge variant={g.status === "CONFIRMED" ? "default" : g.status === "LIKELY" ? "warning" : "outline"} className="text-[9px]">{g.status ?? "CONFIRMED"}</Badge></td>
                             <td className="py-1.5 pr-2 font-mono text-xs">{g.srcHosts.join(", ")} → {g.dstHosts.join(", ")}</td>
                             <td className="py-1.5 pr-2 text-right text-muted-foreground" title={g.packets == null ? "Full capture packet rows were not retained for this flow" : undefined}>{g.packets == null ? "N/A" : g.packets.toLocaleString()}</td>
                             <td className="py-1.5 pr-2 text-right text-muted-foreground" title={g.bytes == null ? "Full capture packet rows were not retained for this flow" : undefined}>{g.bytes == null ? "N/A" : formatBytes(g.bytes)}</td>
@@ -1451,13 +1516,13 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="text-[10px] text-muted-foreground mt-1">Confidence here is the rule&rsquo;s base value (spec v1.3); C2-beacon, exfil and DNS-tunnel rules that fire during a detected traffic burst get a bonus in the Risk Breakdown (e.g. 70% base can appear there as 85%), and behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;. Pkts/Bytes read N/A when an alert spans multiple flows &mdash; the Evidence column then carries the measured numbers.</div>
+                  <div className="text-[10px] text-muted-foreground mt-1">Detection states come from evidence quality: CONFIRMED = payload-verified (e.g. cleartext credentials decoded from the wire); LIKELY = strong multi-indicator or high-evidence behavioral findings; SUSPECTED = a rule crossed its threshold on weaker evidence (scans, floods and behavioral heuristics can never reach CONFIRMED — the evidence is pattern-based, and the finding text says so). Confidence is derived from the same evidence (more probed ports / higher SYN burst rate = higher confidence); C2-beacon, exfil and DNS-tunnel rules that fire during a detected traffic burst get a bonus in the Risk Breakdown (e.g. 70% base can appear there as 85%), and behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;. MITRE mappings are attached only to LIKELY/CONFIRMED detections. Pkts/Bytes read N/A when an alert spans multiple flows &mdash; the Evidence column then carries the measured numbers.</div>
                 </CardContent>
               </Card>
             </section>
 
             <section>
-              <SectionTitle icon={History} title="15. Timeline" sub={`${report.timeline.length.toLocaleString()} sampling intervals`} />
+              <SectionTitle icon={History} title="16. Timeline" sub={`${report.timeline.length.toLocaleString()} sampling intervals`} />
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Card>
                   <CardHeader><CardTitle className="text-sm">Packet Activity {report.timeline.length > 1 && <span className="text-muted-foreground font-normal">({report.timeline.length} intervals)</span>}</CardTitle></CardHeader>
@@ -1518,7 +1583,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={BarChart3} title="16. Top Talkers" />
+              <SectionTitle icon={BarChart3} title="17. Top Talkers" />
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Card>
                   <CardHeader><CardTitle className="text-sm">Source IPs</CardTitle></CardHeader>
@@ -1576,7 +1641,7 @@ export default function ReportsPage() {
             {advancedMetrics && (
               <>
 <section>
-                  <SectionTitle icon={Shield} title="17. Risk Score" />
+                  <SectionTitle icon={Shield} title="18. Risk Score" />
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     {[
                       { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle },
@@ -1783,7 +1848,7 @@ export default function ReportsPage() {
              )}
 
              <section>
-                <SectionTitle icon={AlertTriangle} title="18. Indicators of Compromise (IOCs)" />
+                <SectionTitle icon={AlertTriangle} title="19. Indicators of Compromise (IOCs)" />
                   <Card>
                     <CardContent className="pt-6">
                       {report.iocs.length > 0 && report.iocs.length !== alerts.length && (
@@ -1826,7 +1891,7 @@ export default function ReportsPage() {
                 </section>
 
                 <section>
-                  <SectionTitle icon={Shield} title="19. MITRE ATT&CK Mapping" />
+                  <SectionTitle icon={Shield} title="20. MITRE ATT&CK Mapping" />
                   <Card>
                     <CardContent className="pt-6">
                       {mitre.length === 0 ? (
@@ -1862,7 +1927,7 @@ export default function ReportsPage() {
                 </section>
 
                 <section>
-                  <SectionTitle icon={FileText} title="20. Recommendations" />
+                  <SectionTitle icon={FileText} title="21. Recommendations" />
                   <Card>
                     <CardContent className="pt-6 space-y-4">
                       {recs.High.length === 0 && recs.Medium.length === 0 && recs.Low.length === 0 && (
@@ -1918,7 +1983,7 @@ export default function ReportsPage() {
             )}
 
                 <section>
-                  <SectionTitle icon={BarChart3} title="21. Appendix" />
+                  <SectionTitle icon={BarChart3} title="22. Appendix" />
                   <Card>
                     <CardContent className="pt-6 text-xs text-muted-foreground space-y-3">
                       <p><strong>Analysis ID:</strong> <span className="font-mono">{job.id}</span></p>
@@ -1929,7 +1994,7 @@ export default function ReportsPage() {
                       {job.md5 && <p><strong>MD5:</strong> <span className="font-mono text-xs">{job.md5}</span></p>}
                       <p><strong>Packets:</strong> {stats.totalPackets.toLocaleString()} · <strong>Flows:</strong> {stats.totalFlows.toLocaleString()} · <strong>Sessions:</strong> {stats.sessions.toLocaleString()} · <strong>Local Devices:</strong> {stats.devices.toLocaleString()}</p>
                       <p><strong>Duration:</strong> {durLabel(durationSec)} · <strong>External IPs:</strong> {stats.externalIps} · <strong>Countries:</strong> {countriesLabel(stats.countries, stats.externalIps)}</p>
-                      <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"}{duplicateFrames > 0 ? <> · <strong>{duplicateFrames.toLocaleString()} consecutive duplicate frames</strong> (double-capture artifact)</> : null} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"}</p>
+                      <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"}{duplicateFrames > 0 ? <> · <strong>{duplicateFrames.toLocaleString()} consecutive duplicate frames</strong> removed before analysis</> : null} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"}</p>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
                           <h4 className="font-semibold mb-2">Report Metadata</h4>
@@ -1960,7 +2025,7 @@ export default function ReportsPage() {
                 </section>
 
                 <section>
-                  <SectionTitle icon={Shield} title="22. Analyst Conclusion" />
+                  <SectionTitle icon={Shield} title="23. Analyst Conclusion" />
                   <Card>
                     <CardContent className="pt-6 space-y-2">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -1969,7 +2034,7 @@ export default function ReportsPage() {
                         <span className="text-xs text-muted-foreground">Final verdict · Risk score {riskValue()}</span>
                       </div>
                       <p className="text-sm text-muted-foreground">{conclusionText}</p>
-                      {levelLabel === "SAFE" && <p className="text-xs text-muted-foreground">SAFE means no configured detection rule triggered — it is not proof that the capture is universally safe.</p>}
+                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "SAFE means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only`} — it is not proof that the capture is universally safe or clean.</p>
                     </CardContent>
                   </Card>
                 </section>

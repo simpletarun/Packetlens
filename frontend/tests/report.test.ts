@@ -968,10 +968,11 @@ describe("tlsCipherSuiteName", () => {
 describe("analystConclusion � the verdict must never call a capture clean while confirmed findings exist", () => {
   const base = { undecodable: false, decodeRatePct: 100, encapName: "Ethernet", alerts: [], score: 0 }
 
-  it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW + 1 alert)", () => {
+it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW + 1 alert)", () => {
     const text = analystConclusion({ ...base, alerts: [{ signature: "Plaintext HTTP Credentials" }], score: 39 })
     expect(text).toContain("1 confirmed finding detected (Plaintext HTTP Credentials)")
-    expect(text).toContain("NOT clean")
+    expect(text).toContain("NOT clean under the configured rules")
+    expect(text).toContain("not proof that the capture is universally malicious")
     expect(text).not.toContain("No suspicious indicators")
   })
 
@@ -1048,5 +1049,63 @@ describe("MITRE mapping for plaintext credential alerts (T1552, not T1040)", () 
     expect(mitre?.description).toContain("cleartext")
     // T1040 (Network Sniffing) is the WRONG frame for passive HTTP creds.
     expect(report.mitre.find((m) => m.id === "T1040")).toBeUndefined()
+  })
+})
+
+describe("MITRE gating — SUSPECTED/OBSERVED detections never claim ATT&CK techniques", () => {
+  it("a SUSPECTED port-scan alert drops its T1046 row (QA: scan/flood false positives carried T1046/T1498)", () => {
+    const r = buildReportAnalysis({ ...state, alerts: [{ ...portScanAlert, status: "SUSPECTED" }] })
+    expect(r.mitre.find((m) => m.id === "T1046")).toBeUndefined()
+    // Metric-only techniques (no backing alert) are unaffected by the gate.
+    expect(r.mitre.find((m) => m.id === "T1071.004")).toBeDefined()
+    expect(r.mitre.find((m) => m.id === "T1071")).toBeDefined()
+    // The alert itself still surfaces — only its ATT&CK claim is withheld.
+    expect(r.groups.map((g) => g.ruleId)).toContain("PORT-SCAN-001")
+    expect(r.groups.find((g) => g.ruleId === "PORT-SCAN-001")!.status).toBe("SUSPECTED")
+  })
+
+  it("LIKELY and CONFIRMED alerts keep their techniques; legacy alerts without status stay mapped", () => {
+    const likely = buildReportAnalysis({ ...state, alerts: [{ ...portScanAlert, status: "LIKELY" }] })
+    expect(likely.mitre.find((m) => m.id === "T1046")).toBeDefined()
+    const confirmed = buildReportAnalysis({ ...state, alerts: [{ ...portScanAlert, status: "CONFIRMED" }] })
+    expect(confirmed.mitre.find((m) => m.id === "T1046")).toBeDefined()
+    const legacy = buildReportAnalysis(state)
+    expect(legacy.mitre.find((m) => m.id === "T1046")).toBeDefined()
+  })
+
+  it("OBSERVED alerts are gated too", () => {
+    const r = buildReportAnalysis({ ...state, alerts: [{ ...portScanAlert, status: "OBSERVED" }] })
+    expect(r.mitre.find((m) => m.id === "T1046")).toBeUndefined()
+  })
+})
+
+describe("notable destinations — neutral context, never findings", () => {
+  it("matches the curated families across SNI and HTTP Host, case-insensitively", () => {
+    const r = buildReportAnalysis({
+      ...state,
+tls: [{ id: "t1", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "203.0.113.9", version: "TLSv1.3", cipherSuite: "A", sni: "urlhaus-api.abuse.ch", ja3: "", issuer: "", validityDays: 0 }],
+      http: [{ id: "h1", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "203.0.113.9", method: "GET", uri: "/", status: 200, host: "api.internal.temp-mail.io", contentType: "", userAgent: "", length: 0 }],
+    })
+    const byDomain = new Map(r.notables.map((n) => [n.domain, n.category]))
+    expect(byDomain.get("urlhaus-api.abuse.ch")).toContain("Threat-intelligence")
+    expect(byDomain.get("api.internal.temp-mail.io")).toContain("Disposable")
+    expect(r.notables.length).toBe(2)
+  })
+
+  it("matches DoH resolvers, Tor and github.io; ignores ordinary domains", () => {
+    const r = buildReportAnalysis({
+      ...state,
+tls: [
+        { id: "t1", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "1.1.1.1", version: "TLSv1.3", cipherSuite: "A", sni: "doh.li", ja3: "", issuer: "", validityDays: 0 },
+        { id: "t2", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "8.8.8.8", version: "TLSv1.2", cipherSuite: "A", sni: "purecatamphetamine.github.io", ja3: "", issuer: "", validityDays: 0 },
+        { id: "t3", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "8.8.8.8", version: "TLSv1.2", cipherSuite: "A", sni: "www.bbc.co.uk", ja3: "", issuer: "", validityDays: 0 },
+        { id: "t4", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "8.8.8.8", version: "TLSv1.2", cipherSuite: "A", sni: "TORPROJECT.ORG", ja3: "", issuer: "", validityDays: 0 },
+      ],
+    })
+    const byDomain = new Map(r.notables.map((n) => [n.domain, n.category]))
+    expect(byDomain.get("doh.li")).toContain("DNS-over-HTTPS")
+    expect(byDomain.get("purecatamphetamine.github.io")).toContain("github.io")
+    expect(byDomain.get("torproject.org")).toContain("Tor")
+    expect(byDomain.get("www.bbc.co.uk")).toBeUndefined()
   })
 })

@@ -121,7 +121,15 @@ describe("report export data layer parity — every capture must feed the export
     expect.soft(report.alerts.length, `${name}: report.alerts`).toBe(a.threats.length)
     if (a.threats.length > 0) {
       expect.soft(report.iocs.length, `${name}: iocs for ${a.threats.length} alerts`).toBeGreaterThan(0)
-      expect.soft(report.mitre.length, `${name}: mitre for ${a.threats.length} alerts`).toBeGreaterThan(0)
+      // MITRE rows are gated on detection status: only LIKELY/CONFIRMED (or
+      // legacy status-less) alerts claim ATT&CK techniques — a capture whose
+      // only findings are SUSPECTED heuristics legitimately maps nothing.
+      if (a.threats.some((t) => t.status === undefined || t.status === "LIKELY" || t.status === "CONFIRMED")) {
+        expect.soft(report.mitre.length, `${name}: mitre for ${a.threats.length} alerts`).toBeGreaterThan(0)
+      }
+      for (const m of report.mitre) {
+        expect.soft(m.severity > 0, `${name}: mitre ${m.id} severity`).toBe(true)
+      }
       expect.soft(report.recommendations.length, `${name}: recs for ${a.threats.length} alerts`).toBeGreaterThan(0)
     }
     for (const i of report.iocs) {

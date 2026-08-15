@@ -176,6 +176,13 @@ export interface AnalysisThreat {
   id: string; timestamp: string; signature: string; category: string
   severity: number; confidence: number; ruleId: string; srcIp: string; dstIp: string
   srcPort: number; dstPort: number; protocol: string; evidence: string
+  // Detection state, derived from EVIDENCE QUALITY — never "confirmed" on
+  // the basis of a rule having fired: payload-verified findings are
+  // CONFIRMED, multi-indicator or high-evidence behavioral findings LIKELY,
+  // threshold hits on weak evidence SUSPECTED, port-only observations
+  // OBSERVED. MITRE mappings require LIKELY or CONFIRMED. Absent on legacy
+  // results (treated as CONFIRMED for compatibility).
+  status?: ThreatStatus
   // Evidence provenance: the exact packets that triggered the finding (first
   // few, ascending; count lives in the evidence text). Absent for behavioral
   // aggregates (DNS tunnel, beacon) that span many packets.
@@ -186,6 +193,8 @@ export interface AnalysisThreat {
   // cleartext credentials), distinguishing payload proof from port inference.
   payloadConfirmed?: boolean
 }
+
+export type ThreatStatus = "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
 
 export interface AnalysisTimelineEntry {
   time: string; packets: number; bytes: number
@@ -203,6 +212,12 @@ interface AnalysisJob {
   devices: number; externalIps: number; countries: number
   domains: number; protocols: string[]
   alerts: number; riskScore: number; captureDuration: number; createdAt: string
+  /** Capture-artifact accounting when consecutive duplicate frames were
+   *  removed before analysis: rawPacketCount is the file's frame count,
+   *  duplicateFrameCount what was dropped, and totalPackets is the ANALYZED
+   *  set (raw - duplicates). Absent for legacy jobs (analyzed = raw). */
+  rawPacketCount?: number
+  duplicateFrameCount?: number
   /** Max severity (0-5) across all confirmed findings — displayed ALONGSIDE
    *  riskScore, never hidden by numeric normalization (a 39/100 LOW score can
    *  coexist with a HIGH severity finding and the report must say so). */
@@ -1421,6 +1436,25 @@ const BENIGN_POLLER_DOMAINS = [
 // would silently diverge from the engine's rule definition.
 export const SYN_FLOOD_MIN_PEAK_RATE = 20
 
+// Consecutive duplicate frames — the double-capture signature: two frames are
+// duplicates when their 5-tuple, length, TCP sequence and flags are identical
+// AND adjacent in capture order (same definition as countDuplicateFrames in
+// report.ts, but over ParsedPacket). Removes the later copy of every adjacent
+// duplicate pair; returns the analyzed set and how many frames were dropped.
+export function deduplicatePackets(packets: ParsedPacket[]): { packets: ParsedPacket[]; duplicates: number } {
+  const out: ParsedPacket[] = []
+  let prev: ParsedPacket | undefined
+  for (const p of packets) {
+    if (prev && p.srcIp === prev.srcIp && p.dstIp === prev.dstIp &&
+        p.srcPort === prev.srcPort && p.dstPort === prev.dstPort &&
+        p.protocol === prev.protocol && p.length === prev.length &&
+        p.tcpSeq === prev.tcpSeq && p.tcpFlags === prev.tcpFlags) continue
+    out.push(p)
+    prev = p
+  }
+  return { packets: out, duplicates: packets.length - out.length }
+}
+
 function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
   const threats: AnalysisThreat[] = []
   const scans = new Map<string, { ports: Set<number>; dsts: Set<string>; syn: number; rst: number; fin: number; first: number; last: number; packetNums: number[]; synTimes: number[]; peakSynPerSec: number }>()
@@ -1473,11 +1507,17 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
     if (e.ports.size <= RISK_PARAMS.port_scan_min_unique_ports) continue
     const samples = [...e.ports].sort((a, b) => a - b).slice(0, 6).join(', ')
     const dur = (e.last - e.first).toFixed(1)
+    // Evidence-derived confidence and state: more probed ports = stronger
+    // scan evidence (68 ports reads stronger than the 20-port threshold);
+    // a scan can never be CONFIRMED from probes alone — only LIKELY at
+    // high port counts, SUSPECTED at threshold.
+    const conf = Math.min(90, 50 + Math.round(e.ports.size / 2))
     threats.push({
       id: `alert-${threats.length + 1}`,
       timestamp: safeIso(e.last * 1000),
       signature: 'Port Scan Detected', category: 'Reconnaissance', severity: 3,
-      confidence: 70, ruleId: 'PORT-SCAN-001',
+      confidence: conf, ruleId: 'PORT-SCAN-001',
+      status: e.ports.size >= 50 ? 'LIKELY' : 'SUSPECTED',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} scanned ${e.ports.size} ports on ${e.dsts.size} host(s) over ${dur}s (${e.syn} SYN, ${e.rst} RST, ${e.fin} FIN; e.g. ${samples})`,
@@ -1496,11 +1536,16 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
     if (e.syn < RISK_PARAMS.syn_flood_min_syns) continue
     if (e.peakSynPerSec < SYN_FLOOD_MIN_PEAK_RATE) continue
     const dur = (e.last - e.first).toFixed(1)
+    // Confidence grows with burst intensity (100/s is a stronger flood signal
+    // than the 20/s gate); the finding stays "possible" — a flood can never
+    // be CONFIRMED from SYNs alone (no victim impact was observed).
+    const conf = Math.min(90, 50 + Math.round(e.peakSynPerSec / 4))
     threats.push({
       id: `alert-${threats.length + 1}`,
       timestamp: safeIso(e.last * 1000),
       signature: 'SYN Flood Attempt', category: 'Denial of Service', severity: 4,
-      confidence: 65, ruleId: 'SYN-FLOOD-001',
+      confidence: conf, ruleId: 'SYN-FLOOD-001',
+      status: e.peakSynPerSec >= 100 ? 'LIKELY' : 'SUSPECTED',
       srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
       protocol: 'TCP',
       evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (peak ${e.peakSynPerSec}/s; possible SYN flood)`,
@@ -1524,6 +1569,9 @@ export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, exis
       // (stats.flow_end) — mirror that with the capture end, never "now".
       timestamp: safeIso((captureEndSec ?? Date.now() / 1000) * 1000),
       signature, category, severity, confidence, ruleId,
+      // Behavioral heuristics are SUSPECTED by definition: they aggregate
+      // traffic patterns, not payload proof — "confirmed" would overstate.
+      status: 'SUSPECTED',
       srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
       protocol: 'TCP', evidence,
     })
@@ -1968,8 +2016,33 @@ export function packetProtocolCounts(
   return counts
 }
 
-export function analyzePcap(result: PCAPResult): AnalysisResult {
-  const { packets: raw, stats } = result
+export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {}): AnalysisResult {
+  let { packets: raw, stats } = result
+  let rawPacketCount: number | undefined
+  let duplicateFrameCount: number | undefined
+  // Capture-artifact de-duplication (double-capture signature): detections,
+  // risk and every metric run on the ANALYZED set — raw frames are never
+  // security-scored (QA: mic 1,471 and another 2,747 consecutive duplicate
+  // frames doubled flow counts and SYN probes). Raw counts stay on the job
+  // so the report shows Raw / Duplicate / Analyzed honestly.
+  if (opts.dedupe) {
+    rawPacketCount = raw.length
+    const { packets: eff, duplicates } = deduplicatePackets(raw)
+    if (duplicates > 0) {
+      raw = eff
+      duplicateFrameCount = duplicates
+      stats = {
+        ...stats,
+        totalPackets: eff.length,
+        totalBytes: eff.reduce((s, p) => s + p.length, 0),
+        decodedPackets: Math.max(0, (stats.decodedPackets ?? eff.length) - duplicates),
+        protocols: eff.reduce<Record<string, number>>((acc, p) => { if (p.protocol) acc[p.protocol] = (acc[p.protocol] ?? 0) + 1; return acc }, {}),
+        startTime: eff.length ? Math.min(...eff.map((p) => p.timestamp)) : stats.startTime,
+        endTime: eff.length ? Math.max(...eff.map((p) => p.timestamp)) : stats.endTime,
+        duration: eff.length ? Math.max(0, Math.max(...eff.map((p) => p.timestamp)) - Math.min(...eff.map((p) => p.timestamp))) : 0,
+      }
+    }
+  }
   // Per-direction initial TCP sequence so each side's relative Seq starts at 0
   // from ITS OWN first segment in wire order (the client SYN on the client
   // leg, the SYN-ACK on the server leg for a handshake in the capture). The
@@ -2083,6 +2156,9 @@ export function analyzePcap(result: PCAPResult): AnalysisResult {
         category: isHttp ? 'Credential Theft' : 'Credential Leak',
         severity: 4, confidence: isHttp ? 75 : 70,
         ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
+        // Payload-verified: the plaintext credential bytes were decoded, so
+        // this is CONFIRMED evidence, not an inferred pattern.
+        status: 'CONFIRMED',
         srcIp: c.srcIp, dstIp: c.dstIp, srcPort: 0, dstPort: 0,
         protocol: c.protocol || 'TCP',
         evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''} (user: ${c.username})`,
@@ -2120,6 +2196,10 @@ const job: AnalysisJob = {
     alerts: threats.length, analyzerVersion: ANALYZER_VERSION,
     metricSpecVersion: METRIC_SPEC_VERSION,
     detectionRuleVersion: DETECTION_RULE_VERSION,
+    // Capture-artifact accounting for the dedupe pipeline: rawPacketCount /
+    // duplicateFrameCount are set when the analyzer removed consecutive
+    // duplicate frames before analysis (analyzed set = job.totalPackets).
+    rawPacketCount, duplicateFrameCount,
     riskScore: computeRisk(
       buildRiskInputs(threats),
       burstConfidenceBoost(advancedMetrics)

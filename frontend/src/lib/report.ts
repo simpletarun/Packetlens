@@ -251,6 +251,8 @@ interface AlertGroup {
   category: string
   severity: number
   confidence: number
+  /** Detection state of the group's alerts (first alert's status). */
+  status?: "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
   occurrences: number
   srcHosts: string[]
   dstHosts: string[]
@@ -282,6 +284,14 @@ function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
       category: first.category,
       severity: Math.max(...list.map((a) => a.severity)),
       confidence: Math.max(...list.map((a) => a.confidence)),
+      status: list.reduce<AlertGroup["status"]>((m, a) => {
+        // Strongest status wins the group badge (CONFIRMED > LIKELY > ...);
+        // legacy alerts without a status count as CONFIRMED.
+        const order = ["OBSERVED", "SUSPECTED", "LIKELY", "CONFIRMED"]
+        const cur = order.indexOf(a.status ?? "CONFIRMED")
+        const best = order.indexOf(m ?? "OBSERVED")
+        return cur >= best ? (a.status ?? "CONFIRMED") : m
+      }, undefined),
       occurrences: list.length,
       srcHosts: [...new Set(list.map((a) => a.srcIp))],
       dstHosts: [...new Set(list.map((a) => a.dstIp))],
@@ -377,12 +387,53 @@ interface Recommendation {
   source: FindingSource
 }
 
+export interface NotableDestination {
+  domain: string
+  category: string
+}
+
+// Curated, neutral "notable destination" families — destinations that appear
+// in both benign and malicious traffic, so seeing one is never a finding.
+// Surfaced separately from security detections (QA: another.pcapng reached
+// urlhaus-api.abuse.ch, temp-mail.io and doh.li while staying SAFE — the
+// domains vanished into the SAFE verdict with zero context). Not exhaustive;
+// the section footer says so.
+const NOTABLE_CATEGORIES: { category: string; re: RegExp }[] = [
+  { category: "Threat-intelligence service", re: /(^|\.)(urlhaus-api|urlhaus|threatfox|bazaar|malwarebazaar|feodotracker)\.(abuse\.ch|com|org)$/i },
+  { category: "Disposable/temporary email provider", re: /(^|\.)(temp-mail|mailinator|guerrillamail|10minutemail|yopmail|throwaway)\./i },
+  { category: "DNS-over-HTTPS / encrypted DNS resolver", re: /(^|\.)(doh\.li|cloudflare-dns\.com|dns\.google|dns\.adguard\.com|dns\.nextdns\.io|doh\.pub|dns\.quad9\.net)$/i },
+  { category: "Tor / anonymization project", re: /(^|\.)torproject\.org$|(^|\.)geti2p\.net$/i },
+  { category: "User-hosted content (github.io)", re: /\.github\.io$/i },
+]
+
+export function notableDestinationsOf(
+  tls: { sni?: string }[],
+  http: { host?: string }[],
+): NotableDestination[] {
+  const seen = new Map<string, string>()
+  const hosts = new Set<string>()
+  for (const t of tls) if (t.sni) hosts.add(t.sni.toLowerCase())
+  for (const h of http) if (h.host) hosts.add(h.host.toLowerCase())
+  for (const host of hosts) {
+    for (const { category, re } of NOTABLE_CATEGORIES) {
+      if (re.test(host)) {
+        seen.set(host, category)
+        break
+      }
+    }
+  }
+  return [...seen.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([domain, category]) => ({ domain, category }))
+}
+
 export interface ReportAnalysis {
   risk: ReportRisk | null
   alerts: AlertEntry[]
   groups: AlertGroup[]
   iocs: IocFinding[]
   mitre: MitreFinding[]
+  /** Neutral notable destinations (threat-intel services, disposable email,
+   *  DoH resolvers, Tor, user-hosted content) — never findings. */
+  notables: NotableDestination[]
   recommendations: Recommendation[]
   timeline: { time: string; packets: number }[]
   bandwidth: { time: string; in: number; out: number }[]
@@ -478,6 +529,22 @@ export function mitreSource(mapping: { id: string }, alerts: AlertEntry[]): Find
   return alerts.some((a) => ruleIdsForTechnique(mapping.id).includes(a.ruleId))
     ? "CONFIRMED_ALERT"
     : "BEHAVIORAL_METRIC"
+}
+
+// MITRE gating: a technique row maps to a detection only when the backing
+// alert reaches LIKELY/CONFIRMED — payload proof or strong multi-indicator
+// evidence. A rule that merely crossed a threshold is SUSPECTED and must not
+// claim an ATT&CK technique (QA: the old port-scan/SYN-flood false positives
+// carried T1046/T1498 rows that read as established attacks). Legacy alerts
+// without a status stay mapped (treated as CONFIRMED).
+function mitreStatusPass(ruleIds: string[] | undefined, alerts: AlertEntry[]): boolean {
+  if (!ruleIds || ruleIds.length === 0) return true
+  return ruleIds.some((ruleId) => {
+    const a = alerts.find((x) => x.ruleId === ruleId)
+    if (!a) return true
+    const s = a.status
+    return s === undefined || s === "LIKELY" || s === "CONFIRMED"
+  })
 }
 
 function mitreSeverity(mapping: { id: string; severity: number }, alerts: AlertEntry[]): number {
@@ -1341,7 +1408,7 @@ export function analystConclusion(opts: {
     // Detected)", hiding the SYN flood). "Confirmed" means a configured rule
     // fired; each alert's evidence states how definitive the finding is.
     const names = opts.alerts.map((a) => a.signature).join("; ")
-    const head = `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${names}). The capture is NOT clean — review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+    const head = `${opts.alerts.length} confirmed finding${opts.alerts.length === 1 ? "" : "s"} detected (${names}). The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.
@@ -1438,17 +1505,20 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
     })
   }
 
-  const mitre: MitreFinding[] = (advancedMetrics?.mitreMappings ?? []).map((m) => ({
-    ...m,
-    severity: mitreSeverity(m, alerts),
-    source: mitreSource(m, alerts),
-  }))
+  const mitre: MitreFinding[] = (advancedMetrics?.mitreMappings ?? [])
+    .filter((m) => mitreStatusPass(ruleIdsForTechnique(m.id), alerts))
+    .map((m) => ({
+      ...m,
+      severity: mitreSeverity(m, alerts),
+      source: mitreSource(m, alerts),
+    }))
 
   // Alert-derived MITRE mappings for every fired rule's technique.
   const mitreIds = new Set(mitre.map((m) => m.id))
   for (const g of enriched) {
     const id = TECHNIQUE_ID[g.ruleId]
     if (!id || mitreIds.has(id)) continue
+    if (!mitreStatusPass([g.ruleId], alerts)) continue
     const names = TECHNIQUE_NAMES[id] ?? { name: g.signature, desc: g.evidence }
     mitre.push({
       technique: names.name,
@@ -1497,6 +1567,7 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
     groups: enriched,
     iocs,
     mitre,
+    notables: notableDestinationsOf(state.tls, state.http),
     recommendations,
     timeline: buildTimeline(packets, timeline, durationSec ?? 0),
     bandwidth: buildBandwidth(packets, bandwidth, durationSec),

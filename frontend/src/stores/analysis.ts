@@ -33,6 +33,11 @@ export interface JobSummary {
   highestSeverity?: number
   /** Canonical capture quality (EMPTY/SINGLE_PACKET/ZERO_DURATION/VALID). */
   captureQuality?: string
+  /** Capture-artifact accounting when consecutive duplicate frames were
+   *  removed before analysis: rawPacketCount = frames in the file,
+   *  duplicateFrameCount = dropped, totalPackets = analyzed set. */
+  rawPacketCount?: number
+  duplicateFrameCount?: number
   isDemo?: boolean
   sha256?: string
   sha1?: string
@@ -144,6 +149,10 @@ export interface AlertEntry {
   severity: number; confidence: number; ruleId: string
   srcIp: string; dstIp: string
   srcPort: number; dstPort: number; protocol: string; evidence: string
+  /** Detection state from evidence quality (OBSERVED/SUSPECTED/LIKELY/
+   *  CONFIRMED). Absent on legacy results (treated as CONFIRMED). */
+  status?: "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
+  payloadConfirmed?: boolean
 }
 
 export interface TimelineEntry {
