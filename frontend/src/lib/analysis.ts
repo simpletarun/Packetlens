@@ -2060,6 +2060,15 @@ export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {})
     const { packets: eff, duplicates } = deduplicatePackets(raw)
     if (duplicates > 0) {
       raw = eff
+      // Surviving frames keep their ORIGINAL file numbers (the parser counts
+      // raw frames 1..N), so after duplicate removal the set is 1..rawCount
+      // with gaps — the analyzed result must be renumbered contiguously
+      // 1..N, or every packetNum reference (threats, credentials, evidence)
+      // and the evidence-provenance validator disagree about the analyzed
+      // set (QA: minor.pcapng — threat/credential packetNum 8898/9030/9347
+      // "out of range 1..7441"). Raw accounting stays on the job as
+      // rawPacketCount/duplicateFrameCount.
+      for (let i = 0; i < raw.length; i++) raw[i].num = i + 1
       duplicateFrameCount = duplicates
       stats = {
         ...stats,

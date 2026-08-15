@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { analyzePcap } from "@/lib/analysis"
+import { analyzePcap, analysisProblems } from "@/lib/analysis"
 import { isPrivateIP } from "@/lib/map-data"
 import { enrichDeviceVendors } from "@/lib/oui-server"
 import type { PCAPResult, ParsedPacket } from "@/lib/pcap"
@@ -2080,10 +2080,52 @@ describe("credential findings — field-level evidence, redaction, and the field
     expect(a.job.riskScore).toBe(0)
   })
 
-  it("a GET to a login page with no fields never fires", () => {
+it("a GET to a login page with no fields never fires", () => {
     const a = run([httpPacket(
       "GET /login/login.asp HTTP/1.1\r\nHost: vbsca.ca\r\n\r\n",
     )])
     expect(a.threats).toHaveLength(0)
+  })
+})
+
+describe("dedup renumbering — analyzed packet numbers stay contiguous 1..N (QA: minor.pcapng)", () => {
+  const hex = (s: string) => Buffer.from(s, "latin1").toString("hex")
+  // Three DIFFERENT login tuples, each repeated adjacently: the parser
+  // numbers all six raw frames 1..6, dedup keeps only the first copy of each
+  // pair, so survivors carry ORIGINAL numbers 1,3,5 — pre-fix these exceeded
+  // the analyzed count and the validator rejected every packetNum reference.
+  const login = (num: number, dstIp: string, ts: number): ParsedPacket =>
+    makePacket({
+      num, timestamp: ts, dstIp, dstPort: 80, tcpFlags: "PSH ACK",
+      httpMethod: "POST", appPayloadConfirmed: true,
+      payload: hex(`POST /login/login_results.asp HTTP/1.1\r\nHost: ${dstIp}\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nuser=admin&pass=s3cr3t&submit=Login`),
+    })
+
+  it("surviving frames are renumbered 1..N so threats/credentials stay in range", () => {
+    const raw = [
+      login(1, "10.1.1.1", 1000000), login(2, "10.1.1.1", 1000001),
+      login(3, "10.1.1.2", 1000002), login(4, "10.1.1.2", 1000003),
+      login(5, "10.1.1.3", 1000004), login(6, "10.1.1.3", 1000005),
+    ]
+    const a = analyzePcap({
+      packets: raw,
+      stats: {
+        totalPackets: raw.length,
+        totalBytes: raw.reduce((s, p) => s + p.length, 0),
+        duration: 4, startTime: 1000000, endTime: 1000005,
+        protocols: { TCP: raw.length },
+        linkTypes: [1], decodedPackets: raw.length,
+      },
+    }, { dedupe: true })
+    expect(a.job.rawPacketCount).toBe(6)
+    expect(a.job.duplicateFrameCount).toBe(3)
+    expect(a.job.totalPackets).toBe(3)
+    expect(a.packets.map((p) => p.num)).toEqual([1, 2, 3])
+    expect(a.credentials.map((c) => c.packetNum)).toEqual([1, 2, 3])
+    const credAlerts = a.threats.filter((t) => t.ruleId === "HTTP-CREDS-001")
+    expect(credAlerts).toHaveLength(3)
+    expect([...new Set(credAlerts.flatMap((t) => t.packetNums ?? []))]).toEqual([1, 2, 3])
+    expect(analysisProblems(a).filter((m) => m.includes("out of range"))).toHaveLength(0)
+    expect(analysisProblems(a)).toHaveLength(0)
   })
 })
