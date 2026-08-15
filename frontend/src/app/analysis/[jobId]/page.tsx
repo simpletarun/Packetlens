@@ -146,6 +146,11 @@ export default function AnalysisPage() {
                   </CardHeader>
                   <CardContent>
                     <div className={card.key === "riskScore" ? cn("text-2xl font-bold", color) : "text-2xl font-bold"}>{val}</div>
+                    {card.key === "totalPackets" && typeof job.rawPacketCount === "number" && (job.duplicateFrameCount ?? 0) > 0 && (
+                      <p className="text-[10px] text-muted-foreground mt-0.5">
+                        {job.rawPacketCount.toLocaleString()} raw &minus; {(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicate frame{(job.duplicateFrameCount ?? 0) === 1 ? "" : "s"} removed
+                      </p>
+                    )}
                   </CardContent>
                 </Card>
               )

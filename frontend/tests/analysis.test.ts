@@ -2135,3 +2135,72 @@ describe("dedup renumbering — analyzed packet numbers stay contiguous 1..N (QA
     expect(analysisProblems(a)).toHaveLength(0)
   })
 })
+
+describe("dedupe payload honesty — same tuple+length is NOT a duplicate when the bytes differ (QA: sample.pcap Total Packets)", () => {
+  const hex = (s: string) => Buffer.from(s, "latin1").toString("hex")
+  const udp = (num: number, payload: string, ts = 1000000): ParsedPacket =>
+    makePacket({ num, timestamp: ts, protocol: "UDP", srcPort: 1234, dstPort: 5683, length: 72, payload: hex(payload) })
+
+  it("two UDP datagrams with different content survive dedupe — Total Packets keeps them", () => {
+    const raw = [
+      udp(1, "CON 0x01 token=AAAA"),
+      udp(2, "CON 0x02 token=BBBB"),
+      udp(3, "ACK 0x03 token=CCCC"),
+    ]
+    const a = analyzePcap({
+      packets: raw,
+      stats: {
+        totalPackets: raw.length,
+        totalBytes: raw.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { UDP: raw.length },
+        linkTypes: [1], decodedPackets: raw.length,
+      },
+    }, { dedupe: true })
+    expect(a.job.rawPacketCount).toBe(3)
+    expect(a.job.duplicateFrameCount).toBeUndefined() // nothing dropped → no accounting
+    expect(a.job.totalPackets).toBe(3)
+    expect(a.packets.map((p) => p.num)).toEqual([1, 2, 3])
+  })
+
+  it("two ICMP echoes of equal length are distinct traffic when payloads differ", () => {
+    const raw = [
+      udp(1, "seq=1 data:AAAAAAAA"),
+      udp(2, "seq=2 data:BBBBBBBB"),
+    ]
+    const a = analyzePcap({
+      packets: raw,
+      stats: {
+        totalPackets: raw.length,
+        totalBytes: raw.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { UDP: raw.length },
+        linkTypes: [1], decodedPackets: raw.length,
+      },
+    }, { dedupe: true })
+    expect(a.job.duplicateFrameCount).toBeUndefined()
+    expect(a.job.totalPackets).toBe(2)
+    expect(a.packets.length).toBe(2)
+  })
+
+  it("byte-identical frames (the double-capture artifact) are still dropped", () => {
+    const raw = [
+      udp(1, "IDENTICAL"),
+      udp(2, "IDENTICAL"),
+      udp(3, "IDENTICAL"),
+      udp(4, "OTHER"),
+    ]
+    const a = analyzePcap({
+      packets: raw,
+      stats: {
+        totalPackets: raw.length,
+        totalBytes: raw.reduce((s, p) => s + p.length, 0),
+        duration: 1, startTime: 1000000, endTime: 1000001,
+        protocols: { UDP: raw.length },
+        linkTypes: [1], decodedPackets: raw.length,
+      },
+    }, { dedupe: true })
+    expect(a.job.duplicateFrameCount).toBe(2)
+    expect(a.packets.map((p) => p.num)).toEqual([1, 2])
+  })
+})

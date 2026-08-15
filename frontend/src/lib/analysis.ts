@@ -1493,10 +1493,18 @@ export function deduplicatePackets(packets: ParsedPacket[]): { packets: ParsedPa
   const out: ParsedPacket[] = []
   let prev: ParsedPacket | undefined
   for (const p of packets) {
+    // A "double-capture artifact" is the SAME frame captured twice back to
+    // back — the whole frame, bytes included. Everything up to the payload
+    // can be equal for legitimately DIFFERENT packets (two UDP datagrams of
+    // the same length on one socket, ICMP echoes, TCP retransmissions share
+    // seq/len/flags): without payload equality the dedupe silently deletes
+    // real traffic and Total Packets reads lower than the file (QA: sample
+    // lost CoAP/ICMP repeats; a ping flood reads as a fraction of itself).
     if (prev && p.srcIp === prev.srcIp && p.dstIp === prev.dstIp &&
         p.srcPort === prev.srcPort && p.dstPort === prev.dstPort &&
         p.protocol === prev.protocol && p.length === prev.length &&
-        p.tcpSeq === prev.tcpSeq && p.tcpFlags === prev.tcpFlags) continue
+        p.tcpSeq === prev.tcpSeq && p.tcpFlags === prev.tcpFlags &&
+        p.payload === prev.payload) continue
     out.push(p)
     prev = p
   }
