@@ -6,10 +6,10 @@ import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn, formatTime } from "@/lib/utils"
 import { isPrivateIP, formatBytes } from "@/lib/map-data"
-import { vendorLabel } from "@/lib/oui"
+import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, countDuplicateFrames, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -261,8 +261,12 @@ export default function ReportsPage() {
   const p2pExcluded = useMemo(() => packets.reduce((s, p) => s + ((p.srcPort && p.dstPort) ? 1 : 0), 0) - portTotal, [packets, portTotal])
   // Legacy jobs stored raw frames (dedupe absent): count on the stored set.
   // Fresh jobs record the removal in job.duplicateFrameCount and store the
-  // ANALYZED set — the count then comes from the job, not a re-count.
-  const duplicateFrames = useMemo(() => job?.duplicateFrameCount ?? countDuplicateFrames(packets), [job, packets])
+  // ANALYZED set — the count then comes from the job, not a re-count. A fresh
+  // job that removed NOTHING has rawPacketCount set but duplicateFrameCount
+  // undefined — recounting the analyzed set would re-derive phantom "removed"
+  // frames (QA: report said "2 consecutive duplicate frames removed" on a
+  // capture that removed none — the recount matched byte-identical replies).
+  const duplicateFrames = useMemo(() => duplicateFrameCountOf(job, packets), [job, packets])
   // Capture-quality grade from the duplicate ratio (double-capture artifact):
   // >=25% Poor, >=5% Degraded, else Good. Only when dedupe accounting exists.
   const dedupeGrade = useMemo(() => {
@@ -459,7 +463,7 @@ export default function ReportsPage() {
   const ouiStatus = jobInfo?.ouiVersion || (
     devices.some((d) => d.vendor)
       ? "Vendor Lookup Active (embedded OUI database)"
-      : devices.some((d) => d.mac && d.mac !== "\u2014")
+      : devices.some((d) => isUnicastMac(d.mac))
         ? "Vendor Lookup Active — no vendor match for captured MACs"
         : "embedded OUI database active — no MAC addresses present in this capture"
   )
@@ -1036,7 +1040,7 @@ export default function ReportsPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {sessions.slice(0, 15).map((s) => (
+                        {sessionTableRows(sessions, packets).slice(0, 15).map((s) => (
                           <tr key={s.id} className="border-b border-border/30">
                             <td className="py-1.5 pr-2 font-mono hl-src">{s.srcIp}:{s.srcPort}</td>
                             <td className="py-1.5 pr-2 font-mono">{s.dstIp}:{s.dstPort}</td>
@@ -1113,7 +1117,7 @@ export default function ReportsPage() {
                       { label: "Requests", value: http.length.toLocaleString() },
                       { label: "Hosts", value: new Set(http.map((h) => h.host)).size.toLocaleString() },
                       { label: "Errors (4xx/5xx)", value: http.filter((h) => h.status >= 400).length.toLocaleString() },
-                      { label: "Data", value: formatBytes(http.reduce((s, h) => s + h.length, 0)) },
+                      { label: "HTTP Bytes", value: formatBytes(http.reduce((s, h) => s + h.length, 0)), sub: "Total HTTP request+response bytes carried by the capture (headers and bodies) — distinct from downloadable file bodies, which section 10 reports separately." },
                     ]} />
                   </div>
                   <div className="overflow-x-auto">
@@ -1271,7 +1275,7 @@ export default function ReportsPage() {
                   </div>
                   {files.length === 0 && (
                     <div className="border border-muted rounded p-3 text-xs text-muted-foreground space-y-1">
-                      <p className="font-medium text-foreground">No HTTP payloads extracted.</p>
+                      <p className="font-medium text-foreground">No downloadable file bodies were captured.</p>
                       <p>Reason: {report.emptyReasons.files}</p>
                     </div>
                   )}
@@ -1477,9 +1481,9 @@ export default function ReportsPage() {
                               </span>
                             </td>
                             <td className="py-2 pr-2 font-mono ip-addr" title={d.ip}>{shortIp(d.ip)}</td>
-                            <td className="py-2 pr-2 font-mono text-muted-foreground">{offLink ? "—" : (d.mac || "—")}</td>
+                            <td className="py-2 pr-2 font-mono text-muted-foreground">{offLink ? "—" : displayMac(d.mac)}</td>
                             <td className="py-2 pr-2">{d.hostname && d.hostname !== d.ip ? d.hostname : <span className="text-muted-foreground italic">Not resolved</span>}</td>
-                            <td className="py-2 pr-2 text-muted-foreground">{offLink ? "—" : (vendorLabel(d.vendor, d.mac) || "—")}</td>
+                            <td className="py-2 pr-2 text-muted-foreground">{offLink ? "—" : (vendorLabel(d.vendor, displayMac(d.mac)) || "—")}</td>
                             <td className="py-2 text-right">{d.packets.toLocaleString()}</td>
                           </tr>
                           )
@@ -2040,7 +2044,7 @@ export default function ReportsPage() {
                         <div>
                           <h4 className="font-semibold mb-2">Threat Summary</h4>
                           <p><strong>Alerts:</strong> {alerts.length} — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}</p>
-                          <p><strong>IOCs:</strong> {report.iocs.length} ({report.iocs.filter((i) => i.source === "CONFIRMED_ALERT").length} confirmed, {report.iocs.filter((i) => i.source === "BEHAVIORAL_METRIC").length} behavioral)</p>
+                          <p><strong>IOCs:</strong> {report.iocs.length} — Status: {statusCountsLabel(summarizeStatuses(report.iocs))}</p>
                           <p><strong>MITRE Mappings:</strong> {report.mitre.length}</p>
                           <p><strong>Risk Score:</strong> {riskValue()}</p>
                           {risk && <p><strong>Raw Score:</strong> {Math.round(risk.rawScore * 10) / 10}</p>}

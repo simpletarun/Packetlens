@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -1244,7 +1244,7 @@ const rows = flowTableRows(flows, packets)
     expect(csvLines[3].startsWith("192.168.1.10,6750,46.101.206.53,443,")).toBe(true)
   })
 
-  it("carries the per-flow RTT through to the page rows", () => {
+it("carries the per-flow RTT through to the page rows", () => {
     const flows: Flow[] = [
       { id: "f1", srcIp: "10.0.0.1", dstIp: "10.0.0.2", srcPort: 1234, dstPort: 443, protocol: "TCP", packets: 4, bytesTotal: 400, bytesSent: 100, bytesRecv: 300, duration: 2, startTime: "", endTime: "", rttMs: 42.5 },
       { id: "f2", srcIp: "10.0.0.1", dstIp: "10.0.0.3", srcPort: 1235, dstPort: 53, protocol: "UDP", packets: 2, bytesTotal: 100, bytesSent: 50, bytesRecv: 50, duration: 1, startTime: "", endTime: "" },
@@ -1252,6 +1252,75 @@ const rows = flowTableRows(flows, packets)
     const rows = flowTableRows(flows, [])
     expect(rows[0].rttMs).toBe(42.5)
     expect(rows[1].rttMs).toBeUndefined()
+  })
+})
+
+describe("sessionTableRows — the report's sessions table is initiator-first like the flows table and the CSV (QA: PDF listed the server 142.250.80.46:443 as Initiator)", () => {
+  const mkSession = (o: Partial<Parameters<typeof sessionTableRows>[0][number]>) => ({
+    id: "s1", srcIp: "104.16.103.112", dstIp: "192.168.1.10", srcPort: 443, dstPort: 13248,
+    protocol: "TCP", packets: 10, bytes: 1000, state: "ESTABLISHED", ...o,
+  })
+
+  it("flips a server-first canonical record to the client side", () => {
+    const packets = [
+      { srcIp: "192.168.1.10", dstIp: "104.16.103.112", srcPort: 13248, dstPort: 443, protocol: "TCP", flags: "SYN" },
+      { srcIp: "104.16.103.112", dstIp: "192.168.1.10", srcPort: 443, dstPort: 13248, protocol: "TCP", flags: "SYN-ACK" },
+      { srcIp: "192.168.1.10", dstIp: "104.16.103.112", srcPort: 13248, dstPort: 443, protocol: "TCP", flags: "ACK" },
+    ]
+    const rows = sessionTableRows([mkSession({})], packets)
+    expect(rows[0].srcIp).toBe("192.168.1.10")
+    expect(rows[0].srcPort).toBe(13248)
+    expect(rows[0].dstIp).toBe("104.16.103.112")
+    expect(rows[0].dstPort).toBe(443)
+    // The rest of the session row survives the flip untouched.
+    expect(rows[0].id).toBe("s1")
+    expect(rows[0].packets).toBe(10)
+    expect(rows[0].bytes).toBe(1000)
+    expect(rows[0].state).toBe("ESTABLISHED")
+  })
+
+  it("keeps an already initiator-first session unchanged", () => {
+    const s = mkSession({ srcIp: "192.168.1.10", dstIp: "46.101.206.53", srcPort: 6750, dstPort: 443 })
+    const rows = sessionTableRows([s], [{ srcIp: "192.168.1.10", dstIp: "46.101.206.53", srcPort: 6750, dstPort: 443, protocol: "TCP", flags: "SYN" }])
+    expect(rows[0].srcIp).toBe("192.168.1.10")
+  })
+
+  it("UDP sessions flip to the endpoint that sent the first observed packet", () => {
+    const packets = [
+      { srcIp: "192.168.1.10", dstIp: "8.8.8.8", srcPort: 54321, dstPort: 53, protocol: "UDP", flags: "" },
+      { srcIp: "8.8.8.8", dstIp: "192.168.1.10", srcPort: 53, dstPort: 54321, protocol: "UDP", flags: "" },
+    ]
+    const rows = sessionTableRows([mkSession({ protocol: "UDP", srcIp: "8.8.8.8", dstIp: "192.168.1.10", srcPort: 53, dstPort: 54321, state: "STATELESS" })], packets)
+    expect(rows[0].srcIp).toBe("192.168.1.10")
+  })
+
+  it("a mid-stream capture with no SYN keeps the canonical order (nothing better exists)", () => {
+    const packets = [{ srcIp: "8.8.8.8", dstIp: "192.168.1.10", srcPort: 53, dstPort: 54321, protocol: "UDP", flags: "" }]
+    const rows = sessionTableRows([mkSession({ protocol: "UDP", srcIp: "8.8.8.8", dstIp: "192.168.1.10", srcPort: 53, dstPort: 54321, state: "STATELESS" })], packets)
+    expect(rows[0].srcIp).toBe("8.8.8.8")
+  })
+})
+
+describe("duplicateFrameCountOf — the report's duplicate count never re-derives phantom removals (QA: '2 removed' on a capture that removed none)", () => {
+  const dupPair = [
+    { srcIp: "192.168.1.10", dstIp: "8.8.8.8", srcPort: 54321, dstPort: 443, protocol: "TCP", length: 60, tcpSeq: 10, flags: "ACK" },
+    { srcIp: "192.168.1.10", dstIp: "8.8.8.8", srcPort: 54321, dstPort: 443, protocol: "TCP", length: 60, tcpSeq: 10, flags: "ACK" },
+  ]
+
+  it("a fresh job that removed nothing reports 0 — the analyzed set is never recounted", () => {
+    expect(duplicateFrameCountOf({ rawPacketCount: 152 }, dupPair)).toBe(0)
+  })
+
+  it("a fresh job with a recorded removal uses the job's own number", () => {
+    expect(duplicateFrameCountOf({ rawPacketCount: 152, duplicateFrameCount: 2 }, dupPair)).toBe(2)
+    expect(duplicateFrameCountOf({ rawPacketCount: 152, duplicateFrameCount: 0 }, dupPair)).toBe(0)
+  })
+
+  it("true legacy jobs (neither field present) recount the stored raw set", () => {
+    expect(duplicateFrameCountOf({}, dupPair)).toBe(1)
+    expect(duplicateFrameCountOf(null, dupPair)).toBe(1)
+    expect(duplicateFrameCountOf(undefined, dupPair)).toBe(1)
+    expect(duplicateFrameCountOf(undefined, [])).toBe(0)
   })
 })
 
@@ -1347,10 +1416,24 @@ describe("severity and status stay visibly separate (QA: 'Alerts: 1 (1 critical)
     expect(summarizeStatuses([])).toEqual({ confirmed: 0, likely: 0, suspected: 0, observed: 0 })
   })
 
-  it("statusCountsLabel always states the confirmed count, zero included", () => {
+it("statusCountsLabel always states the confirmed count, zero included", () => {
     expect(statusCountsLabel({ confirmed: 0, likely: 0, suspected: 1, observed: 0 })).toBe("0 confirmed · 1 suspected")
     expect(statusCountsLabel({ confirmed: 1, likely: 0, suspected: 1, observed: 0 })).toBe("1 confirmed · 1 suspected")
     expect(statusCountsLabel({ confirmed: 0, likely: 0, suspected: 0, observed: 0 })).toBe("0 confirmed")
+  })
+
+  it("IOC statuses aggregate exactly like alerts — a SUSPECTED IOC is never 'confirmed' (QA: report parenthetical labeled IOC sources as confirmed/behavioral)", () => {
+    // The report's Threat Summary line aggregates the IOC statuses with the
+    // same helper the Alerts line uses; a SUSPECTED IOC (the detection's own
+    // status) must never read as confirmed.
+    const iocs = [
+      { type: "threat", value: "8.8.8.8", status: "SUSPECTED" as const },
+      { type: "domain", value: "example.com", status: "CONFIRMED" as const },
+      { type: "behavioral", value: "exfil", status: undefined }, // legacy: no status field
+    ]
+    const label = statusCountsLabel(summarizeStatuses(iocs))
+    expect(label).toBe("2 confirmed · 1 suspected")
+    expect(label).not.toContain("behavioral")
   })
 
   it("a CRITICAL-severity SUSPECTED finding renders 0 confirmed, never '1 confirmed'", () => {

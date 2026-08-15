@@ -1,6 +1,7 @@
 import { PCAPResult, ParsedPacket, tlsCipherSuiteName } from './pcap'
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, RISK_PARAMS } from './risk'
 import { captureRates, CaptureRates, CaptureQuality } from './metrics'
+import { isUnicastMac } from './oui'
 
 export const ANALYZER_VERSION = "3.4.0"
 
@@ -1142,7 +1143,7 @@ function delegatedPrefixes(packets: ParsedPacket[]): Set<string> {
   const prefixSourcers = new Map<string, Set<string>>()
   for (const p of packets) {
     const ip = p.srcIp
-    if (!ip || !p.srcMac) continue
+    if (!ip || !p.srcMac || !isUnicastMac(p.srcMac)) continue
     if (ip.includes(':') && !isPrivateIp(ip) && !isNonUnicast(ip)) {
       const prefix = ip.split(':').slice(0, 4).join(':')
       let s = prefixSourcers.get(prefix)
@@ -1165,13 +1166,13 @@ function delegatedPrefixes(packets: ParsedPacket[]): Set<string> {
   // router both source 2401:4900:1:2).
   const arpMacByIp = new Map<string, string>()
   for (const p of packets) {
-    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac) continue
+    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac || !isUnicastMac(p.arpSenderMac)) continue
     if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
   }
   const lanMacs = new Set<string>(arpMacByIp.values())
   for (const p of packets) {
     const ip = p.srcIp
-    if (!ip || !p.srcMac || !ip.includes(':')) continue
+    if (!ip || !p.srcMac || !isUnicastMac(p.srcMac) || !ip.includes(':')) continue
     const v = ip.toLowerCase()
     if (v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')) lanMacs.add(p.srcMac)
   }
@@ -1242,7 +1243,7 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
   // MAC as a real LAN interface for the shadow-MAC collapse above.)
   const arpMacByIp = new Map<string, string>()
   for (const p of packets) {
-    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac) continue
+    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac || !isUnicastMac(p.arpSenderMac)) continue
     if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
   }
   for (const p of packets) {
@@ -1259,8 +1260,12 @@ function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
       // remote public IPs never carry a MAC here. A public-scope IPv6 inside
       // the /64 the LAN itself sources (SLAAC/DHCPv6 on the same NIC) carries
       // its own interface's MAC and folds into that device as an alias.
-      const onSource = p.srcIp === ip ? p.srcMac : ''
-      const onOwn = p.srcIp === ip ? p.srcMac : (isPrivateIp(ip) ? p.dstMac : '')
+      // Non-unicast MACs (broadcast ff:ff:ff:ff:ff:ff, multicast, zero) are
+      // frame-addressing artifacts: an ARP REQUEST's dstMac is the broadcast
+      // address and must never become the TARGET's device MAC (QA: unresolved
+      // ARP target 192.168.1.2 displayed ff:ff:ff:ff:ff:ff as its NIC).
+      const onSource = p.srcIp === ip ? (isUnicastMac(p.srcMac) ? p.srcMac : '') : ''
+      const onOwn = p.srcIp === ip ? (isUnicastMac(p.srcMac) ? p.srcMac : '') : (isPrivateIp(ip) && isUnicastMac(p.dstMac) ? p.dstMac : '')
       // The ARP-declared sender MAC wins when present: it is the IP's own
       // interface binding, independent of whether the capture stamped the
       // Ethernet header (the router's identity is what merges its addresses).

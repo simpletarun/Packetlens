@@ -156,6 +156,22 @@ export function countDuplicateFrames(packets: { srcIp?: string; dstIp?: string; 
   return n
 }
 
+// How many consecutive duplicate frames the report should state. Fresh jobs
+// record the removal in job.duplicateFrameCount and store the ANALYZED set;
+// a fresh job that removed NOTHING has rawPacketCount set but
+// duplicateFrameCount undefined — recounting the analyzed set would re-derive
+// phantom "removed" frames (QA: report said "2 consecutive duplicate frames
+// removed" on a capture that removed none). Only jobs that predate BOTH
+// fields (true legacy: raw frames stored, no dedupe accounting) recount.
+export function duplicateFrameCountOf(
+  job: { duplicateFrameCount?: number; rawPacketCount?: number } | null | undefined,
+  packets: { srcIp?: string; dstIp?: string; srcPort?: number; dstPort?: number; protocol?: string; length?: number; tcpSeq?: number; flags?: string }[],
+): number {
+  if (job && typeof job.duplicateFrameCount === "number") return job.duplicateFrameCount
+  if (job && typeof job.rawPacketCount === "number") return 0
+  return countDuplicateFrames(packets)
+}
+
 // Endpoint table rows: unspecified/multicast placeholders (::, ::1, ff00::/8)
 // are interface chatter, not hosts — never listed as endpoint rows (QA).
 export function endpointRowsOf<T extends { ip: string }>(devices: T[]): T[] {
@@ -1430,7 +1446,7 @@ const flowKey = (x: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: 
   return `${x.protocol}|${a}|${b}|${pa ?? ""}|${pb ?? ""}`
 }
 
-function flowInitiatorFlip(f: Flow, pkts: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[]): boolean {
+function flowInitiatorFlip(f: { directionUnknown?: boolean; srcIp: string; dstIp: string }, pkts: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[]): boolean {
   if (f.directionUnknown) return false
   const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
   const init = syn ? syn.srcIp : pkts[0]?.srcIp
@@ -1477,6 +1493,32 @@ export function flowTableRows(
       directionUnknown: f.directionUnknown,
       rttMs: f.rttMs,
     }
+  })
+}
+
+// The report's Sessions table mirrors the flows table: initiator-first.
+// Sessions are one per direction-normalized conversation and the store keeps
+// the canonical endpoint order (which can be service-first), so without the
+// flip the "Initiator" column showed the RESPONDER — e.g. Google
+// 142.250.80.46:443 in Initiator next to the client's ephemeral source port
+// (QA: PDF sessions table listed the server as Initiator). Same SYN /
+// first-observed-packet rule as the flows table and the CSV export.
+export function sessionTableRows(
+  sessions: { id: string; srcIp: string; dstIp: string; srcPort: number; dstPort: number; protocol: string; packets: number; bytes: number; state: string }[],
+  packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[],
+): { id: string; srcIp: string; dstIp: string; srcPort: number; dstPort: number; protocol: string; packets: number; bytes: number; state: string }[] {
+  const sessionPackets = new Map<string, typeof packets>()
+  for (const p of packets) {
+    const k = flowKey(p)
+    const arr = sessionPackets.get(k)
+    if (arr) arr.push(p)
+    else sessionPackets.set(k, [p])
+  }
+  return sessions.map((s) => {
+    const flip = flowInitiatorFlip(s, sessionPackets.get(flowKey(s)) ?? [])
+    return flip
+      ? { ...s, srcIp: s.dstIp, dstIp: s.srcIp, srcPort: s.dstPort, dstPort: s.srcPort }
+      : { ...s }
   })
 }
 

@@ -1095,6 +1095,28 @@ describe("Analysis engine", () => {
     expect(host?.addresses ?? []).toEqual(expect.not.arrayContaining(["203.0.113.9"]))
   })
 
+  it("an unresolved ARP target never inherits the broadcast MAC, and targets never merge through it (QA: device showed ff:ff:ff:ff:ff:ff)", () => {
+    const result: PCAPResult = {
+      packets: [
+        // The router probes .2 and .3 with ARP requests — the frame dstMac is
+        // the broadcast address, NOT the target's NIC.
+        makePacket({ num: 1, srcMac: "aa:bb:cc:dd:ee:01", dstMac: "ff:ff:ff:ff:ff:ff", srcIp: "192.168.1.1", dstIp: "192.168.1.2", protocol: "ARP", appProtocol: "ARP-Request", tcpFlags: undefined, arpSenderMac: "aa:bb:cc:dd:ee:01", length: 60 }),
+        makePacket({ num: 2, srcMac: "aa:bb:cc:dd:ee:01", dstMac: "ff:ff:ff:ff:ff:ff", srcIp: "192.168.1.1", dstIp: "192.168.1.3", protocol: "ARP", appProtocol: "ARP-Request", tcpFlags: undefined, arpSenderMac: "aa:bb:cc:dd:ee:01", length: 60 }),
+      ],
+      stats: { totalPackets: 2, totalBytes: 120, duration: 1, startTime: 1000000, endTime: 1000001, protocols: { ARP: 2 } },
+    }
+    const analysis = analyzePcap(result)
+    const t2 = analysis.devices.find((d) => d.ip === "192.168.1.2")
+    const t3 = analysis.devices.find((d) => d.ip === "192.168.1.3")
+    expect(t2?.mac).toBe("\u2014")
+    expect(t3?.mac).toBe("\u2014")
+    expect(t2?.mac).not.toContain("ff:ff:ff:ff:ff:ff")
+    // The broadcast MAC must never merge two unresolved targets into one row.
+    expect(t2?.id).not.toBe(t3?.id)
+    // The router keeps its own real MAC from the ARP sender declaration.
+    expect(analysis.devices.find((d) => d.ip === "192.168.1.1")?.mac).toBe("aa:bb:cc:dd:ee:01")
+  })
+
   it("undecodable packets form one direction-unknown flow with no fabricated bytes (QA large/verylarge)", () => {
     const undecodable = (n: number, length: number): ParsedPacket => ({
       num: n, timestamp: 1000000 + n, length, origLength: length,

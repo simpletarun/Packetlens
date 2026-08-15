@@ -5,7 +5,7 @@ import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
 import { cn } from "@/lib/utils"
-import { vendorLabel } from "@/lib/oui"
+import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Search, X } from "lucide-react"
@@ -118,7 +118,7 @@ export default function DevicesPage() {
               a bare 0 (QA: Vendors 0 on the raw-IP capture). CGNAT ranges
               (100.64/10) are also treated as local per RFC 6598 — the counts
               below follow that rule (QA: CGNAT classification undocumented). */}
-          {!devices.some((d) => d.mac && d.mac !== "\u2014") && (
+          {!devices.some((d) => isUnicastMac(d.mac)) && (
             <p className="px-4 pb-2 text-xs text-muted-foreground">No MAC addresses in this capture — vendor lookup needs Ethernet headers (raw IP / IP-only pcap).</p>
           )}
           {devices.some((d) => { const p = d.ip.split("."); return p[0] === "100" && Number(p[1]) >= 64 && Number(p[1]) <= 127 }) && (
@@ -166,11 +166,11 @@ export default function DevicesPage() {
                     >
                       <td className="py-2 pl-4 pr-2 font-mono text-muted-foreground whitespace-nowrap">{d.ip}</td>
                       <td className="py-2 pr-2 font-mono truncate max-w-[160px]" title={d.hostname && d.hostname !== d.ip ? d.hostname : "Not resolved"}>{d.hostname && d.hostname !== d.ip ? d.hostname : <span className="italic text-muted-foreground">Not resolved</span>}</td>
-                      <td className="py-2 pr-2 font-mono text-muted-foreground whitespace-nowrap">{d.mac}</td>
+                      <td className="py-2 pr-2 font-mono text-muted-foreground whitespace-nowrap">{displayMac(d.mac)}</td>
                       <td className="py-2 pr-2 font-mono text-muted-foreground truncate max-w-[200px]" title={(d.addresses ?? []).join(", ")}>
                         {d.addresses && d.addresses.length > 0 ? d.addresses.join(", ") : '\u2014'}
                       </td>
-                      <td className="py-2 pr-2 truncate max-w-[120px]" title={vendorLabel(d.vendor, d.mac)}>{vendorLabel(d.vendor, d.mac) || '\u2014'}</td>
+                      <td className="py-2 pr-2 truncate max-w-[120px]" title={vendorLabel(d.vendor, displayMac(d.mac))}>{vendorLabel(d.vendor, displayMac(d.mac)) || '\u2014'}</td>
                       {/* OS now comes from the UA/TTL fingerprint (A2); fall
                           back to a dash instead of a blank cell (U4). The
                           title names the evidence source (QA: TTL-based
@@ -193,9 +193,9 @@ export default function DevicesPage() {
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-2 text-xs">
                     <div className="space-y-1">
                       <p><span className="text-muted-foreground">Hostname: </span>{selected.hostname && selected.hostname !== selected.ip ? selected.hostname : <span className="text-muted-foreground italic">Not resolved</span>}</p>
-                      <p><span className="text-muted-foreground">MAC: </span>{selected.mac}</p>
+                      <p><span className="text-muted-foreground">MAC: </span>{displayMac(selected.mac)}</p>
                       <p><span className="text-muted-foreground">Other addresses: </span>{(selected.addresses ?? []).join(", ") || '\u2014'}</p>
-                      <p><span className="text-muted-foreground">Vendor: </span>{vendorLabel(selected.vendor, selected.mac) || '\u2014'}</p>
+                      <p><span className="text-muted-foreground">Vendor: </span>{vendorLabel(selected.vendor, displayMac(selected.mac)) || '\u2014'}</p>
                       <p><span className="text-muted-foreground">OS: </span>{selected.os || '\u2014'}{selected.osSource === "ttl" && <span className="text-muted-foreground italic"> (inferred from TTL)</span>}{selected.osSource === "ua" && <span className="text-muted-foreground italic"> (from User-Agent)</span>}</p>
                       <p><span className="text-muted-foreground">Location: </span>{profile.geo}</p>
                     </div>
