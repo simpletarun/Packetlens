@@ -1423,6 +1423,12 @@ describe("Credential extraction (deriveCredentials)", () => {
     expect(analysis.files[0].mimeType).toBe("application/x-www-form-urlencoded")
     expect(analysis.files[1].mimeType).toBe("text/plain")
     expect(analysis.files[1].filename).toBe("doc.txt")
+    // A bare Content-Type request body is an HTTP payload (form body), never
+    // a "file"; only a filename= attribute makes it a file transfer (QA:
+    // minor.pcapng "3 files extracted" were 3 login form bodies).
+    expect(analysis.files[0].kind).toBe("form-body")
+    expect(analysis.files[0].filename).toBe("")
+    expect(analysis.files[1].kind).toBe("file-transfer")
   })
 
   it("a plus sign in form data decodes to a space", () => {

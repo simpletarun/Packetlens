@@ -108,6 +108,8 @@ interface FileEntry {
   id: string; timestamp: string; srcIp: string; dstIp: string
   filename: string; mimeType: string; size: number
   protocol: string; md5: string
+  /** file-transfer (has filename=) vs form-body (HTTP request payload). */
+  kind: "file-transfer" | "form-body"
 }
 
 interface CredentialEntry {

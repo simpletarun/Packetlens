@@ -977,6 +977,8 @@ it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW
     expect(text).toContain("1 confirmed finding detected (Plaintext HTTP Credentials)")
     expect(text).toContain("NOT clean under the configured rules")
     expect(text).toContain("not proof that the capture is universally malicious")
+    // The score is a rule-output summary, never a probability of compromise.
+    expect(text).toContain("does not represent a probability of compromise")
     expect(text).not.toContain("No suspicious indicators")
   })
 
@@ -1024,8 +1026,8 @@ it("pluralizes the alert count and names EVERY fired rule (QA: mic.pcapng hid th
   })
 })
 
-describe("MITRE mapping for plaintext credential alerts (T1552, not T1040)", () => {
-  it("recommends rotating the exposed accounts, not generic Network Sniffing investigation", () => {
+describe("MITRE mapping for plaintext credential alerts (T1040, not T1552)", () => {
+  it("maps wire-exposed credentials to Network Sniffing and recommends rotation + HTTPS", () => {
     const report = buildReportAnalysis({
       job: null,
       jobInfo: {},
@@ -1045,14 +1047,61 @@ describe("MITRE mapping for plaintext credential alerts (T1552, not T1040)", () 
         topTalkers: [], iocs: [], mitreMappings: [],
       },
     })
-    const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials"))
-    expect(rec?.text).toBe("Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS")
+    const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials") || r.text.includes("Cleartext credentials"))
     expect(rec?.severity).toBe(4)
-    const mitre = report.mitre.find((m) => m.id === "T1552")
-    expect(mitre?.technique).toBe("Unsecured Credentials")
+    // T1040 Network Sniffing: credentials captured from the wire — a packet
+    // capture IS passive interception (MITRE: "passively capture network
+    // traffic... including authentication material"). T1552 covers credentials
+    // in insecure STORAGE (files, logs, shell history), never transit (QA:
+    // minor.pcapng mapped to T1552 and claimed it covered "in transit").
+    const mitre = report.mitre.find((m) => m.id === "T1040")
+    expect(mitre?.technique).toBe("Network Sniffing")
     expect(mitre?.description).toContain("cleartext")
-    // T1040 (Network Sniffing) is the WRONG frame for passive HTTP creds.
-    expect(report.mitre.find((m) => m.id === "T1040")).toBeUndefined()
+    expect(mitre?.status).toBe("CONFIRMED")
+    expect(report.mitre.find((m) => m.id === "T1552")).toBeUndefined()
+  })
+
+  it("legacy persisted T1552 rows keep rendering (their own stored description is preserved)", () => {
+    const report = buildReportAnalysis({
+      ...state,
+      advancedMetrics: {
+        ...state.advancedMetrics,
+        mitreMappings: [{ id: "T1552", technique: "Unsecured Credentials", description: "legacy row", severity: 4 }],
+      },
+    })
+    const m = report.mitre.find((x) => x.id === "T1552")
+    expect(m?.technique).toBe("Unsecured Credentials")
+    expect(m?.description).toBe("legacy row")
+  })
+})
+
+describe("TLS certificate empty-reason is version-aware — 1.2 is never blamed on 1.3 encryption (QA: minor.pcapng)", () => {
+  const tlsRow = (version: string) => ({ id: "t1", timestamp: new Date(T0 * 1000).toISOString(), srcIp: "10.0.0.5", dstIp: "203.0.113.9", version, sni: "example.com", cipherSuite: "TLS_AES_128_GCM_SHA256", ja3: "", issuer: "", validityDays: 0 })
+
+  it("1.2-only captures explain missing certificates via resumed/missed handshakes, not encryption", () => {
+    const r = buildReportAnalysis({ ...state, tls: [tlsRow("TLS 1.2"), tlsRow("TLS 1.2")] })
+    expect(r.emptyReasons.certificates).toContain("TLS 1.2")
+    expect(r.emptyReasons.certificates).toContain("resumed/abbreviated")
+    expect(r.emptyReasons.certificates).not.toContain("TLS 1.3")
+  })
+
+  it("1.3-only captures attribute the absence to 1.3 encryption", () => {
+    const r = buildReportAnalysis({ ...state, tls: [tlsRow("TLS 1.3")] })
+    expect(r.emptyReasons.certificates).toContain("TLS 1.3")
+    expect(r.emptyReasons.certificates).toContain("encrypt")
+  })
+
+  it("mixed 1.3 + 1.2 captures explain BOTH — 1.2 is not blanket-claimed encrypted (QA: 29x1.3 + 5x1.2)", () => {
+    const r = buildReportAnalysis({ ...state, tls: [tlsRow("TLS 1.3"), tlsRow("TLS 1.2")] })
+    expect(r.emptyReasons.certificates).toContain("1 TLS 1.3 handshake")
+    expect(r.emptyReasons.certificates).toContain("1 TLS 1.2 handshake")
+    expect(r.emptyReasons.certificates).toContain("encrypt the server Certificate")
+    expect(r.emptyReasons.certificates).toContain("resumed/abbreviated")
+  })
+
+  it("no TLS at all keeps the plain reason", () => {
+    const r = buildReportAnalysis(state)
+    expect(r.emptyReasons.certificates).toBe("No TLS handshake packets captured.")
   })
 })
 

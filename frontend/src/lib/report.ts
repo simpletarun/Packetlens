@@ -253,11 +253,14 @@ const TECHNIQUE_RULES: Record<string, string[]> = {
   "T1071.004": ["DNS-TUNNEL-001"],
   T1041: ["DATA-EXFIL-001"],
   T1071: ["C2-BEACON-001"],
-  // Plaintext credentials transmitted over the wire = Unsecured Credentials
-  // (T1552), NOT Network Sniffing (T1040 — that requires passive interception
-  // evidence we never have). Semantic fix: HTTP-CREDS-001/CRED-LEAK-001 are
-  // exposure events, and their mapping must say so (QA: creds mapped T1040).
-  T1552: ["HTTP-CREDS-001", "CRED-LEAK-001"],
+  // Credentials observed in cleartext ON THE WIRE = Network Sniffing (T1040 —
+  // MITRE: "passively capture network traffic... including authentication
+  // material"; a packet capture IS passive interception). T1552 (Unsecured
+  // Credentials) covers credentials found in insecure STORAGE (files, logs,
+  // shell history) — it is never a "credentials in transit" technique (QA:
+  // minor.pcapng mapped plaintext HTTP creds to T1552 and claimed T1552
+  // covers "credentials submitted... in transit", which MITRE does not say).
+  T1040: ["HTTP-CREDS-001", "CRED-LEAK-001"],
   T1105: ["MALWARE-DL-001"],
   "T1583.001": ["TLS-SUSPICIOUS-001"],
 }
@@ -272,12 +275,12 @@ const TECHNIQUE_ID: Record<string, string> = {
   "PORT-SCAN-001": "T1046",
   "SYN-FLOOD-001": "T1498",
   "DNS-TUNNEL-001": "T1048",
-  "CRED-LEAK-001": "T1552",
+  "CRED-LEAK-001": "T1040",
   "MALWARE-DL-001": "T1105",
   "C2-BEACON-001": "T1071",
   "DATA-EXFIL-001": "T1041",
   "TLS-SUSPICIOUS-001": "T1583.001",
-  "HTTP-CREDS-001": "T1552",
+  "HTTP-CREDS-001": "T1040",
 }
 
 // IOC type → alert rule that backs it. The engine fires DNS-TUNNEL-001,
@@ -312,7 +315,12 @@ const TECHNIQUE_NAMES: Record<string, { name: string; desc: string }> = {
   "T1071.004": { name: "DNS Tunneling", desc: "Data encoded in DNS queries/responses" },
   T1041: { name: "Exfiltration Over C2 Channel", desc: "Data sent to external server" },
   T1071: { name: "Application Layer Protocol", desc: "Periodic C2 beaconing detected" },
-  T1552: { name: "Unsecured Credentials", desc: "Credentials submitted or stored in cleartext (transit, files, logs) without protection" },
+  // T1040: credentials captured FROM the wire — passive capture is exactly
+  // what a pcap analysis is. T1552 stays known for LEGACY persisted results
+  // that predate the T1040 remap, with MITRE's actual definition (storage,
+  // not transit).
+  T1040: { name: "Network Sniffing", desc: "Passive capture of network traffic revealing credentials transmitted in cleartext (unencrypted protocols)" },
+  T1552: { name: "Unsecured Credentials", desc: "Credentials discovered in insecure storage (files, logs, shell history) without protection" },
   T1105: { name: "Ingress Tool Transfer", desc: "Download of files from remote systems" },
   "T1583.001": { name: "Acquire Infrastructure: Domains", desc: "Suspicious TLS or domain infrastructure" },
 }
@@ -647,6 +655,10 @@ const MITRE_REC: Record<string, string> = {
   T1071: "Isolate beaconing endpoints and hunt for C2 malware on affected hosts",
   T1090: "Enforce blocking of known proxy/TOR/VPN endpoints; review outbound policy",
   T1003: "Rotate exposed credentials and investigate hosts involved in authentication traffic",
+  T1040: "Cleartext credentials were observed on the wire (possible network sniffing); rotate the affected accounts, migrate the service to HTTPS and watch for interception on the LAN path",
+  // Legacy persisted results mapped plaintext HTTP creds to T1552 — keep a
+  // correct remediation for those rows (T1552 rows can no longer be produced
+  // by fresh analyses).
   T1552: "Plaintext credentials were exposed in cleartext traffic; rotate the affected accounts and migrate the service to HTTPS",
   T1213: "Review data-collection endpoints and restrict access to sensitive repositories",
 }
@@ -1561,7 +1573,7 @@ export function analystConclusion(opts: {
     const names = opts.alerts.map((a) => a.signature).join("; ")
     const summary = `${parts.join(", ")} finding${opts.alerts.length === 1 ? "" : "s"} detected`
     const noneConfirmed = counts.CONFIRMED === 0 ? " No findings were confirmed." : ""
-    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations.`
+    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.
@@ -1581,7 +1593,7 @@ export function analystConclusion(opts: {
   if (opts.score >= 40) {
     return "Suspicious or anomalous behavior was detected. Review the findings above and apply the recommended mitigations."
   }
-  return "No configured detection rules triggered on this capture; under those rules no findings were confirmed. Continue routine monitoring."
+  return "No configured detection rules triggered on this capture; under those rules no findings were confirmed. Continue routine monitoring. The risk score reflects the configured detection rules and does not represent a probability of compromise."
 }
 
 export function buildReportAnalysis(state: ReportState): ReportAnalysis {
@@ -1648,9 +1660,18 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
     const type = IOC_RULE_TYPE[g.ruleId]
     if (!type) continue
     if (iocs.some((i) => i.ruleId === g.ruleId || i.type === type || i.value === g.signature)) continue
+    // An IOC must be an INDICATOR (host, IP, domain), not the finding's
+    // signature: "1 IOC = Plaintext HTTP Credentials" reads like a second
+    // finding (QA: minor.pcapng IOC row duplicated the alert). The endpoint
+    // that submitted the credentials is the indicator of a compromised
+    // account; behavioral rules keep their signature for now (their value
+    // is the behavior itself).
+    const value = type === "credential-theft" && g.srcHosts.length > 0
+      ? g.srcHosts[0]
+      : shortAlertName(g.signature)
     iocs.push({
       type,
-      value: shortAlertName(g.signature),
+      value,
       description: g.evidence,
       severity: g.severity,
       source: "CONFIRMED_ALERT",
@@ -1714,11 +1735,21 @@ const mitre: MitreFinding[] = (advancedMetrics?.mitreMappings ?? [])
           ? "HTTP traffic present, but every response was a partial 206 range — no complete file body crossed the wire, so nothing to extract."
           : "HTTP traffic present, but no downloadable files were identified.",
     credentials: "No supported cleartext authentication observed.",
+    // Version-aware: TLS 1.3 encrypts the Certificate message, but a TLS 1.2
+    // certificate is normally OBSERVABLE in the capture — "0 certificates"
+    // cannot be explained by 1.3 alone when 1.2 handshakes were present
+    // (QA: minor.pcapng 29× TLS 1.3 + 5× TLS 1.2, reason claimed all were
+    // encrypted). Abbreviated/resumed handshakes send no Certificate.
     certificates: tls.length === 0
       ? "No TLS handshake packets captured."
-      : tls.some((r) => /1\.3/.test(r.version))
-        ? "TLS handshakes present, but no certificates were extracted — TLS 1.3 encrypts server certificates after the handshake (RFC 8446), so they are only visible if the session is decrypted."
-        : "TLS handshakes present, but no certificate messages were captured (the handshakes likely completed before the capture started, or the capture missed the server's flight).",
+      : (() => {
+          const v13 = tls.filter((r) => /1\.3/.test(r.version)).length
+          const v12 = tls.filter((r) => /1\.2/.test(r.version)).length
+          const parts: string[] = []
+          if (v13 > 0) parts.push(`${v13} TLS 1.3 handshake${v13 === 1 ? "" : "s"} encrypt the server Certificate message (RFC 8446), so those certificates are visible only if the session is decrypted`)
+          if (v12 > 0) parts.push(`${v12} TLS 1.2 handshake${v12 === 1 ? "" : "s"} send the server Certificate in cleartext during a full handshake — none was extracted, so those handshakes were likely resumed/abbreviated (no Certificate flight) or the capture missed the server's message`)
+          return `TLS handshakes present, but no certificates were extracted. ${parts.join("; ") || "No full handshake with a Certificate message was captured (resumed sessions or a capture that began mid-handshake)."}`
+        })(),
   }
 
   const mode = jobInfo.isDemo

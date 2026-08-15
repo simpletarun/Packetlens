@@ -120,6 +120,9 @@ export interface AnalysisFile {
   id: string; timestamp: string; srcIp: string; dstIp: string
   filename: string; mimeType: string; size: number
   protocol: string; md5: string
+  /** file-transfer = an upload/download carrying a filename=; form-body = an
+   * HTTP request body (e.g. a login form) — never called a "file" (QA). */
+  kind: "file-transfer" | "form-body"
 }
 
 // A VoIP/SIP call: one INVITE dialog unified with its RTP media stream. RTP
@@ -813,26 +816,36 @@ function deriveFiles(packets: ParsedPacket[]): AnalysisFile[] {
   let idx = 0
   for (const p of packets) {
     if (!p.httpMethod) continue
+    // The payload stores the whole FRAME as hex — decode only the TCP
+    // application bytes (same slice as reassembleTlsSni), or the header
+    // region leaks into Content-Type/filename matches and every packet looks
+    // like a file (QA: minor.pcapng "3 files" were 3 login form bodies).
+    const app = typeof p.tcpPayloadLen === "number" ? p.payload.slice((p.length - p.tcpPayloadLen) * 2) : p.payload
     // CR/LF are kept (like deriveCredentials): a CR/LF-stripped dump merges
     // header lines into one string, and \S+ then swallows the NEXT header's
     // name into the mime type (e.g. "...form-urlencodedUser-Agent:").
-    const raw = hexToAsciiKeep(p.payload)
+    const raw = hexToAsciiKeep(app)
     const sep = raw.indexOf('\r\n\r\n')
     const head = sep >= 0 ? raw.slice(0, sep) : raw
     const ct = head.match(/Content-Type:\s*(\S+)/i)
     if (!ct) continue
     const mime = ct[1].replace(/;.*/, '')
     const fn = head.match(/filename="?([^"\r\n]+)"?/i)
+    // A filename= attribute (multipart/form-data upload) is a real file
+    // transfer; a bare Content-Type request body is an HTTP payload (form
+    // submission), never a file (QA: "3 files extracted" were 3 login forms).
+    const kind: AnalysisFile["kind"] = fn ? "file-transfer" : "form-body"
     files.push({
       id: `file-${++idx}`,
       timestamp: safeIso(p.timestamp * 1000),
       srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
-      filename: fn ? fn[1] : `file-${idx}`,
+      filename: fn ? fn[1] : '',
       // Honest size: the HTTP payload bytes of THIS packet (no reassembly —
       // a multi-packet transfer yields one row per observed chunk). The wire
       // length previously counted IP/TCP headers and looked like file size.
       mimeType: mime, size: p.tcpPayloadLen ?? p.length,
       protocol: p.protocol || 'HTTP', md5: '',
+      kind,
     })
   }
   return files
@@ -982,7 +995,15 @@ function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
   let idx = 0
   for (const p of packets) {
     if (!p.httpMethod) continue
-    const raw = hexToAsciiKeep(p.payload)
+    // The payload stores the whole FRAME as hex — decode only the TCP
+    // application bytes (same slice as reassembleTlsSni). Decoding from byte
+    // 0 put Ethernet/IP/TCP header bytes in front of the request line, so
+    // the "method" read as ASCII garbage of the destination MAC (QA:
+    // minor.pcapng showed method 'l"-EL@P' — the frame header — while the
+    // HTTP section correctly showed POST; login.pcapng merged header bytes
+    // into 'EFN@de-)P6;skPuPOST').
+    const app = typeof p.tcpPayloadLen === "number" ? p.payload.slice((p.length - p.tcpPayloadLen) * 2) : p.payload
+    const raw = hexToAsciiKeep(app)
 
     // Real HTTP Basic auth: Authorization: Basic base64(user:pass)
     const basic = raw.match(/Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i)

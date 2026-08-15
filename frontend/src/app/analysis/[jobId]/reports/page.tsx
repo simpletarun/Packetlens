@@ -528,13 +528,24 @@ export default function ReportsPage() {
       const worst = [...lossyFlows].sort((a, b) => (b.lossPct ?? 0) - (a.lossPct ?? 0))[0]
       const rsts = tcpFlowsAll.filter((f) => (f.rstCount ?? 0) > 0).length
       const high = lossyFlows.filter((f) => (f.lossPct ?? 0) >= 20).length
-      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% to ${worst.dstIp}${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST` : ""}) — no detection rule triggered`)
+      // Confidence travels with the number: a 75% estimate from a 9-packet
+      // flow is LOW-confidence and must not read as genuine 75% loss (QA:
+      // minor.pcapng summary said "worst 75%" while the table showed 9 pkts).
+      const worstConf = worst.packets >= 100 ? "HIGH" : worst.packets >= 20 ? "MEDIUM" : "LOW"
+      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% to ${worst.dstIp} — ${worstConf} confidence, ${worst.packets} packets in that flow${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST` : ""}) — no detection rule triggered`)
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
     // must (QA: frames #1/#3 and #2/#4 identical ACKs went unmentioned).
+    // A substantial removal share is a capture-quality problem, not a win:
+    // packet-rate, loss, retransmission and timing statistics come from the
+    // analyzed set and must be read with that limitation in mind (QA:
+    // minor.pcapng removed 27.1% of frames yet the verdict read like a
+    // clean capture).
     if (duplicateFrames > 0) {
-      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} removed before analysis (double-capture artifact) — detections and the risk score are computed on the analyzed set${typeof job?.rawPacketCount === "number" ? ` (${job.rawPacketCount.toLocaleString()} raw → ${(job.rawPacketCount - duplicateFrames).toLocaleString()} analyzed)` : ""}`)
+      const rawCount = typeof job?.rawPacketCount === "number" ? job.rawPacketCount : packets.length + duplicateFrames
+      const dupPct = rawCount > 0 ? Math.round((duplicateFrames / rawCount) * 1000) / 10 : 0
+      obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} removed before analysis (double-capture artifact, ${dupPct}% of ${rawCount.toLocaleString()} raw frames) — detections and the risk score are computed on the analyzed set (${(rawCount - duplicateFrames).toLocaleString()} analyzed)${dupPct >= 25 ? "; capture quality POOR — interpret packet-rate, loss, retransmission and timing statistics cautiously" : dupPct >= 5 ? "; capture quality DEGRADED — interpret packet-rate and timing statistics cautiously" : ""}`)
     }
     return obs
   }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job])
@@ -645,7 +656,7 @@ export default function ReportsPage() {
       `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design.`,
       `- DNS queries: ${dnsQueries} (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
-      `- ${plural(files.length, "file")} extracted · ${plural(credentials.length, "credential")} · ${plural(certificates.length, "certificate")}`,
+      `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} · ${plural(certificates.length, "certificate")}`,
       ...(report.notables.length ? [`- Notable destinations (neutral, not findings): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
@@ -695,7 +706,7 @@ export default function ReportsPage() {
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion} · Generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
 
@@ -753,7 +764,8 @@ export default function ReportsPage() {
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Packets</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{stats.totalPackets.toLocaleString()}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Duration</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{durLabel(durationSec)}</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Risk Score</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{riskValue()}</td></tr>
-                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Generated</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{new Date().toISOString().slice(0, 10)}</td></tr>
+                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Analysis Completed</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"}</td></tr>
+                  <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Export Generated</td><td style={{ padding: "4pt 16pt", fontWeight: 600 }}>{new Date().toISOString().slice(0, 19).replace("T", " ")} UTC</td></tr>
                   <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Build</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>v{BUILD_INFO.version} · {BUILD_INFO.isGit ? `commit:${BUILD_INFO.commitShort}` : `src:${BUILD_INFO.sourceHash || "unknown"}`} · {BUILD_INFO.builtAt}</td></tr>
                   {BUILD_INFO.isGit && <tr><td style={{ padding: "4pt 16pt", textAlign: "right", color: "#888" }}>Commit</td><td style={{ padding: "4pt 16pt", fontWeight: 600, fontFamily: "monospace", fontSize: "8pt" }}>{BUILD_INFO.commit}</td></tr>}
                 </tbody>
@@ -781,7 +793,7 @@ export default function ReportsPage() {
                   )}
                   {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{plural(dnsQueries, "DNS query packet")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
                   {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
-                  {files.length > 0 && <p><strong>{plural(files.length, "file")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential")}</strong>, <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
+                  {files.length > 0 && <p><strong>{plural(files.length, "HTTP payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong>, <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
                   {alerts.length > 0 ? (
                     <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
@@ -816,9 +828,9 @@ export default function ReportsPage() {
                   { label: "DNS Lookups", value: dnsLookupCount(dns).toLocaleString(), icon: Globe, color: "text-warning" },
                   { label: "HTTP Requests", value: http.length.toLocaleString(), icon: FileText, color: "text-info" },
                   { label: "TLS Handshakes", value: tls.length.toLocaleString(), icon: Shield, color: "text-chart-3" },
-                  { label: "Files Extracted", value: files.length.toLocaleString(), icon: FolderOpen, color: "text-chart-1" },
+                  { label: "HTTP Payloads", value: files.length.toLocaleString(), icon: FolderOpen, color: "text-chart-1" },
                   { label: "VoIP Calls", value: calls.length.toLocaleString(), icon: Phone, color: "text-chart-2" },
-                  { label: "Credentials", value: credentials.length.toLocaleString(), icon: Key, color: "text-warning" },
+                  { label: "Credential Submissions", value: credentials.length.toLocaleString(), icon: Key, color: "text-warning" },
                   { label: "Certificates", value: certificates.length.toLocaleString(), icon: Verified, color: "text-chart-2" },
                   { label: "Alerts", value: alerts.length.toLocaleString(), icon: AlertTriangle, color: "text-danger" },
                   { label: "Risk Score", value: riskValue(), icon: AlertTriangle, color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))) },
@@ -1219,12 +1231,12 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={FolderOpen} title="10. Extracted Files" />
+              <SectionTitle icon={FolderOpen} title="10. Extracted HTTP Payloads" />
               <Card>
                 <CardContent className="pt-6">
                   <div className="grid grid-cols-3 gap-4 text-xs mb-4">
                     <StatGrid items={[
-                      { label: "Total Files", value: files.length.toLocaleString() },
+                      { label: "Total Payloads", value: files.length.toLocaleString() },
                       { label: "Total Size", value: formatBytes(files.reduce((s, f) => s + f.size, 0)) },
                       { label: "MIME Types", value: new Set(files.map((f) => f.mimeType)).size.toLocaleString() },
                     ]} />
@@ -1233,6 +1245,7 @@ export default function ReportsPage() {
                     <table className="w-full text-xs">
                       <thead>
                         <tr className="border-b text-muted-foreground">
+                          <th className="text-left py-2 pr-2">Kind</th>
                           <th className="text-left py-2 pr-2">Filename</th>
                           <th className="text-left py-2 pr-2">Type</th>
                           <th className="text-right py-2 pr-2">Size</th>
@@ -1242,21 +1255,22 @@ export default function ReportsPage() {
                       <tbody>
                         {files.slice(0, 20).map((f) => (
                           <tr key={f.id} className="border-b border-border/30">
-                            <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{f.filename}</td>
+                            <td className="py-1.5 pr-2 whitespace-nowrap">{f.kind === "file-transfer" ? "file upload" : "form body"}</td>
+                            <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{f.filename || '\u2014'}</td>
                             <td className="py-1.5 pr-2 text-muted-foreground">{f.mimeType}</td>
                             <td className="py-1.5 pr-2 text-right text-muted-foreground">{formatBytes(f.size)}</td>
                             <td className="py-1.5 font-mono text-[10px] text-muted-foreground">{f.md5}</td>
                           </tr>
                         ))}
                         {files.length > 20 && (
-                          <tr><td colSpan={4} className="py-1.5 text-xs text-muted-foreground">… and {files.length - 20} more (see the Files page for the full list)</td></tr>
+                          <tr><td colSpan={5} className="py-1.5 text-xs text-muted-foreground">… and {files.length - 20} more (see the Files page for the full list)</td></tr>
                         )}
                       </tbody>
                     </table>
                   </div>
                   {files.length === 0 && (
                     <div className="border border-muted rounded p-3 text-xs text-muted-foreground space-y-1">
-                      <p className="font-medium text-foreground">No files extracted.</p>
+                      <p className="font-medium text-foreground">No HTTP payloads extracted.</p>
                       <p>Reason: {report.emptyReasons.files}</p>
                     </div>
                   )}
@@ -1311,7 +1325,7 @@ export default function ReportsPage() {
 
             <section>
               <div className="flex items-center justify-between">
-                <SectionTitle icon={Key} title="12. Credentials" />
+                <SectionTitle icon={Key} title="12. Credential Submissions" sub={credentials.length > 0 ? `${credentials.length.toLocaleString()} submission${credentials.length === 1 ? "" : "s"} · ${new Set(credentials.map((c) => c.username)).size.toLocaleString()} unique username${new Set(credentials.map((c) => c.username)).size === 1 ? "" : "s"}` : undefined} />
                 {credentials.length > 0 && (
                   <Button variant="ghost" size="sm" onClick={() => setShowPasswords(!showPasswords)}>
                     {showPasswords ? "Hide passwords" : "Show passwords"}
@@ -1320,6 +1334,13 @@ export default function ReportsPage() {
               </div>
               <Card>
                 <CardContent className="pt-6">
+                  <div className="grid grid-cols-3 gap-4 text-xs mb-4">
+                    <StatGrid items={[
+                      { label: "Submissions", value: credentials.length.toLocaleString() },
+                      { label: "Unique Usernames", value: new Set(credentials.map((c) => c.username)).size.toLocaleString() },
+                      { label: "Services", value: new Set(credentials.map((c) => c.service)).size.toLocaleString() },
+                    ]} />
+                  </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
@@ -1347,7 +1368,7 @@ export default function ReportsPage() {
                   </div>
                   {credentials.length === 0 && (
                     <div className="border border-muted rounded p-3 text-xs text-muted-foreground space-y-1">
-                      <p className="font-medium text-foreground">No credentials detected.</p>
+                      <p className="font-medium text-foreground">No credential submissions detected.</p>
                       <p>Reason: {report.emptyReasons.credentials}</p>
                     </div>
                   )}
@@ -2025,7 +2046,7 @@ export default function ReportsPage() {
                           {burst && <p><strong>Burst Detected:</strong> {formatBytes(burst.peakThroughput)}/s peak</p>}
                         </div>
                       </div>
-                      <p><strong>Generated:</strong> {new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · <strong>Build:</strong> {BUILD_STAMP}</p>
+                      <p><strong>Analysis completed:</strong> {job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · <strong>Export generated:</strong> {new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · <strong>Build:</strong> {BUILD_STAMP}</p>
                     </CardContent>
                   </Card>
                 </section>

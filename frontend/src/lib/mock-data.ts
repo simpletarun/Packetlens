@@ -231,6 +231,7 @@ function deriveFiles(packets: MockPacket[]): MockFile[] {
       size: randInt(1024, 10 * 1024 * 1024, rand),
       protocol: p.protocol,
       md5: pick(md5s, rand),
+      kind: "file-transfer",
     }
   })
 }

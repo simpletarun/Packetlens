@@ -32,11 +32,11 @@ export default function CredentialsPage() {
         <Header />
         <main className="flex-1 flex flex-col overflow-hidden">
           <div className="p-4 border-b">
-            <h1 className="text-lg font-bold mb-1">{beginnerMode ? "Captured Credentials" : "Credentials"}</h1>
-            <p className="text-xs text-muted-foreground">Cleartext credentials detected in network traffic</p>
+            <h1 className="text-lg font-bold mb-1">{beginnerMode ? "Captured Credential Submissions" : "Credential Submissions"}</h1>
+            <p className="text-xs text-muted-foreground">Cleartext credentials detected in network traffic — one row per submission; the same account may appear multiple times</p>
           </div>
           <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Captured</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{credentials.length}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Submissions</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{credentials.length}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Unique Usernames</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(credentials.map((c) => c.username)).size}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Services</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(credentials.map((c) => c.service)).size}</div></CardContent></Card>
           </div>
