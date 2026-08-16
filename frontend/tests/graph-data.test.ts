@@ -7,7 +7,7 @@ function geo(ip: string, country: string, countryCode: string, asn?: string, org
 
 const base = {
   packets: [] as { srcIp?: string; dstIp?: string; protocol?: string }[],
-  dns: [] as { query: string; srcIp: string; dstIp: string; type: string; responseCode?: string }[],
+  dns: [] as { query: string; srcIp: string; dstIp: string; type: string; responseCode?: string; isResponse?: boolean }[],
   http: [] as { method: string; uri: string; host: string; srcIp: string; dstIp: string }[],
   tls: [] as { sni: string; srcIp: string; dstIp: string; version: string }[],
   files: [] as { filename: string; srcIp: string; dstIp: string; size: number }[],
@@ -101,5 +101,60 @@ describe("buildGraphElements", () => {
     expect(nodes.some(n => n.data.id === "dev:8.8.8.8")).toBe(false)
     expect(nodes.some(n => n.data.id === "dev:203.0.113.9")).toBe(false)
     expect(nodes.some(n => n.data.id === "ip:8.8.8.8")).toBe(true)
+  })
+
+  it("DNS node counts QUERIES only — responses echo the question and must never double the count (page/report convention)", () => {
+    const dns = [
+      { query: "example.com", srcIp: "192.168.1.20", dstIp: "8.8.8.8", type: "A", responseCode: "NOERROR" },
+      { query: "example.com", srcIp: "192.168.1.20", dstIp: "8.8.8.8", type: "AAAA", responseCode: "NOERROR" },
+      { query: "example.com", srcIp: "8.8.8.8", dstIp: "192.168.1.20", type: "A", responseCode: "NOERROR", isResponse: true },
+      { query: "example.com", srcIp: "8.8.8.8", dstIp: "192.168.1.20", type: "A", responseCode: "NOERROR", isResponse: true },
+      { query: "example.com", srcIp: "8.8.8.8", dstIp: "192.168.1.20", type: "A", responseCode: "NXDOMAIN", isResponse: true },
+    ]
+    const { nodes } = buildGraphElements({ ...base, devices: [], flows: [], dns, geoMap: new Map(), beginnerMode: false })
+    const dnsNode = nodes.find(n => n.data.id === "dns:example.com")
+    expect(dnsNode).toBeTruthy()
+    const info = String(dnsNode!.data.info)
+    expect(info).toContain("Queries: 2")
+    expect(info).toContain("A ×1, AAAA ×1")
+    expect(info).toContain("Responses: NOERROR ×2, NXDOMAIN ×1")
+    expect(info).not.toContain("Queries: 5")
+  })
+
+  it("DNS 'resolved' edges attach to the RESOLVER, never to the client on response rows", () => {
+    const dns = [
+      { query: "example.com", srcIp: "192.168.1.20", dstIp: "8.8.8.8", type: "A", responseCode: "NOERROR" },
+      { query: "example.com", srcIp: "8.8.8.8", dstIp: "192.168.1.20", type: "A", responseCode: "NOERROR", isResponse: true },
+    ]
+    const flows = [{ srcIp: "192.168.1.20", dstIp: "8.8.8.8", protocol: "UDP", packets: 2, bytesTotal: 160 }]
+    const { edges } = buildGraphElements({ ...base, devices: [], flows, dns, geoMap: new Map(), beginnerMode: false })
+    expect(edges.some(e => e.data.id === "ip:8.8.8.8->dns:example.com" && e.data.label === "resolved")).toBe(true)
+    expect(edges.some(e => e.data.source === "ip:192.168.1.20" && String(e.data.label) === "resolved")).toBe(false)
+  })
+
+  it("flow edges aggregate per IP PAIR: one edge, summed packets/bytes, both protocols", () => {
+    const flows = [
+      { srcIp: "192.168.1.20", dstIp: "8.8.8.8", protocol: "UDP", packets: 2, bytesTotal: 160, duration: 3 },
+      { srcIp: "192.168.1.20", dstIp: "8.8.8.8", protocol: "TCP", packets: 40, bytesTotal: 40960, duration: 12 },
+    ]
+    const { edges } = buildGraphElements({ ...base, devices: [], flows, geoMap: new Map(), beginnerMode: false })
+    const pairEdges = edges.filter(e => e.data.source === "ip:192.168.1.20" && e.data.target === "ip:8.8.8.8" && e.data.kind === "flow")
+    expect(pairEdges).toHaveLength(1)
+    const label = String(pairEdges[0].data.label)
+    expect(label).toContain("UDP, TCP")
+    expect(label).toContain("42pkts")
+    expect(label).toContain("40.2 KiB")
+    expect(label).toContain("12s")
+    expect(pairEdges[0].data.weight).toBeGreaterThan(1)
+  })
+
+  it("the undecodable '—|—|0|0|OTHER' flow draws NO flow edge (no self-loop on the unknown endpoint node)", () => {
+    const flows = [
+      { srcIp: "192.168.1.20", dstIp: "8.8.8.8", protocol: "TCP", packets: 4, bytesTotal: 300 },
+      { srcIp: "\u2014", dstIp: "\u2014", protocol: "OTHER", packets: 7, bytesTotal: 420 },
+    ]
+    const { edges } = buildGraphElements({ ...base, devices: [], flows, geoMap: new Map(), beginnerMode: false })
+    expect(edges.some(e => e.data.source === "ip:\u2014" && e.data.target === "ip:\u2014")).toBe(false)
+    expect(edges.some(e => e.data.source === "ip:192.168.1.20" && e.data.target === "ip:8.8.8.8")).toBe(true)
   })
 })

@@ -186,7 +186,7 @@ interface DisplayPrefs {
 interface InvGraphProps {
   packets: { srcIp?: string; dstIp?: string; protocol?: string; srcPort?: number; dstPort?: number }[]
   flows: { srcIp: string; dstIp: string; protocol: string; packets: number; bytesTotal: number; duration?: number }[]
-  dns: { query: string; srcIp: string; dstIp: string; type: string; responseCode?: string }[]
+  dns: { query: string; srcIp: string; dstIp: string; type: string; responseCode?: string; isResponse?: boolean }[]
   http: { method: string; uri: string; host: string; srcIp: string; dstIp: string }[]
   tls: { sni: string; srcIp: string; dstIp: string; version: string }[]
   files: { filename: string; srcIp: string; dstIp: string; size: number }[]

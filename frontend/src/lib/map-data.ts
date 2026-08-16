@@ -413,11 +413,20 @@ export function deriveMapData(
     // rule counted placeholder-sourced chatter the card correctly excludes).
     // Same predicate as the page's LAN card: src private UNICAST, dst not
     // public-unicast.
+    // One pass per distinct endpoint. A self-addressed flow (srcIp === dstIp,
+    // e.g. an ARP self-ping or a crafted packet) is ONE packet on ONE node —
+    // the old pair loop ran the same IP twice and doubled its packets/bytes
+    // (the analyzer counts self-flows once: analysis.ts deriveFlows "count
+    // each packet ONCE"). Direction attribution keeps the analyzer's rule:
+    // a self-flow counts as sent (bytesSent), never both legs.
+    const endpoints = p.srcIp === p.dstIp ? [p.srcIp] : [p.srcIp, p.dstIp]
+    // LAN bookkeeping: same dedupe — a private self-flow IS a LAN packet
+    // (dst is not public-unicast), but its lanStats row must not double.
     if (isLanFlow(p.srcIp, p.dstIp)) {
       // LAN-only traffic: counted for localSummary, never drawn.
       lanBytes += p.length || 0
       lanPackets++
-      for (const ip of [p.srcIp, p.dstIp]) {
+      for (const ip of endpoints) {
         const s = lanStats.get(ip) ?? { bytes: 0, packets: 0 }
         s.bytes += p.length || 0
         s.packets++
@@ -449,7 +458,7 @@ export function deriveMapData(
       }
     }
 
-    for (const ip of [p.srcIp, p.dstIp]) {
+    for (const ip of endpoints) {
       // The packet-level check above already tallied the undecodable bytes;
       // here the placeholder side is just skipped so it never becomes a node,
       // a LAN host, or an unresolved external.

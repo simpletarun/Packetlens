@@ -33,7 +33,7 @@ const NODE_ICONS: Record<string, string> = {
 export interface GraphElementsInput {
   packets: { srcIp?: string; dstIp?: string; protocol?: string }[]
   flows: { srcIp: string; dstIp: string; protocol: string; packets: number; bytesTotal: number; duration?: number }[]
-  dns: { query: string; srcIp: string; dstIp: string; type: string; responseCode?: string }[]
+  dns: { query: string; srcIp: string; dstIp: string; type: string; responseCode?: string; isResponse?: boolean }[]
   http: { method: string; uri: string; host: string; srcIp: string; dstIp: string }[]
   tls: { sni: string; srcIp: string; dstIp: string; version: string }[]
   files: { filename: string; srcIp: string; dstIp: string; size: number }[]
@@ -112,15 +112,23 @@ export function buildGraphElements(input: GraphElementsInput): { nodes: ElementD
   for (const [asn, org] of asnNames) addNode(`asn:${asn}`, org.length > 30 ? org.slice(0, 30) + "…" : org, "asn", `ASN: ${asn}\nOrg: ${org}`, 1)
 
   // Aggregate DNS records per domain: a domain node must show ALL record
-  // types + counts for that domain.
+  // types + counts for that domain. QUERIES ONLY for the count (same
+  // convention as the DNS card/panel and the report's dnsLookupCount):
+  // responses echo the question, so counting both sides of a lookup doubles
+  // every number (F-04 QA: 54 "queries" for 27 real ones). Response codes
+  // live only on responses — the analyzer defaults every record's rcode to
+  // "NOERROR", so they must be counted from the response rows alone.
   const dnsAgg = new Map<string, { types: Map<string, number>; codes: Map<string, number>; total: number }>()
   for (const d of dns) {
     if (!d.query) continue
     let agg = dnsAgg.get(d.query)
     if (!agg) { agg = { types: new Map(), codes: new Map(), total: 0 }; dnsAgg.set(d.query, agg) }
+    if (d.isResponse) {
+      if (d.responseCode) agg.codes.set(d.responseCode, (agg.codes.get(d.responseCode) || 0) + 1)
+      continue
+    }
     agg.total++
     agg.types.set(d.type, (agg.types.get(d.type) || 0) + 1)
-    if (d.responseCode) agg.codes.set(d.responseCode, (agg.codes.get(d.responseCode) || 0) + 1)
   }
   for (const [query, agg] of dnsAgg) {
     const types = [...agg.types.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t, c]) => `${t} ×${c}`).join(", ")
@@ -173,12 +181,43 @@ export function buildGraphElements(input: GraphElementsInput): { nodes: ElementD
   }
 
   for (const f of flows) { addEdge("pcap", `ip:${f.srcIp}`, "contains", "struct"); addEdge("pcap", `ip:${f.dstIp}`, "contains", "struct") }
+
+  // One flow edge per IP PAIR, aggregated across 5-tuples. The store emits
+  // one flow per (srcIp, dstIp, srcPort, dstPort, protocol), and the edge
+  // id was `${src}->${dst}` — a pair talking over BOTH UDP/53 and TCP/443
+  // drew ONE edge carrying only the FIRST flow's protocol/packets/bytes, so
+  // the line (and its weight → thickness/color) understated the pair's real
+  // traffic. Sum the pair: packets + bytes, protocol list, max duration.
+  // The undecodable "—|—|0|0|OTHER" flow has no endpoints — a self-loop on
+  // the "unknown endpoint" node reads as a real connection; skip it.
+  const pairFlows = new Map<string, { srcIp: string; dstIp: string; protocols: Set<string>; packets: number; bytes: number; duration: number }>()
   for (const f of flows) {
-    const rel = Math.sqrt(f.bytesTotal) / Math.sqrt(maxFlowBytes)
-    addEdge(`ip:${f.srcIp}`, `ip:${f.dstIp}`, `${f.protocol} | ${f.packets}pkts | ${formatBytes(f.bytesTotal)}${f.duration ? ` | ${Math.round(f.duration)}s` : ""}`, "flow", Math.max(1, Math.round(rel * 50)), "edge")
+    if (f.srcIp === "\u2014" && f.dstIp === "\u2014") continue
+    const key = `${f.srcIp}->${f.dstIp}`
+    const agg = pairFlows.get(key) ?? { srcIp: f.srcIp, dstIp: f.dstIp, protocols: new Set<string>(), packets: 0, bytes: 0, duration: 0 }
+    agg.packets += f.packets
+    agg.bytes += f.bytesTotal
+    agg.protocols.add(f.protocol)
+    if (f.duration && f.duration > agg.duration) agg.duration = f.duration
+    pairFlows.set(key, agg)
+  }
+  for (const pf of pairFlows.values()) {
+    const rel = Math.sqrt(pf.bytes) / Math.sqrt(maxFlowBytes)
+    const protos = [...pf.protocols]
+    const protoLabel = protos.length > 3 ? `${protos.slice(0, 3).join(", ")} +${protos.length - 3}` : protos.join(", ")
+    addEdge(`ip:${pf.srcIp}`, `ip:${pf.dstIp}`, `${protoLabel} | ${pf.packets}pkts | ${formatBytes(pf.bytes)}${pf.duration > 0 ? ` | ${Math.round(pf.duration)}s` : ""}`, "flow", Math.max(1, Math.round(rel * 50)), "edge")
   }
   for (const p of protoSet) addEdge("pcap", `proto:${p}`, "uses", "struct")
-  for (const d of dns) { if (d.query && d.dstIp) addEdge(`ip:${d.dstIp}`, `dns:${d.query}`, "resolved", "relation") }
+  // The "resolved" edge belongs to the RESOLVER: a query travels client→
+  // resolver (dstIp) and the response comes back resolver→client (srcIp) —
+  // pointing the response's edge at the client claimed the querier resolved
+  // its own question. Both rows land on the same ip:<resolver> node, so the
+  // pair dedupes into one edge either way.
+  for (const d of dns) {
+    if (!d.query) continue
+    const resolver = d.isResponse ? d.srcIp : d.dstIp
+    if (resolver) addEdge(`ip:${resolver}`, `dns:${d.query}`, "resolved", "relation")
+  }
   for (const h of http) { if (h.host && h.dstIp) addEdge(`ip:${h.dstIp}`, `http:${h.host}`, "serves", "relation") }
   for (const t of tls) { if (t.sni && t.dstIp) addEdge(`ip:${t.dstIp}`, `tls:${t.sni}`, "tls", "relation") }
   for (const f of files) { if (f.srcIp) addEdge(`ip:${f.srcIp}`, `file:${f.filename}`, "transferred", "relation"); if (f.dstIp) addEdge(`ip:${f.dstIp}`, `file:${f.filename}`, "transferred", "relation") }

@@ -82,6 +82,32 @@ describe("deriveMapData — globe draws public IPs only", () => {
     expect(data.localSummary.bytes).toBe(80)
     expect(data.localSummary.topHost).toBe("192.168.1.5")
   })
+
+  it("self-addressed flows (srcIp === dstIp) count ONCE per packet — never packets/bytes/bytesSent doubled", () => {
+    const data = deriveMapData([
+      mk(1, PUBLICS[0], PUBLICS[0], 64), // self-flow on a drawn public node
+      mk(2, PRIVATES[0], PUBLICS[0], 128), // normal flow to the same node
+    ], publicGeo())
+    const n = data.nodeMap.get(PUBLICS[0])!
+    expect(n.packets).toBe(2)
+    expect(n.bytes).toBe(192)
+    expect(n.bytesSent).toBe(64) // analyzer rule: a self-flow is sent, never both legs
+    expect(n.bytesRecv).toBe(128)
+    expect(n.connections).toBe(2) // two distinct sessions: the self-flow and the private→public one
+  })
+
+  it("private self-addressed flows never inflate the local host count or LAN bytes", () => {
+    const data = deriveMapData([
+      mk(1, PRIVATES[0], PRIVATES[0], 64),
+      mk(2, PRIVATES[1], PRIVATES[2], 32),
+    ])
+    expect(data.localSummary.hosts).toBe(3) // one per distinct private IP — self-flow adds none extra
+    // A private self-flow IS a LAN packet (dst is not public-unicast) — but
+    // counted once, never doubled in the LAN totals.
+    expect(data.localSummary.packets).toBe(2)
+    expect(data.localSummary.bytes).toBe(96)
+    expect(data.localSummary.topHost).toBe(PRIVATES[0])
+  })
 })
 
 describe("deriveMapData — globe draws only IPs with a resolved country", () => {
