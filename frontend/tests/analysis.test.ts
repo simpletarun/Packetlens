@@ -2084,12 +2084,14 @@ describe("credential findings — field-level evidence, redaction, and the field
     expect(t!.evidenceQuality).toBe("HIGH")
     expect(t!.confidence).toBe(100)
     expect(t!.payloadConfirmed).toBe(true)
-    // Structured evidence: method, path, field names, content type, transport.
-    expect(t!.evidence).toContain("method POST /login/login_results.asp")
+// Structured evidence: request line (method + path), field names,
+    // content type, transport, and the capture packet number.
+    expect(t!.evidence).toContain("request(s): POST /login/login_results.asp")
     expect(t!.evidence).toContain('username field user="admin"')
     expect(t!.evidence).toContain('password field pass="[REDACTED]"')
     expect(t!.evidence).toContain("Content-Type application/x-www-form-urlencoded")
     expect(t!.evidence).toContain("transport HTTP (unencrypted)")
+    expect(t!.evidence).toContain("capture packet(s) #1")
     // The password VALUE must never leave the detector.
     expect(t!.evidence).not.toContain("s3cr3t")
     expect(JSON.stringify(t!.evidence)).not.toContain("s3cr3t")

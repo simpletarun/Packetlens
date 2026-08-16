@@ -365,7 +365,7 @@ async function audit(file: string, display: string) {
     quality: a1.advancedMetrics.rates?.quality,
   })
   expect.soft(
-    (report?.alerts.length ?? 0) === 0 || conclusion.includes("NOT clean"),
+    (report?.alerts.length ?? 0) === 0 || conclusion.includes("NOT clean") || conclusion.includes("A security finding was confirmed"),
     `${display}: verdict acknowledges findings (${conclusion.slice(0, 60)})`,
   ).toBe(true)
   // 0 alerts on a capture without a time interval: INSUFFICIENT EVIDENCE,

@@ -269,16 +269,17 @@ const TECHNIQUE_RULES: Record<string, string[]> = {
   "T1071.004": ["DNS-TUNNEL-001"],
   T1041: ["DATA-EXFIL-001"],
   T1071: ["C2-BEACON-001"],
-  // Credentials observed in cleartext ON THE WIRE = Network Sniffing (T1040 —
-  // MITRE: "passively capture network traffic... including authentication
-  // material"). The capture shows the credentials were EXPOSED to passive
-  // interception — it does not prove an attacker sniffed them (the finding
-  // wording must say exposure, not theft). T1552 (Unsecured Credentials)
-  // covers credentials found in insecure STORAGE (files, logs, shell
-  // history) — it is never a "credentials in transit" technique (QA:
-  // minor.pcapng mapped plaintext HTTP creds to T1552 and claimed T1552
-  // covers "credentials submitted... in transit", which MITRE does not say).
-  T1040: ["HTTP-CREDS-001", "CRED-LEAK-001"],
+  // Plaintext credential exposure is deliberately NOT mapped to T1040 (Network
+  // Sniffing): T1040 describes adversary activity (passively capturing
+  // traffic), while the capture only proves the credentials were exposed to
+  // potential passive interception — no sniffer is observed (QA: never_end.
+  // pcapng mapped the finding to T1040 while simultaneously admitting "the
+  // capture demonstrates exposure, not an active sniffer"). An automatic
+  // report must never imply observed adversary activity from a weakness the
+  // capture merely demonstrates. T1552 (Unsecured Credentials) stays unmapped
+  // too — it covers insecure STORAGE (files, logs, shell history), never
+  // credentials in transit (QA: minor.pcapng claimed T1552 covers "in
+  // transit", which MITRE does not say).
   T1105: ["MALWARE-DL-001"],
   "T1583.001": ["TLS-SUSPICIOUS-001"],
 }
@@ -293,12 +294,13 @@ const TECHNIQUE_ID: Record<string, string> = {
   "PORT-SCAN-001": "T1046",
   "SYN-FLOOD-001": "T1498",
   "DNS-TUNNEL-001": "T1048",
-  "CRED-LEAK-001": "T1040",
   "MALWARE-DL-001": "T1105",
   "C2-BEACON-001": "T1071",
   "DATA-EXFIL-001": "T1041",
   "TLS-SUSPICIOUS-001": "T1583.001",
-  "HTTP-CREDS-001": "T1040",
+  // HTTP-CREDS-001 / CRED-LEAK-001 are intentionally absent: plaintext
+  // credential exposure proves exposure, not an active sniffer (T1040) —
+  // automatic reports never map it (QA: never_end.pcapng).
 }
 
 // IOC type → alert rule that backs it. The engine fires DNS-TUNNEL-001,
@@ -333,12 +335,10 @@ const TECHNIQUE_NAMES: Record<string, { name: string; desc: string }> = {
   "T1071.004": { name: "DNS Tunneling", desc: "Data encoded in DNS queries/responses" },
   T1041: { name: "Exfiltration Over C2 Channel", desc: "Data sent to external server" },
   T1071: { name: "Application Layer Protocol", desc: "Periodic C2 beaconing detected" },
-  // T1040: credentials observed IN TRANSIT on the wire — a packet capture
-  // demonstrates the exposure, not an active sniffer (the finding must read
-  // "plaintext credential exposure", never "credential theft" or a confirmed
-  // sniffing attacker — QA: college.pcapng labeled HTTP login "Credential
-  // Theft"). T1552 stays known for LEGACY persisted results that predate the
-  // T1040 remap, with MITRE's actual definition (storage, not transit).
+  // T1040/T1552: kept ONLY for legacy persisted results that predate the
+  // unmapping decision (fresh analyses never produce these rows — plaintext
+  // credential exposure proves exposure, not an active sniffer, and T1552 is
+  // insecure STORAGE, never transit — QA: never_end.pcapng, minor.pcapng).
   T1040: { name: "Network Sniffing", desc: "Cleartext credentials were observable on the network path — exposed to passive interception; the capture demonstrates exposure, not an active sniffer" },
   T1552: { name: "Unsecured Credentials", desc: "Credentials discovered in insecure storage (files, logs, shell history) without protection" },
   T1105: { name: "Ingress Tool Transfer", desc: "Download of files from remote systems" },
@@ -683,7 +683,7 @@ const MITRE_REC: Record<string, string> = {
   T1071: "Isolate beaconing endpoints and hunt for C2 malware on affected hosts",
   T1090: "Enforce blocking of known proxy/TOR/VPN endpoints; review outbound policy",
   T1003: "Rotate exposed credentials and investigate hosts involved in authentication traffic",
-  T1040: "Cleartext credentials were observed on the wire (exposed to passive interception on the LAN path); rotate the affected accounts, migrate the service to HTTPS, and verify no interception tooling (sniffer/ARP spoofing) is active on the segment",
+  T1040: "Plaintext credentials were observed on the wire (unencrypted) — assume the credential may have been exposed to anyone able to observe the network path; rotate the affected accounts and migrate the service to HTTPS",
   // Legacy persisted results mapped plaintext HTTP creds to T1552 — keep a
   // correct remediation for those rows (T1552 rows can no longer be produced
   // by fresh analyses).
@@ -755,6 +755,22 @@ function buildRecommendations(
     items.push({
       text: "Port scan activity detected. Block source IPs and review firewall rules.",
       ...flagRec(alerts, "PORT-SCAN-001", 3),
+    })
+  }
+  // Credential exposure recommendations no longer ride on a T1040 MITRE row
+  // (credential findings are deliberately unmapped — the capture proves
+  // exposure, never an active sniffer; QA: never_end.pcapng). The alert
+  // itself carries the remediation, phrased around what the capture actually
+  // proves: the credential may have been observed by anyone on the path.
+  // Gated on the exposure signatures — a ruleId alone is not enough (the
+  // demo dataset's HTTP-CREDS-001 row is "Repeated HTTP Errors").
+  const credAlert = alerts.find((a) => /Plaintext HTTP Credentials|Cleartext Credentials/i.test(a.signature))
+  if (credAlert) {
+    items.push({
+      text: "Plaintext credentials were observed on the wire (unencrypted) — assume the credential may have been exposed to anyone able to observe the network path; rotate the affected accounts and migrate the service to HTTPS.",
+      severity: credAlert.severity,
+      source: "CONFIRMED_ALERT",
+      status: effectiveStatus(credAlert),
     })
   }
   for (const m of mitre) {
@@ -1666,11 +1682,29 @@ export function buildFlowsCsv(
 // safety (QA: 1-SYN capture concluded clean). The verdict depends on BOTH
 // capture quality and detections: a non-VALID capture can never conclude
 // SAFE/clean, even when no rule fired.
+
+// Number of credential-submission events behind the credential alerts: each
+// HTTP-CREDS-001/CRED-LEAK-001 alert groups N credential-bearing requests of
+// one conversation, and its evidence opens with "N plaintext credential
+// submission(s)". The report surfaces the count so "1 finding" never reads
+// as "1 exposed credential" (QA: never_end.pcapng — "1 alert" next to
+// "4 plaintext credential submissions"). Both the local analyzer and the
+// engine emit this phrasing; anything else counts as 0 and the report stays
+// quiet rather than guessing.
+export function credentialEventCount(alerts: { ruleId?: string; evidence?: string }[]): number {
+  let total = 0
+  for (const a of alerts) {
+    if (a.ruleId !== "HTTP-CREDS-001" && a.ruleId !== "CRED-LEAK-001") continue
+    const m = (a.evidence ?? "").match(/^(\d+) plaintext credential submission/i)
+    if (m) total += parseInt(m[1], 10)
+  }
+  return total
+}
 export function analystConclusion(opts: {
   undecodable: boolean
   decodeRatePct: number
   encapName: string
-  alerts: { signature: string; status?: DetectionStatus }[]
+  alerts: { signature: string; status?: DetectionStatus; ruleId?: string; evidence?: string }[]
   score: number
   quality?: string
 }): string {
@@ -1696,6 +1730,14 @@ export function analystConclusion(opts: {
     const names = opts.alerts.map((a) => a.signature).join("; ")
     const summary = `${parts.join(", ")} finding${opts.alerts.length === 1 ? "" : "s"} detected`
     const noneConfirmed = counts.CONFIRMED === 0 ? " No findings were confirmed." : ""
+    // One finding can cover many events: a single HTTP-CREDS-001 alert groups
+    // every credential-bearing request of the conversation. "1 confirmed
+    // finding" next to "4 credential submissions" must not read as one
+    // exposed credential, so the event count rides on the summary line
+    // (QA: never_end.pcapng — "1 alert" vs "4 plaintext credential
+    // submissions").
+    const credEvents = credentialEventCount(opts.alerts)
+    const eventNote = credEvents > 0 ? ` covering ${credEvents} credential-submission event${credEvents === 1 ? "" : "s"}` : ""
     // Credential findings: the capture proves the TRANSMISSION, never theft,
     // interception or a malicious destination (QA: college.pcapng — the
     // finding must read "plaintext credential exposure", not "credential
@@ -1710,7 +1752,16 @@ export function analystConclusion(opts: {
     const exfilNote = opts.alerts.some((a) => /[Oo]utbound [Tt]ransfer/.test(a.signature))
       ? " A behavioral rule flagged a potentially asymmetric outbound transfer; the capture does not by itself establish data exfiltration or compromise — no payload evidence ties the transferred bytes to stolen data."
       : ""
-    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.${credNote}${exfilNote}`
+    // "A security finding was confirmed under the configured detection rules"
+    // instead of "the capture is NOT clean": "not clean" implies compromise
+    // or attacker activity, while a confirmed plaintext credential exposure
+    // is a weakness the capture demonstrated — not observed malicious
+    // activity (QA: never_end.pcapng). The unconfirmed case keeps the
+    // "NOT clean" wording because nothing was confirmed to name.
+    const cleanWording = counts.CONFIRMED > 0
+      ? "A security finding was confirmed under the configured detection rules — this verdict is not proof that the capture is universally malicious"
+      : "The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious"
+    const head = `${summary}${eventNote} (${names}).${noneConfirmed} ${cleanWording}; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.${credNote}${exfilNote}`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.

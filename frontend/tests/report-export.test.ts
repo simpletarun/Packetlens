@@ -128,8 +128,10 @@ describe("report export data layer parity — every capture must feed the export
       expect.soft(report.iocs.length, `${name}: iocs for ${a.threats.length} alerts`).toBeGreaterThan(0)
       // MITRE rows are gated on detection status: only LIKELY/CONFIRMED (or
       // legacy status-less) alerts claim ATT&CK techniques — a capture whose
-      // only findings are SUSPECTED heuristics legitimately maps nothing.
-      if (a.threats.some((t) => t.status === undefined || t.status === "LIKELY" || t.status === "CONFIRMED")) {
+      // only findings are SUSPECTED heuristics legitimately maps nothing, and
+      // credential alerts (HTTP-CREDS-001/CRED-LEAK-001) are deliberately
+      // unmapped: exposure is proven, a sniffer is not (QA: never_end.pcapng).
+      if (a.threats.some((t) => (t.status === undefined || t.status === "LIKELY" || t.status === "CONFIRMED") && t.ruleId !== "HTTP-CREDS-001" && t.ruleId !== "CRED-LEAK-001")) {
         expect.soft(report.mitre.length, `${name}: mitre for ${a.threats.length} alerts`).toBeGreaterThan(0)
       }
       for (const m of report.mitre) {

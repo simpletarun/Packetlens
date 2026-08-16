@@ -2265,8 +2265,21 @@ export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {})
         // Structured field-level evidence; the PASSWORD VALUE is never
         // printed — only its field name and presence (QA: report must show
         // "Credential field detected" with username + field names, redacted
-        // password, content type and transport).
-        evidence: `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''}; method ${c.method ?? '?'}${c.path ? ` ${c.path}` : ''}; username field ${c.usernameField ?? '?'}="${c.username}"${c.passwordField ? `, password field ${c.passwordField}="[REDACTED]"` : ''}; ${c.contentType ? `Content-Type ${c.contentType}; ` : ''}transport ${isHttp ? 'HTTP' : c.protocol || 'TCP'} (unencrypted)`,
+        // password, content type and transport). The request enumeration
+        // names EVERY credential-bearing request (method + path, with counts
+        // for repeats) so the count is verifiable transaction-by-transaction
+        // instead of "N submissions" with a single cited method (QA:
+        // never_end.pcapng — "4 HTTP payloads = 4 credential submissions"
+        // needed transaction-level evidence).
+        evidence: (() => {
+          const reqCounts = new Map<string, number>()
+          for (const x of creds) {
+            const k = `${x.method ?? '?'} ${x.path ?? '/'}`
+            reqCounts.set(k, (reqCounts.get(k) ?? 0) + 1)
+          }
+          const reqs = [...reqCounts.entries()].map(([k, n]) => (n > 1 ? `${k} (${n}×)` : k)).join(", ")
+          return `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''}; request(s): ${reqs}; username field ${c.usernameField ?? '?'}="${c.username}"${c.passwordField ? `, password field ${c.passwordField}="[REDACTED]"` : ''}; ${c.contentType ? `Content-Type ${c.contentType}; ` : ''}transport ${isHttp ? 'HTTP' : c.protocol || 'TCP'} (unencrypted); capture packet(s) #${creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number').join(', #')}`
+        })(),
         packetNums: [...new Set(creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))],
         // Credentials exist only because payload content was decoded: this is
         // payload proof, not port inference.

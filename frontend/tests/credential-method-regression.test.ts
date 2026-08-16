@@ -18,7 +18,7 @@ describe("credential method on REAL captures — frame headers never leak into H
     }
     // The evidence line in the alert must carry the true method.
     for (const t of a.threats) {
-      if (t.ruleId === "HTTP-CREDS-001") expect(t.evidence).toContain("method POST")
+      if (t.ruleId === "HTTP-CREDS-001") expect(t.evidence).toContain("POST /login/login_results.asp")
     }
   })
 })

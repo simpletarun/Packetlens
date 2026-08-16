@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest"
 import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, 
 packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, 
 duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel, 
-reportDurationSec, dnsUniqueDomains, dnsNameOf } from "@/lib/report"
+reportDurationSec, dnsUniqueDomains, dnsNameOf, credentialEventCount } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -995,10 +995,14 @@ describe("tlsCipherSuiteName", () => {
 describe("analystConclusion � the verdict must never call a capture clean while confirmed findings exist", () => {
   const base = { undecodable: false, decodeRatePct: 100, encapName: "Ethernet", alerts: [], score: 0 }
 
-it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW + 1 alert)", () => {
+  it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW + 1 alert)", () => {
     const text = analystConclusion({ ...base, alerts: [{ signature: "Plaintext HTTP Credentials" }], score: 39 })
     expect(text).toContain("1 confirmed finding detected (Plaintext HTTP Credentials)")
-    expect(text).toContain("NOT clean under the configured rules")
+    // "NOT clean" implies compromise; a confirmed plaintext credential
+    // exposure is a weakness the capture demonstrated — the confirmed case
+    // says "a security finding was confirmed" instead (QA: never_end.pcapng).
+    expect(text).toContain("A security finding was confirmed under the configured detection rules")
+    expect(text).not.toContain("NOT clean")
     expect(text).toContain("not proof that the capture is universally malicious")
     // The score is a rule-output summary, never a probability of compromise.
     expect(text).toContain("does not represent a probability of compromise")
@@ -1047,13 +1051,13 @@ it("pluralizes the alert count and names EVERY fired rule (QA: mic.pcapng hid th
     // silently downgrade the detection.
     const text = analystConclusion({ ...base, quality: "SINGLE_PACKET", alerts: [{ signature: "Plaintext HTTP Credentials" }], score: 39 })
     expect(text).toContain("1 confirmed finding detected")
-    expect(text).toContain("NOT clean")
+    expect(text).toContain("A security finding was confirmed under the configured detection rules")
     expect(text).toContain("capture quality")
   })
 })
 
-describe("MITRE mapping for plaintext credential alerts (T1040, not T1552)", () => {
-  it("maps wire-exposed credentials to Network Sniffing and recommends rotation + HTTPS", () => {
+describe("MITRE mapping for plaintext credential alerts (never T1040, never T1552)", () => {
+  it("never maps plaintext credential exposure to Network Sniffing, and recommends exposure-aware rotation", () => {
     const report = buildReportAnalysis({
       job: null,
       jobInfo: {},
@@ -1062,7 +1066,7 @@ describe("MITRE mapping for plaintext credential alerts (T1040, not T1552)", () 
         signature: "Plaintext HTTP Credentials", category: "Credential Access",
         severity: 4, confidence: 75, ruleId: "HTTP-CREDS-001",
         srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 0, dstPort: 0, protocol: "HTTP",
-        evidence: "1 plaintext credential submission(s) over HTTP Form",
+        evidence: "4 plaintext credential submission(s) over HTTP Form",
       }],
       packets: [], flows: [], sessions: [], tls: [], http: [],
       timeline: [], bandwidth: [],
@@ -1073,20 +1077,23 @@ describe("MITRE mapping for plaintext credential alerts (T1040, not T1552)", () 
         topTalkers: [], iocs: [], mitreMappings: [],
       },
     })
-    const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials") || r.text.includes("Cleartext credentials"))
-    expect(rec?.severity).toBe(4)
-    // T1040 Network Sniffing: credentials were EXPOSED on the wire — the
-    // capture demonstrates the exposure, never a confirmed sniffer (the
-    // wording must say "exposure", not "theft"). T1552 covers credentials in
-    // insecure STORAGE (files, logs, shell history), never transit (QA:
-    // minor.pcapng mapped to T1552 and claimed it covered "in transit").
-    const mitre = report.mitre.find((m) => m.id === "T1040")
-    expect(mitre?.technique).toBe("Network Sniffing")
-    expect(mitre?.description).toContain("Cleartext")
-    expect(mitre?.description).toContain("exposure")
-    expect(mitre?.description).not.toContain("theft")
-    expect(mitre?.status).toBe("CONFIRMED")
+    // T1040 Network Sniffing describes adversary activity (capturing
+    // traffic); the capture proves only that the credentials were exposed
+    // to potential passive interception — no sniffer is observed, so an
+    // automatic report must not map the finding (QA: never_end.pcapng).
+    expect(report.mitre.find((m) => m.id === "T1040")).toBeUndefined()
+    expect(report.mitre).toHaveLength(0)
     expect(report.mitre.find((m) => m.id === "T1552")).toBeUndefined()
+    // The remediation rides on the alert itself, phrased around what the
+    // capture proves: assume exposure to anyone able to observe the path.
+    const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials"))
+    expect(rec).toBeDefined()
+    expect(rec?.severity).toBe(4)
+    expect(rec?.source).toBe("CONFIRMED_ALERT")
+    expect(rec?.status).toBe("CONFIRMED")
+    expect(rec?.text).toContain("assume the credential may have been exposed to anyone able to observe the network path")
+    expect(rec?.text).toContain("rotate the affected accounts")
+    expect(rec?.text).not.toContain("sniffer")
   })
 
   it("legacy persisted T1552 rows keep rendering (their own stored description is preserved)", () => {
@@ -1100,6 +1107,27 @@ describe("MITRE mapping for plaintext credential alerts (T1040, not T1552)", () 
     const m = report.mitre.find((x) => x.id === "T1552")
     expect(m?.technique).toBe("Unsecured Credentials")
     expect(m?.description).toBe("legacy row")
+  })
+})
+
+describe("credentialEventCount — one finding must never read as one exposed credential", () => {
+  it("reads the submission count from the alert evidence and sums across alerts", () => {
+    expect(credentialEventCount([
+      { ruleId: "HTTP-CREDS-001", evidence: "4 plaintext credential submission(s) over HTTP Form" },
+      { ruleId: "CRED-LEAK-001", evidence: "2 plaintext credential submission(s) over SMTP" },
+      { ruleId: "DATA-EXFIL-001", evidence: "9 plaintext credential submission(s) — ignored, wrong rule" },
+      { ruleId: "HTTP-CREDS-001", evidence: "no numeric prefix — counts 0" },
+    ])).toBe(6)
+  })
+
+  it("surfaces the count on the conclusion line (QA: never_end '1 alert' vs 4 submissions)", () => {
+    const text = analystConclusion({
+      undecodable: false, decodeRatePct: 100, encapName: "Ethernet",
+      alerts: [{ signature: "Plaintext HTTP Credentials", ruleId: "HTTP-CREDS-001", evidence: "4 plaintext credential submission(s) over HTTP Form" }],
+      score: 53,
+    })
+    expect(text).toContain("1 confirmed finding detected covering 4 credential-submission events")
+    expect(text).not.toContain("1 confirmed finding detected (Plaintext HTTP Credentials)")
   })
 })
 

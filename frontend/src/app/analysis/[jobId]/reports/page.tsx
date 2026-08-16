@@ -9,7 +9,7 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, credentialEventCount, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -558,7 +558,17 @@ export default function ReportsPage() {
       // 192.168.1.10 → 185.199.110.133). "in flow A → B" claims no loss
       // direction: the retrans count sums both directions.
       const worstOrient = flowInitiatorFlip(worst, packets) ? `${worst.dstIp} → ${worst.srcIp}` : `${worst.srcIp} → ${worst.dstIp}`
-      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% in flow ${worstOrient} — ${worstConf} confidence, ${worst.packets} packets in that flow${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST` : ""}) — no detection rule triggered`)
+      const rstRate = tcpFlowsAll.length > 0 ? rsts / tcpFlowsAll.length : 0
+      // An elevated RST share is common in browser/streaming traffic (cancelled
+      // connections, short-lived flows, rejected connections, capture timing)
+      // — it must be stated as informational, never as a security finding, but
+      // a 30%+ reset share next to a clean verdict reads as unexamined
+      // (QA: never_end.pcapng — 15 of 40 TCP flows reset, "no detection rule
+      // triggered" only).
+      const rstNote = rsts > 0
+        ? `${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST${rstRate >= 0.3 ? " (elevated rate — informational, not treated as a security finding; RSTs commonly follow cancelled connections, short-lived flows, rejected connections and capture timing)" : ""}`
+        : ""
+      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% in flow ${worstOrient} — ${worstConf} confidence, ${worst.packets} packets in that flow${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rstNote ? `; ${rstNote}` : ""}) — no detection rule triggered`)
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
@@ -678,14 +688,14 @@ export default function ReportsPage() {
       `- **File size:** ${formatBytes(job.fileSize)}`,
       `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (typeof job?.rawPacketCount === "number" ? ` analyzed (raw ${job.rawPacketCount.toLocaleString()} · ${(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicates removed)` : "") + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
       `- **Duration:** ${durLabel(durationSec)} · Risk score: ${riskValue()}`,
-      `- **Alerts:** ${report.alerts.length} — Severity: ${severityCounts(report.alerts)} · Status: ${statusCountsLabel(summarizeStatuses(report.alerts))}`,
+      `- **Alerts:** ${report.alerts.length} — Severity: ${severityCounts(report.alerts)} · Status: ${statusCountsLabel(summarizeStatuses(report.alerts))}${credentialEventCount(report.alerts) > 0 ? ` — covering ${credentialEventCount(report.alerts)} credential-submission event${credentialEventCount(report.alerts) === 1 ? "" : "s"}` : ""}`,
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
       `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design.`,
       `- DNS queries: ${dnsQueries} (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
-      `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} · ${plural(certificates.length, "certificate")}`,
+      `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} (credential submissions are the HTTP requests whose decoded body carried a username and/or password field — not every HTTP request) · ${plural(certificates.length, "certificate")}`,
       ...(report.notables.length ? [`- Notable destinations (neutral, not findings): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
@@ -720,9 +730,9 @@ export default function ReportsPage() {
       lines.push("## Alerts", ...report.alerts.slice(0, 20).map((t) => `- [${sevLabel(t.severity)}] ${t.signature} (${t.srcIp} → ${t.dstIp})`), "")
     }
     if (report.iocs.length) {
-      lines.push("## Indicators of Compromise", ...report.iocs.slice(0, 20).map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
+      lines.push("## Indicators of Compromise", ...report.iocs.slice(0, 20).map((i) => `- [${sevLabel(i.severity)}] ${i.type === "credential-theft" ? `Affected host: ${i.value}` : i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
       if (report.iocs.some((i) => i.type === "credential-theft")) {
-        lines.push("_A Plaintext Credential Exposure IOC lists the affected internal host (the machine that transmitted the credentials) — not an external indicator of compromise. The capture proves the transmission, not theft, interception, or a malicious destination._", "")
+        lines.push("_The Plaintext Credential Exposure row lists the affected host (the machine that transmitted the credentials) and its destination — an affected host is the victim of the exposure, not an indicator of a known-malicious artifact. The capture proves the transmission, not theft, interception, or a malicious destination._", "")
       }
       if (report.iocs.some((i) => ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"].includes(i.type))) {
         lines.push("_Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are findings about observed traffic patterns, not indicators of a known-malicious artifact: the value describes the behavior itself, and the endpoints are not established as malicious._", "")
@@ -734,7 +744,7 @@ export default function ReportsPage() {
     if (mitre.length) {
       lines.push("## MITRE ATT&CK", ...mitre.map((m) => `- ${m.id} ${m.technique} (${sevLabel(m.severity)}) — ${m.description} (${findingSourceLabel(m.source, m.status)})`), "")
     } else if (report.alerts.length > 0) {
-      lines.push("## MITRE ATT&CK", "- No techniques mapped — mappings attach only to LIKELY/CONFIRMED detections; SUSPECTED findings (threshold crossed on pattern evidence) deliberately receive none, because the evidence does not establish the technique was executed.", "")
+      lines.push("## MITRE ATT&CK", "- No techniques mapped — techniques attach only when the evidence demonstrates the technique was executed; SUSPECTED threshold findings and confirmed exposure-style findings (e.g. plaintext credential exposure) are deliberately unmapped, because exposure is a weakness or prerequisite, not observed adversary activity.", "")
     }
     const recLines: string[] = []
     if (recs.High.length) recLines.push("### High", ...recs.High.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
@@ -830,7 +840,7 @@ export default function ReportsPage() {
                   )}
                   {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{plural(dnsQueries, "DNS query packet")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
                   {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
-                  {files.length > 0 && <p><strong>{plural(files.length, "HTTP payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong>, <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
+                  {files.length > 0 && <p><strong>{plural(files.length, "HTTP payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong> ({credentials.length > 0 ? "HTTP requests whose decoded body carried a username and/or password field — not every HTTP request" : "none of the HTTP requests carried credential fields"}), <strong>{plural(certificates.length, "certificate")}</strong> observed.</p>}
                   {alerts.length > 0 ? (
                     <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
@@ -1393,6 +1403,11 @@ export default function ReportsPage() {
                       { label: "Services", value: new Set(credentials.map((c) => c.service)).size.toLocaleString() },
                     ]} />
                   </div>
+                  <p className="text-[10px] text-muted-foreground mb-3">
+                    Each row is one HTTP request whose <strong>decoded body carried a username and/or password field</strong> —
+                    a credential submission is not every HTTP payload, and the password value above is shown redacted by
+                    default. The detection alert cites the exact request(s) and capture packet numbers in its Evidence.
+                  </p>
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
@@ -1808,7 +1823,7 @@ export default function ReportsPage() {
                                         <th className="text-right">Severity</th>
                                         <th className="text-right">Confidence</th>
                                         <th className="text-right">Weight</th>
-                                        <th className="text-right">Contribution</th>
+                                        <th className="text-right">Contribution (raw pts)</th>
                                         <th className="text-right">Formula</th>
                                       </tr>
                                     </thead>
@@ -1829,7 +1844,7 @@ export default function ReportsPage() {
                                   </table>
                                 </div>
                                 )}
-                                <div className="text-[10px] text-muted-foreground mt-1">contribution = (severity weight + rule weight) × confidence multiplier — &lt;50% ×0.5, 50–79% ×1.0, ≥80% ×1.5</div>
+                                <div className="text-[10px] text-muted-foreground mt-1">contribution = (severity weight + rule weight) × confidence multiplier — &lt;50% ×0.5, 50–79% ×1.0, ≥80% ×1.5. Each rule&rsquo;s contribution is raw pre-normalization points; the contributions sum to the <strong>Raw score</strong> ({risk.rawScore.toFixed(1)}), which the curve maps to the <strong>Normalized score</strong> ({risk.normalizedScore}/100).</div>
                               </div>
                             </div>
                           </div>
@@ -1955,9 +1970,10 @@ export default function ReportsPage() {
                       )}
                       {report.iocs.some((i) => i.type === "credential-theft") && (
                         <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-3">
-                          A Plaintext Credential Exposure IOC lists the <strong>affected internal host</strong> (the machine
-                          that transmitted the credentials) — not an external indicator of compromise. The capture proves the
-                          transmission, not theft, interception, or a malicious destination.
+                          The Plaintext Credential Exposure row lists the <strong>affected host</strong> (the machine
+                          that transmitted the credentials) and its destination — an affected host is the <strong>victim
+                          of the exposure</strong>, not an indicator of a known-malicious artifact. The capture proves
+                          the transmission, not theft, interception, or a malicious destination.
                         </p>
                       )}
                       {report.iocs.some((i) => ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"].includes(i.type)) && (
@@ -1985,7 +2001,7 @@ export default function ReportsPage() {
                               {report.iocs.map((ioc, i) => (
                                 <tr key={i} className="border-b border-border/30">
                                   <td className="py-1.5 pr-2 text-muted-foreground">{iocTypeLabel(ioc.type)}</td>
-                                  <td className="py-1.5 pr-2 font-mono">{ioc.value}</td>
+                                  <td className="py-1.5 pr-2 font-mono">{ioc.type === "credential-theft" ? `Affected host: ${ioc.value}` : ioc.value}</td>
                                   <td className="py-1.5 pr-2 text-muted-foreground">{ioc.description}</td>
                                   <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{sevLabel(ioc.severity)}</Badge></td>
                                   <td className="py-1.5">{sourceBadge(ioc.source, ioc.status)}</td>
@@ -2008,10 +2024,12 @@ export default function ReportsPage() {
                           <p className="text-sm text-muted-foreground">No MITRE ATT&CK techniques mapped</p>
                           {alerts.length > 0 && (
                             <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mt-2">
-                              Techniques are attached only to <strong>LIKELY/CONFIRMED</strong> detections. SUSPECTED
+                              Techniques are attached only when the evidence <strong>demonstrates the technique was
+                              executed</strong> (LIKELY/CONFIRMED detections with matching activity). SUSPECTED
                               findings — rules that crossed a threshold on pattern evidence (e.g. the directional
-                              byte-ratio exfiltration rule) — deliberately receive no technique mapping, because the
-                              evidence does not establish the technique was executed.
+                              byte-ratio exfiltration rule) — deliberately receive no mapping, and confirmed
+                              exposure-style findings (e.g. plaintext credential exposure) are unmapped too: exposure
+                              is a weakness or prerequisite, not observed adversary activity.
                             </p>
                           )}
                         </div>
