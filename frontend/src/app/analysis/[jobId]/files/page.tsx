@@ -44,7 +44,7 @@ export default function FilesPage() {
           <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Payloads</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{files.length}</div></CardContent></Card>
             <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Total Size</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{formatBytes(totalSize)}</div></CardContent></Card>
-            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Types</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(files.map((f) => f.mimeType)).size}</div></CardContent></Card>
+            <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Types</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{new Set(files.map((f) => (f.mimeType || "").toLowerCase()).filter(Boolean)).size}</div></CardContent></Card>
           </div>
           <div className="px-4 pb-4">
             <div className="relative">

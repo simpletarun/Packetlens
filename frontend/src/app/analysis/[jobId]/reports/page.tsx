@@ -1244,7 +1244,7 @@ export default function ReportsPage() {
                     <StatGrid items={[
                       { label: "Total Payloads", value: files.length.toLocaleString() },
                       { label: "Total Size", value: formatBytes(files.reduce((s, f) => s + f.size, 0)) },
-                      { label: "MIME Types", value: new Set(files.map((f) => f.mimeType)).size.toLocaleString() },
+                      { label: "MIME Types", value: new Set(files.map((f) => (f.mimeType || "").toLowerCase()).filter(Boolean)).size.toLocaleString() },
                     ]} />
                   </div>
                   <div className="overflow-x-auto">
