@@ -92,7 +92,7 @@ const RULE_NAMES: Record<string, string> = {
   "PORT-SCAN-001": "Port Scan Detection",
   "SYN-FLOOD-001": "SYN Flood Attack",
   "DNS-TUNNEL-001": "DNS Tunneling",
-  "CRED-LEAK-001": "Credential Leak",
+  "CRED-LEAK-001": "Credential Exposure",
   "MALWARE-DL-001": "Malware Download",
   "C2-BEACON-001": "C2 Beaconing",
   "DATA-EXFIL-001": "Data Exfiltration",
@@ -109,7 +109,7 @@ const RULE_CATEGORIES: Record<string, string> = {
   "C2-BEACON-001": "C2 Channels",
   "DATA-EXFIL-001": "Data Exfiltration",
   "TLS-SUSPICIOUS-001": "C2 Channels",
-  "HTTP-CREDS-001": "Credential Theft",
+  "HTTP-CREDS-001": "Plaintext Credential Exposure",
 }
 
 export const RISK_PARAMS = spec.rule_params

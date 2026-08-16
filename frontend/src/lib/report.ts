@@ -271,9 +271,11 @@ const TECHNIQUE_RULES: Record<string, string[]> = {
   T1071: ["C2-BEACON-001"],
   // Credentials observed in cleartext ON THE WIRE = Network Sniffing (T1040 —
   // MITRE: "passively capture network traffic... including authentication
-  // material"; a packet capture IS passive interception). T1552 (Unsecured
-  // Credentials) covers credentials found in insecure STORAGE (files, logs,
-  // shell history) — it is never a "credentials in transit" technique (QA:
+  // material"). The capture shows the credentials were EXPOSED to passive
+  // interception — it does not prove an attacker sniffed them (the finding
+  // wording must say exposure, not theft). T1552 (Unsecured Credentials)
+  // covers credentials found in insecure STORAGE (files, logs, shell
+  // history) — it is never a "credentials in transit" technique (QA:
   // minor.pcapng mapped plaintext HTTP creds to T1552 and claimed T1552
   // covers "credentials submitted... in transit", which MITRE does not say).
   T1040: ["HTTP-CREDS-001", "CRED-LEAK-001"],
@@ -331,11 +333,13 @@ const TECHNIQUE_NAMES: Record<string, { name: string; desc: string }> = {
   "T1071.004": { name: "DNS Tunneling", desc: "Data encoded in DNS queries/responses" },
   T1041: { name: "Exfiltration Over C2 Channel", desc: "Data sent to external server" },
   T1071: { name: "Application Layer Protocol", desc: "Periodic C2 beaconing detected" },
-  // T1040: credentials captured FROM the wire — passive capture is exactly
-  // what a pcap analysis is. T1552 stays known for LEGACY persisted results
-  // that predate the T1040 remap, with MITRE's actual definition (storage,
-  // not transit).
-  T1040: { name: "Network Sniffing", desc: "Passive capture of network traffic revealing credentials transmitted in cleartext (unencrypted protocols)" },
+  // T1040: credentials observed IN TRANSIT on the wire — a packet capture
+  // demonstrates the exposure, not an active sniffer (the finding must read
+  // "plaintext credential exposure", never "credential theft" or a confirmed
+  // sniffing attacker — QA: college.pcapng labeled HTTP login "Credential
+  // Theft"). T1552 stays known for LEGACY persisted results that predate the
+  // T1040 remap, with MITRE's actual definition (storage, not transit).
+  T1040: { name: "Network Sniffing", desc: "Cleartext credentials were observable on the network path — exposed to passive interception; the capture demonstrates exposure, not an active sniffer" },
   T1552: { name: "Unsecured Credentials", desc: "Credentials discovered in insecure storage (files, logs, shell history) without protection" },
   T1105: { name: "Ingress Tool Transfer", desc: "Download of files from remote systems" },
   "T1583.001": { name: "Acquire Infrastructure: Domains", desc: "Suspicious TLS or domain infrastructure" },
@@ -679,7 +683,7 @@ const MITRE_REC: Record<string, string> = {
   T1071: "Isolate beaconing endpoints and hunt for C2 malware on affected hosts",
   T1090: "Enforce blocking of known proxy/TOR/VPN endpoints; review outbound policy",
   T1003: "Rotate exposed credentials and investigate hosts involved in authentication traffic",
-  T1040: "Cleartext credentials were observed on the wire (possible network sniffing); rotate the affected accounts, migrate the service to HTTPS and watch for interception on the LAN path",
+  T1040: "Cleartext credentials were observed on the wire (exposed to passive interception on the LAN path); rotate the affected accounts, migrate the service to HTTPS, and verify no interception tooling (sniffer/ARP spoofing) is active on the segment",
   // Legacy persisted results mapped plaintext HTTP creds to T1552 — keep a
   // correct remediation for those rows (T1552 rows can no longer be produced
   // by fresh analyses).
@@ -1270,7 +1274,7 @@ const IOC_TYPE_LABELS: Record<string, string> = {
   ja3: "Suspicious JA3",
   "port-scan": "Port Scan",
   "syn-flood": "SYN Flood",
-  "credential-theft": "Credential Theft",
+  "credential-theft": "Plaintext Credential Exposure",
   "malware-download": "Malware Download",
   "tls-anomaly": "TLS Anomaly",
 }
@@ -1689,7 +1693,14 @@ export function analystConclusion(opts: {
     const names = opts.alerts.map((a) => a.signature).join("; ")
     const summary = `${parts.join(", ")} finding${opts.alerts.length === 1 ? "" : "s"} detected`
     const noneConfirmed = counts.CONFIRMED === 0 ? " No findings were confirmed." : ""
-    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.`
+    // Credential findings: the capture proves the TRANSMISSION, never theft,
+    // interception or a malicious destination (QA: college.pcapng — the
+    // finding must read "plaintext credential exposure", not "credential
+    // theft").
+    const credNote = opts.alerts.some((a) => /[Cc]redential/.test(a.signature) && effectiveStatus(a) === "CONFIRMED")
+      ? " A plaintext credential submission is confirmed, but the capture does not establish that the credential was intercepted, that the destination is malicious, or that the host was compromised."
+      : ""
+    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.${credNote}`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.

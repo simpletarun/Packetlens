@@ -705,6 +705,9 @@ export default function ReportsPage() {
     }
     if (report.iocs.length) {
       lines.push("## Indicators of Compromise", ...report.iocs.slice(0, 20).map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
+      if (report.iocs.some((i) => i.type === "credential-theft")) {
+        lines.push("_A Plaintext Credential Exposure IOC lists the affected internal host (the machine that transmitted the credentials) — not an external indicator of compromise. The capture proves the transmission, not theft, interception, or a malicious destination._", "")
+      }
     }
     if (calls.length) {
       lines.push("## VoIP / SIP Calls", ...mdTable(["Caller", "Callee", "Status", "Start", "Duration", "RTP Packets", "RTP Payload"], calls.map((c) => [c.from, c.to, c.status, formatTime(c.startTime), c.durationSec !== null ? fmtClock(c.durationSec) : "—", c.rtpPackets > 0 ? c.rtpPackets.toLocaleString() : "—", c.rtpPayloadType !== null ? `PT ${c.rtpPayloadType}` : "—"])), "")
@@ -1162,7 +1165,7 @@ export default function ReportsPage() {
                             <td className="py-1.5 pr-2 font-mono truncate max-w-[160px]">{h.uri}</td>
                             <td className="py-1.5 pr-2 text-muted-foreground">{h.host}</td>
                             <td className="py-1.5 pr-2 font-mono">{h.dstIp}</td>
-                            <td className="py-1.5 pr-2 text-right"><Badge variant="outline" className={"text-[10px] " + (h.status < 300 ? "bg-success/10 text-success" : h.status < 400 ? "bg-info/10 text-info" : "bg-danger/10 text-danger")}>{h.status}</Badge></td>
+                            <td className="py-1.5 pr-2 text-right"><Badge variant="outline" className={"text-[10px] " + (h.status === 0 ? "bg-muted/40 text-muted-foreground" : h.status < 300 ? "bg-success/10 text-success" : h.status < 400 ? "bg-info/10 text-info" : "bg-danger/10 text-danger")}>{h.status}</Badge></td>
                             <td className="py-1.5 pr-2 text-muted-foreground truncate max-w-[120px]">{h.contentType}</td>
                             <td className="py-1.5 text-muted-foreground truncate max-w-[180px]">{h.userAgent}</td>
                           </tr>
@@ -1170,6 +1173,9 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
+                  {http.some((h) => h.status === 0) && (
+                    <p className="text-[10px] text-muted-foreground">Status 0 = no HTTP response was captured for that request (capture ended before the response, the connection closed, or the response was not observed) — it does not mean the request failed.</p>
+                  )}
                 </CardContent>
               </Card>
             </section>
@@ -1907,6 +1913,13 @@ export default function ReportsPage() {
                           IOCs may exceed confirmed alerts: behavioral indicators (DNS tunneling, beaconing, exfiltration) are
                           derived from advanced metrics, while confirmed alerts come from signature rules. Each IOC is labeled
                           with its source below.
+                        </p>
+                      )}
+                      {report.iocs.some((i) => i.type === "credential-theft") && (
+                        <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-3">
+                          A Plaintext Credential Exposure IOC lists the <strong>affected internal host</strong> (the machine
+                          that transmitted the credentials) — not an external indicator of compromise. The capture proves the
+                          transmission, not theft, interception, or a malicious destination.
                         </p>
                       )}
                       {report.iocs.length === 0 ? (

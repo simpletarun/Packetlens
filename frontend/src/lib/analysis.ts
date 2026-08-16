@@ -2235,7 +2235,7 @@ export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {})
         // Latest credential in the event (ISO UTC sorts lexically).
         timestamp: creds.map((x) => x.timestamp).sort().pop()!,
         signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
-        category: isHttp ? 'Credential Theft' : 'Credential Leak',
+        category: isHttp ? 'Plaintext Credential Exposure' : 'Credential Exposure',
         severity: 4,
         // Payload-verified: the plaintext credential bytes were decoded, so
         // the detector's confidence is maximal and the state is CONFIRMED —

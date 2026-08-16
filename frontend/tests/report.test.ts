@@ -356,7 +356,7 @@ it("burst bonus is reported as applied only when an eligible rule actually benef
   it("verdict floors to the strongest finding's severity (score band LOW, finding HIGH)", () => {
     const credAlert: AlertEntry = {
       id: "t1", timestamp: new Date(T0 * 1000).toISOString(), signature: "Plaintext HTTP Credentials",
-      category: "Credential Theft", severity: 4, confidence: 75, ruleId: "HTTP-CREDS-001",
+      category: "Plaintext Credential Exposure", severity: 4, confidence: 75, ruleId: "HTTP-CREDS-001",
       srcIp: "10.0.0.5", dstIp: "23.155.129.172", srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "x",
     }
     const metrics = { burst: null, beaconDetected: false } as unknown as AdvancedMetrics
@@ -1002,6 +1002,9 @@ it("confirms findings when alerts exist, even at LOW score (QA: never_end 39 LOW
     expect(text).toContain("not proof that the capture is universally malicious")
     // The score is a rule-output summary, never a probability of compromise.
     expect(text).toContain("does not represent a probability of compromise")
+    // A confirmed credential transmission must never read as confirmed theft
+    // or interception (QA: college.pcapng "Credential Theft" wording).
+    expect(text).toContain("does not establish that the credential was intercepted")
     expect(text).not.toContain("No suspicious indicators")
   })
 
@@ -1072,14 +1075,16 @@ describe("MITRE mapping for plaintext credential alerts (T1040, not T1552)", () 
     })
     const rec = report.recommendations.find((r) => r.text.includes("Plaintext credentials") || r.text.includes("Cleartext credentials"))
     expect(rec?.severity).toBe(4)
-    // T1040 Network Sniffing: credentials captured from the wire — a packet
-    // capture IS passive interception (MITRE: "passively capture network
-    // traffic... including authentication material"). T1552 covers credentials
-    // in insecure STORAGE (files, logs, shell history), never transit (QA:
+    // T1040 Network Sniffing: credentials were EXPOSED on the wire — the
+    // capture demonstrates the exposure, never a confirmed sniffer (the
+    // wording must say "exposure", not "theft"). T1552 covers credentials in
+    // insecure STORAGE (files, logs, shell history), never transit (QA:
     // minor.pcapng mapped to T1552 and claimed it covered "in transit").
     const mitre = report.mitre.find((m) => m.id === "T1040")
     expect(mitre?.technique).toBe("Network Sniffing")
-    expect(mitre?.description).toContain("cleartext")
+    expect(mitre?.description).toContain("Cleartext")
+    expect(mitre?.description).toContain("exposure")
+    expect(mitre?.description).not.toContain("theft")
     expect(mitre?.status).toBe("CONFIRMED")
     expect(report.mitre.find((m) => m.id === "T1552")).toBeUndefined()
   })
