@@ -9,7 +9,7 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -538,7 +538,14 @@ export default function ReportsPage() {
       // flow is LOW-confidence and must not read as genuine 75% loss (QA:
       // minor.pcapng summary said "worst 75%" while the table showed 9 pkts).
       const worstConf = worst.packets >= 100 ? "HIGH" : worst.packets >= 20 ? "MEDIUM" : "LOW"
-      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% to ${worst.dstIp} — ${worstConf} confidence, ${worst.packets} packets in that flow${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST` : ""}) — no detection rule triggered`)
+      // The flow must be read initiator-first, exactly like the flows table,
+      // the TCP Health table and the CSV — or the summary's worst flow and
+      // the table's rows show opposite endpoint orders (QA: main.pcapng said
+      // "worst 87.5% to 192.168.1.10" while the CSV row was
+      // 192.168.1.10 → 185.199.110.133). "in flow A → B" claims no loss
+      // direction: the retrans count sums both directions.
+      const worstOrient = flowInitiatorFlip(worst, packets) ? `${worst.dstIp} → ${worst.srcIp}` : `${worst.srcIp} → ${worst.dstIp}`
+      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) show retransmission or computed loss (worst ${worst.lossPct}% in flow ${worstOrient} — ${worstConf} confidence, ${worst.packets} packets in that flow${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% loss` : ""}${rsts > 0 ? `; ${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST` : ""}) — no detection rule triggered`)
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
@@ -679,7 +686,7 @@ export default function ReportsPage() {
       "| --- | --- | --- |",
       ...topPorts.map(({ protocol, port, count, confirmedFlows, flows }) => `| ${protocol}/${port} | ${serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)} | ${count.toLocaleString()} |`),
       ...(topPorts.length < allPorts.length ? [`- *(+${allPorts.length - topPorts.length} more services — top ${topPorts.length} shown)*`, ""] : [""]),
-      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded (${p2pExcluded.toLocaleString()} pkts); port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Packets column holds packet totals. A conversation counts as confirmed when at least one of its packets was payload-verified, so a partially verified conversation still counts (the CSV's "mixed" rows)._`,
+      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded (${p2pExcluded.toLocaleString()} pkts); port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; evidence counts are FLOWS (conversations), never packets — the Packets column holds packet totals. A flow counts as having payload evidence when at least one of its packets was payload-verified, so a partially verified flow still counts (the CSV's "mixed" rows)._`,
       "",
       ...(observations.length ? ["## Observations", ...observations.map((o) => `- ${o}`), ""] : []),
       "## Top Talkers (source)",
@@ -1000,9 +1007,20 @@ export default function ReportsPage() {
                               </tr>
                             </thead>
                             <tbody>
-                              {worst.map((f) => (
+                              {worst.map((f) => {
+                                // Same initiator-first orientation as the
+                                // flows table and the CSV — the health table
+                                // used to show the raw lexicographic order,
+                                // so the same flow read as two flows (QA:
+                                // main.pcapng 185.199.110.133 → 192.168.1.10
+                                // in health vs 192.168.1.10 → 185.199.110.133
+                                // in the CSV).
+                                const o = flowInitiatorFlip(f, packets)
+                                  ? { srcIp: f.dstIp, srcPort: f.dstPort, dstIp: f.srcIp, dstPort: f.srcPort }
+                                  : { srcIp: f.srcIp, srcPort: f.srcPort, dstIp: f.dstIp, dstPort: f.dstPort }
+                                return (
                                 <tr key={f.id} className="border-b border-border/30">
-                                  <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{f.srcIp}:{f.srcPort} → {f.dstIp}:{f.dstPort}</td>
+                                  <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{o.srcIp}:{o.srcPort} → {o.dstIp}:{o.dstPort}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.packets}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.rttMs ? f.rttMs : "n/a"}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.retrans ?? 0}</td>
@@ -1012,11 +1030,12 @@ export default function ReportsPage() {
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.zeroWindow ?? 0}</td>
                                   <td className="py-1.5 text-right font-mono">{f.rstCount ?? 0}</td>
                                 </tr>
-                              ))}
+                                )
+                              })}
                             </tbody>
                           </table>
                         </div>
-                        <p className="text-[10px] text-muted-foreground mt-1">Loss % is estimated from retransmission evidence on the observed packet sample; the Loss Confidence column scales with the sample size (&ge;100 pkts HIGH, 20&ndash;99 MED, &lt;20 LOW) — a 50% estimate from 4 packets is far weaker than from 10,000.</p>
+                        <p className="text-[10px] text-muted-foreground mt-1">Endpoints are listed initiator-first, like the flows table and the CSV export. Loss % is estimated from retransmission evidence on the observed packet sample; the Loss Confidence column scales with the sample size (&ge;100 pkts HIGH, 20&ndash;99 MED, &lt;20 LOW) — a 50% estimate from 4 packets is far weaker than from 10,000. Retransmissions are summed over both directions and are not attributed to a side.</p>
                       </div>
                     )
                   })()}
@@ -1676,7 +1695,7 @@ export default function ReportsPage() {
                   <SectionTitle icon={Shield} title="18. Risk Score" />
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     {[
-                      { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle },
+                      { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle, sub: !undecodable && scoreVal === 0 ? "no configured detection rule triggered — not a compromise probability" : undefined },
                       { label: "Throughput Avg", value: rateLabel(advancedMetrics.throughputAvg), color: "text-info", icon: BarChart3 },
                       { label: "Throughput Peak (100 ms window)", value: rateLabel(advancedMetrics.throughputPeak100ms ?? null), color: "text-chart-2", icon: BarChart3 },
                        { label: "Burst", value: advancedMetrics.burst?.detected ? "Detected" : "Not Detected", color: advancedMetrics.burst?.detected ? "text-danger" : "text-success", icon: Zap, sub: advancedMetrics.burst?.detected ? `${advancedMetrics.burst.ratio.toFixed(1)}× average · ${advancedMetrics.burst.duration.toFixed(1)} s` : undefined },
@@ -1779,7 +1798,7 @@ export default function ReportsPage() {
                 <Card>
                   <CardHeader><CardTitle className="text-sm">Top Ports</CardTitle></CardHeader>
                   <CardContent className="space-y-2">
-                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; confirmed counts are FLOWS (conversations), never packets — the Count column holds packet totals. A conversation counts as confirmed when at least one of its packets was payload-verified, so a partially verified conversation still counts (the CSV's "mixed" rows).</p>}
+                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; evidence counts are FLOWS (conversations), never packets — the Count column holds packet totals. A flow counts as having payload evidence when at least one of its packets was payload-verified, so a partially verified flow still counts (the CSV's "mixed" rows).</p>}
                     {topPorts.length === 0 && (
                       <p className="text-xs text-muted-foreground">{undecodable ? `No port data — payloads undecodable (${dltName(linkTypes)}), so ports were not parsed` : "No port data"}</p>
                     )}
@@ -2064,6 +2083,7 @@ export default function ReportsPage() {
                       <div className="flex items-center gap-2 flex-wrap">
                         <Shield className={cn("h-5 w-5", levelColor)} />
                         <span className={cn("text-lg font-bold", levelColor)}>{levelLabel}</span>
+                        {levelLabel === "SAFE" && <span className="text-xs text-muted-foreground">— no configured detection rule triggered (not a proof of a clean network)</span>}
                         <span className="text-xs text-muted-foreground">Final verdict · Risk score {riskValue()}</span>
                       </div>
                       <p className="text-sm text-muted-foreground">{conclusionText}</p>

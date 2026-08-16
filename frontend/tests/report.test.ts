@@ -725,24 +725,30 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     expect(csv.startsWith("\uFEFF")).toBe(true)
     const lines = csv.split("\n")
     // Build-identity comment rides the export so the artifact traces to a
-    // commit; it is the ONLY comment row (supersedes the old audit rule —
-    // strict importers must skip a single leading '#' record, RFC 4180 §2.1).
-    expect(lines[0]).toMatch(/^\uFEFF# PacketLens v\d+\.\d+\.\d+ · (commit|src):/)
-    expect(lines[1]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct")
+    // commit, followed by the semantics lines that document the columns a
+    // spreadsheet reader cannot see explained anywhere else (RFC 4180 §2.1
+    // allows comment preamble rows).
+    expect(lines[0]).toMatch(/^\uFEFF# PacketLens v\d+\.\d+\.\d+ · (commit|src):.* · 4 flows$/)
+    expect(lines[1]).toMatch(/^# Rows are initiator-first:/)
+    expect(lines[2]).toMatch(/^# serviceEvidence:/)
+    expect(lines[3]).toMatch(/^# estLossPct:/)
+    expect(lines[4]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct")
     // src/dst in their own columns — "ip:port" pairs are gone (IPv6 safety).
-    expect(lines[2]).toBe("10.0.0.5,1234,203.0.113.9,80,TCP,42,4000,2000,6000,2024-01-01T00:00:00Z,2024-01-01T00:00:10Z,10,,US,,AS64500,HTTP,port,9,1,")
-    // Direction-unknown: empty sent/recv cells, never the string "unknown".
-    expect(lines[3]).toBe("203.0.113.9,80,10.0.0.5,1234,TCP,12,,,1000,,,2,US,,AS64500,,,,0,0,")
-    expect(lines[3]).not.toContain("unknown")
-    expect(lines[3]).not.toContain("\u2014")
+    expect(lines[5]).toBe("10.0.0.5,1234,203.0.113.9,80,TCP,42,4000,2000,6000,2024-01-01T00:00:00Z,2024-01-01T00:00:10Z,10,,US,,AS64500,HTTP,port,9,1,")
+    // Direction-unknown: empty sent/recv cells, never the string "unknown";
+    // service reads N/A like the port-less rows, never a blank (QA: OTHER
+    // rows shipped an empty service while ARP/ICMPv6 said N/A).
+    expect(lines[6]).toBe("203.0.113.9,80,10.0.0.5,1234,TCP,12,,,1000,,,2,US,,AS64500,,N/A,,0,0,")
+    expect(lines[6]).not.toContain("unknown")
+    expect(lines[6]).not.toContain("\u2014")
     // Undecodable ("—") endpoints keep an explicit label, never an em-dash
     // or a silent blank (QA: "OTHER flow has empty source/destination").
-    expect(lines[4]).toBe("Undecoded/unknown endpoint,0,Undecoded/unknown endpoint,0,OTHER,4,,,243,,,1,,,,,,,,,")
+    expect(lines[7]).toBe("Undecoded/unknown endpoint,0,Undecoded/unknown endpoint,0,OTHER,4,,,243,,,1,,,,,N/A,,,,")
     // IPv6 row parses as 4 separate columns (no 9-group "ip:port" address).
-    expect(lines[5]).toBe("2401:4900:1:2:3:4:5:6,443,203.0.113.20,53000,UDP,1,,,100,,,1,,,,,,,,,")
-    // Exactly ONE comment row, then schema rows only.
-    expect(lines.filter((l) => l.replace(/^\uFEFF/, "").startsWith("#"))).toHaveLength(1)
-    expect(lines).toHaveLength(6)
+    expect(lines[8]).toBe("2401:4900:1:2:3:4:5:6,443,203.0.113.20,53000,UDP,1,,,100,,,1,,,,,N/A,,,,")
+    // Exactly FOUR comment rows, then schema rows only.
+    expect(lines.filter((l) => l.replace(/^\uFEFF/, "").startsWith("#"))).toHaveLength(4)
+    expect(lines).toHaveLength(9)
   })
 
   it("buildFlowsCsv: serviceEvidence column is port/mixed/payload, never a guess", () => {
@@ -756,17 +762,17 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
       { srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", appProtocol: "UDP" },
       { srcIp: "101.2.27.162", dstIp: "192.168.1.20", srcPort: 3478, dstPort: 65242, protocol: "UDP", appProtocol: "UDP" },
     ]
-    expect(buildFlowsCsv([stunFlow], new Map(), stunPackets).split("\n")[2].split(",")[17]).toBe("mixed")
+    expect(buildFlowsCsv([stunFlow], new Map(), stunPackets).split("\n")[5].split(",")[17]).toBe("mixed")
     // No packet evidence → "port". UDP/8001 HTTP-Alt is port-based, so even a
     // port-labeled HTTP-Alt packet never counts as payload evidence.
     const altPackets = [
       { srcIp: "192.168.1.3", dstIp: "224.0.0.7", srcPort: 8001, dstPort: 8001, protocol: "UDP", appProtocol: "HTTP-Alt" },
     ]
     const altFlow: Flow = { id: "f2", srcIp: "192.168.1.3", dstIp: "224.0.0.7", srcPort: 8001, dstPort: 8001, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "" }
-    expect(buildFlowsCsv([altFlow], new Map(), altPackets).split("\n")[2].split(",")[17]).toBe("port")
+    expect(buildFlowsCsv([altFlow], new Map(), altPackets).split("\n")[5].split(",")[17]).toBe("port")
     // Direction-unknown rows carry no service, hence no evidence.
     const dirUnknown: Flow = { id: "f3", srcIp: "203.0.113.9", dstIp: "10.0.0.5", srcPort: 443, dstPort: 53000, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 0, bytesRecv: 0, duration: 1, startTime: "", endTime: "", directionUnknown: true }
-    expect(buildFlowsCsv([dirUnknown], new Map(), []).split("\n")[2].split(",")[17]).toBe("")
+    expect(buildFlowsCsv([dirUnknown], new Map(), []).split("\n")[5].split(",")[17]).toBe("")
   })
 
   it("DHCPv6 (UDP 546/547) is a known service, not Unknown service", () => {
@@ -774,7 +780,7 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     expect(portServiceName(547, "UDP")).toBe("DHCPv6")
     expect(flowServiceName(546, 547, "UDP")).toBe("DHCPv6")
     const flow: Flow = { id: "f1", srcIp: "fe80::bad1:fffa:a38:77dc", dstIp: "ff02::1:2", srcPort: 546, dstPort: 547, protocol: "UDP", packets: 1, bytesTotal: 100, bytesSent: 100, bytesRecv: 0, duration: 1, startTime: "", endTime: "" }
-    expect(buildFlowsCsv([flow]).split("\n")[2].split(",")[16]).toBe("DHCPv6")
+    expect(buildFlowsCsv([flow]).split("\n")[5].split(",")[16]).toBe("DHCPv6")
   })
 
   it("serviceEvidenceLabel: fully confirmed stays plain, partial carries the flow counts, none says port-inferred", () => {
@@ -782,7 +788,7 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     // payload-confirmed if ANY of its packets was protocol-verified, so
     // "N of M flows" is the honest wording next to packet counts (QA:
     // "8 of 17" vs "17 of 40,864 packets" mixed radixes).
-    expect(serviceEvidenceLabel("STUN", 26, 622)).toBe("STUN (26 of 622 flows payload-confirmed)")
+    expect(serviceEvidenceLabel("STUN", 26, 622)).toBe("STUN (26 of 622 flows with payload evidence)")
     expect(serviceEvidenceLabel("HTTP-Alt", 0, 20)).toBe("HTTP-Alt (port-inferred)")
     expect(serviceEvidenceLabel("STUN", 622, 622)).toBe("STUN")
   })
@@ -813,8 +819,8 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     ]
     const csv = buildFlowsCsv(flows)
     const lines = csv.split("\n")
-    expect(lines[2].split(",")[16]).toBe("STUN")
-    expect(lines[3].split(",")[16]).toBe("N/A")
+    expect(lines[5].split(",")[16]).toBe("STUN")
+    expect(lines[6].split(",")[16]).toBe("N/A")
   })
 
   it("buildFlowsCsv: rows are initiator-first — a resolver-sorted flow flips to the querying client (DNS QA)", () => {
@@ -832,7 +838,7 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
       { srcIp: "192.168.137.228", dstIp: "192.168.137.1", srcPort: 47942, dstPort: 53, protocol: "UDP" },
     ]
     const csv = buildFlowsCsv(flows, new Map(), packets)
-    const cols = csv.split("\n")[2].split(",")
+    const cols = csv.split("\n")[5].split(",")
     expect(cols[0]).toBe("192.168.137.228") // client, the initiator
     expect(cols[2]).toBe("192.168.137.1")   // resolver
     expect(cols[6]).toBe("200")             // bytesSent = flow bytesRecv (client leg)
@@ -851,7 +857,7 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
       { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "SYN-ACK" },
       { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "ACK" },
     ]
-    const cols = buildFlowsCsv(flows, new Map(), packets).split("\n")[2].split(",")
+    const cols = buildFlowsCsv(flows, new Map(), packets).split("\n")[5].split(",")
     expect(cols[0]).toBe("10.0.0.5")        // the SYN sender
     expect(cols[1]).toBe("42224")
     expect(cols[2]).toBe("198.51.100.7")
@@ -861,8 +867,8 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     // keeps canonical order; with NO packets at all there is nothing to
     // detect, so the canonical order stands unchanged.
     const noSyn = buildFlowsCsv(flows, new Map(), [{ srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP" }])
-    expect(noSyn.split("\n")[2].split(",")[0]).toBe("198.51.100.7")
-    expect(buildFlowsCsv(flows).split("\n")[2].split(",")[0]).toBe("198.51.100.7")
+    expect(noSyn.split("\n")[5].split(",")[0]).toBe("198.51.100.7")
+    expect(buildFlowsCsv(flows).split("\n")[5].split(",")[0]).toBe("198.51.100.7")
   })
 
   it("buildFlowsCsv: formula-prefixed cells are defused and embedded commas/quotes are quoted", () => {
@@ -879,12 +885,12 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
       { id: "fx3", srcIp: "10.0.0.1", dstIp: "203.0.113.79", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 1, bytesTotal: 1, bytesSent: 0, bytesRecv: 1, duration: 1, startTime: "", endTime: "" },
     ]
     const csv = buildFlowsCsv(flows, geo)
-    const defusedLine = csv.split("\n")[2]
+    const defusedLine = csv.split("\n")[5]
     expect(defusedLine).toContain(`'=HYPERLINK(""http://evil"")`)
     expect(defusedLine).toContain("'=HYPERLINK")
     expect(defusedLine).not.toContain(",=HYPERLINK")
-    expect(csv.split("\n")[3]).toContain("'+SUM(A1:A9)")
-    expect(csv.split("\n")[4]).toContain("AS64500")
+    expect(csv.split("\n")[6]).toContain("'+SUM(A1:A9)")
+    expect(csv.split("\n")[7]).toContain("AS64500")
   })
 
   it("mdInline escapes ONCE — no &amp;amp; / literal &lt; in exported HTML", () => {
@@ -1257,8 +1263,8 @@ const rows = flowTableRows(flows, packets)
     // CSV produces the same initiator for the same flow record.
     const csv = buildFlowsCsv(flows, new Map(), packets)
     const csvLines = csv.split("\n")
-    expect(csvLines[2].startsWith("192.168.1.10,13248,104.16.103.112,443,")).toBe(true)
-    expect(csvLines[3].startsWith("192.168.1.10,6750,46.101.206.53,443,")).toBe(true)
+    expect(csvLines[5].startsWith("192.168.1.10,13248,104.16.103.112,443,")).toBe(true)
+    expect(csvLines[6].startsWith("192.168.1.10,6750,46.101.206.53,443,")).toBe(true)
   })
 
 it("carries the per-flow RTT through to the page rows", () => {

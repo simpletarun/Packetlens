@@ -1022,10 +1022,15 @@ const PORT_SERVICES: Record<number, string> = {
   1723: "PPTP", 1812: "RADIUS", 19302: "STUN", 2049: "NFS", 2375: "Docker",
   3000: "Web-Dev", 3128: "Proxy", 3306: "MySQL", 3389: "RDP", 3702: "WS-Discovery",
   5060: "SIP", 5222: "XMPP", 5349: "STUN", 5353: "mDNS", 5355: "LLMNR",
-  5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 6443: "K8s-API",
-  8080: "HTTP-Alt", 8443: "HTTPS-Alt", 9000: "App", 9092: "Kafka",
-   8001: "HTTP-Alt",
-  27017: "MongoDB", 3478: "STUN", 51820: "WireGuard", 5228: "GCM (FCM)",
+   5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 6443: "K8s-API",
+   8080: "HTTP-Alt", 8443: "HTTPS-Alt", 9000: "App", 9092: "Kafka",
+    8001: "HTTP-Alt",
+   // Samsung TVs/phones broadcast device discovery on UDP 15600–15601
+   // (community-documented, not IANA-assigned) — frequent 77-byte LAN
+   // broadcasts between OUI-identified Samsung devices were "Unknown
+   // service" (QA: main.pcapng UDP/15600 read as unexplained traffic).
+   15600: "Samsung Discovery", 15601: "Samsung Discovery",
+   27017: "MongoDB", 3478: "STUN", 51820: "WireGuard", 5228: "GCM (FCM)",
 }
 
 // Port → human service label. Ephemeral-looking ports get "Dynamic/Ephemeral":
@@ -1068,12 +1073,16 @@ function evidenceAppProtocols(service: string): Set<string> | undefined {
 // is fully payload-confirmed stays plain; a partially confirmed one carries
 // the verified count; an entirely port-inferred one says so. `count` is the
 // FLOW count and `confirmed` the flow count with verified payload — both
-// numbers are the same unit, so "8 of 17 flows payload-confirmed" can never
-// read as 8 packets of 40,864 (QA: the old label mixed an 8-flow count with
-// the TCP/443 packet total).
+// numbers are the same unit, so "8 of 17 flows with payload evidence" can
+// never read as 8 packets of 40,864 (QA: the old label mixed an 8-flow count
+// with the TCP/443 packet total). The qualifier says "payload evidence", not
+// "payload-confirmed", because a flow with at least one verified packet is
+// partially verified — "confirmed" read as whole-flow verification while the
+// CSV's per-flow column shows "mixed" for those exact flows (QA: main.pcapng
+// "36 of 54 flows payload-confirmed" next to 36 "mixed" + 0 "payload" rows).
 export function serviceEvidenceLabel(service: string, confirmed: number, count: number): string {
   if (confirmed >= count) return service
-  if (confirmed > 0) return `${service} (${confirmed.toLocaleString()} of ${count.toLocaleString()} flows payload-confirmed)`
+  if (confirmed > 0) return `${service} (${confirmed.toLocaleString()} of ${count.toLocaleString()} flows with payload evidence)`
   return `${service} (port-inferred)`
 }
 
@@ -1490,7 +1499,12 @@ const flowKey = (x: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: 
   return `${x.protocol}|${a}|${b}|${pa ?? ""}|${pb ?? ""}`
 }
 
-function flowInitiatorFlip(f: { directionUnknown?: boolean; srcIp: string; dstIp: string }, pkts: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[]): boolean {
+// flowInitiatorFlip is exported so the report page, the flows table, the CSV
+// and the network-health surfaces all orient one conversation identically
+// (QA: the TCP Health table and the health observation used the raw
+// lexicographic endpoint order while the flows table and CSV were
+// initiator-first — the same flow read as two different flows).
+export function flowInitiatorFlip(f: { directionUnknown?: boolean; srcIp: string; dstIp: string }, pkts: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[]): boolean {
   if (f.directionUnknown) return false
   const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
   const init = syn ? syn.srcIp : pkts[0]?.srcIp
@@ -1612,7 +1626,7 @@ export function buildFlowsCsv(
       f.duration,
       cc(srcIp), cc(dstIp),
       asn(srcIp), asn(dstIp),
-      f.directionUnknown ? "" : flowServiceName(srcPort, dstPort, f.protocol),
+      f.directionUnknown ? "N/A" : flowServiceName(srcPort, dstPort, f.protocol),
       flowServiceEvidence(f, pkts),
       f.rttMs ?? "",
       f.retrans ?? "",
@@ -1624,7 +1638,16 @@ export function buildFlowsCsv(
   // Git identity and could not be certified against a release). Comment
   // lines are legal CSV preamble (RFC 4180 section 2.1) and the earlier
   // audit's "no comment rows" rule is superseded by this requirement.
-  const comment = `# PacketLens ${BUILD_STAMP} · ${rows.length} flow${rows.length === 1 ? "" : "s"}`
+  // The semantics lines document the columns whose values a spreadsheet
+  // reader cannot see explained anywhere else (QA: main.pcapng's "mixed"
+  // serviceEvidence and 87.5% estLossPct were read without the report's
+  // footnotes and misread as full-flow verification / measured loss).
+  const comment = [
+    `# PacketLens ${BUILD_STAMP} · ${rows.length} flow${rows.length === 1 ? "" : "s"}`,
+    "# Rows are initiator-first: the endpoint that sent the SYN (TCP) or the first observed packet is the left (srcIp) side; bytesSent/bytesRecv are relative to the initiator.",
+    "# serviceEvidence: \"payload\" = every packet payload-verified; \"mixed\" = at least one packet payload-verified (partial verification still counts as confirmed); \"port\" = port-inferred only, never payload-verified.",
+    "# estLossPct: retransmissions / data segments, both directions summed — an ESTIMATE from the observed sample, not a measured loss rate; the retrans column is not split by direction. rttMs: TCP handshake RTT (SYN→SYN-ACK) when captured.",
+  ].join("\n")
   return "\uFEFF" + [comment, header, ...rows].join("\n")
 }
 

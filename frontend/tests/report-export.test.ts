@@ -161,16 +161,18 @@ describe("flows CSV artifact — the exported file must mirror the engine flows 
     const csv = buildFlowsCsv(a.flows, new Map(), a.packets)
     expect.soft(csv.startsWith("\uFEFF# PacketLens "), `${name}: BOM + build-identity comment`).toBe(true)
     expect.soft(csv.includes("\n" + HEADER), `${name}: header row after comment`).toBe(true)
-    const rows = parseCsv(csv)
-    expect.soft(rows.length, `${name}: row count`).toBe(a.flows.length + 2)
-    expect.soft(rows[0].join(","), `${name}: comment row`).toContain("PacketLens")
-    expect.soft(rows[1].join(","), `${name}: header row`).toBe(HEADER)
+    // Semantics comment lines (build identity, initiator-first, serviceEvidence,
+    // estLossPct) ride the export before the schema; drop every '#' record and
+    // validate the schema + data rows that remain.
+    const rows = parseCsv(csv).filter((r) => !r[0].startsWith("#"))
+    expect.soft(rows.length, `${name}: row count`).toBe(a.flows.length + 1)
+    expect.soft(rows[0].join(","), `${name}: header row`).toBe(HEADER)
     const totalLen = a.packets.reduce((s, p) => s + (p.length || 0), 0)
     let csvBytes = 0
     const flows = a.flows
     for (let i = 0; i < flows.length; i++) {
       const f = flows[i]
-      const r = rows[i + 2]
+      const r = rows[i + 1]
       const idx = (ip: string) => (ip === "\u2014" ? "Undecoded/unknown endpoint" : ip)
       // CSV rows are direction-normalized to the conversation INITIATOR
       // (SYN sender for TCP, else first observed packet; canonical order kept
@@ -201,7 +203,7 @@ describe("flows CSV artifact — the exported file must mirror the engine flows 
       expect.soft(r[10], `${name}: row ${i + 1} endTime`).toBe(f.endTime)
       expect.soft(Math.abs(Number(r[11]) - f.duration), `${name}: row ${i + 1} durationSec`).toBeLessThanOrEqual(0.011)
       if (f.directionUnknown) {
-        expect.soft(r[6] === "" && r[7] === "" && r[16] === "", `${name}: row ${i + 1} directionUnknown blanks`).toBe(true)
+        expect.soft(r[6] === "" && r[7] === "" && r[16] === "N/A", `${name}: row ${i + 1} directionUnknown blanks`).toBe(true)
       } else {
         expect.soft(Number(r[6]), `${name}: row ${i + 1} bytesSent`).toBe(flip ? f.bytesRecv : f.bytesSent)
         expect.soft(Number(r[7]), `${name}: row ${i + 1} bytesRecv`).toBe(flip ? f.bytesSent : f.bytesRecv)
@@ -305,11 +307,11 @@ describe("markdownToHtml — the standalone HTML artifact renderer", () => {
   })
 
   it("drops the separator rows and keeps every data row of a table", () => {
-    const md = "## Top Ports\n| Protocol/Port | Service | Packets |\n| --- | --- | --- |\n| TCP/443 | HTTPS (3 of 2,011 payload-confirmed) | 2,011 |\n| UDP/53 | DNS | 8 |\n"
+    const md = "## Top Ports\n| Protocol/Port | Service | Packets |\n| --- | --- | --- |\n| TCP/443 | HTTPS (3 of 2,011 flows with payload evidence) | 2,011 |\n| UDP/53 | DNS | 8 |\n"
     const html = markdownToHtml(md, { jobId: "j", jobFilename: "f.pcap", origin: "http://x" })
     expect(html).not.toContain("<td>---</td>")
     expect(html).toContain("<td>TCP/443</td>")
-    expect(html).toContain("<td>HTTPS (3 of 2,011 payload-confirmed)</td>")
+    expect(html).toContain("<td>HTTPS (3 of 2,011 flows with payload evidence)</td>")
     expect(html).toContain("<td>2,011</td>")
     expect(html).toContain("<td>UDP/53</td>")
     expect(html).toContain("<td>8</td>")
