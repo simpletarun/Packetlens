@@ -256,7 +256,7 @@ describe("markdownToHtml — the standalone HTML artifact renderer", () => {
       "| 100.101.45.41 | Internal Host | 1,014 | 596.0 KB | DNS, HTTP |",
       "",
       "## Alerts",
-      "- [Critical] Data Exfiltration Suspected (100.101.45.41 → 172.65.90.22)",
+      "- [Critical] Suspected Large Outbound Transfer (100.101.45.41 → 172.65.90.22)",
       "",
       "## Analyst Conclusion",
       "- **Final verdict:** **HIGH** — risk 68/100",
@@ -288,7 +288,7 @@ describe("markdownToHtml — the standalone HTML artifact renderer", () => {
     expect(html).toContain("<li><strong>Final verdict:</strong> <strong class=\"lv-high\">HIGH</strong> — risk 68/100</li>")
     expect(html).toContain("<p class=\"note\">Service-side attribution per conversation.</p>")
     expect(html).toContain("<h2>Alerts</h2>")
-    expect(html).toContain("<li>[Critical] Data Exfiltration Suspected (100.101.45.41 → 172.65.90.22)</li>")
+    expect(html).toContain("<li>[Critical] Suspected Large Outbound Transfer (100.101.45.41 → 172.65.90.22)</li>")
   })
 
   it("escapes hostile content and encodes the deep link", () => {

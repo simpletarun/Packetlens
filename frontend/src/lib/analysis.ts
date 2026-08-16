@@ -1641,7 +1641,7 @@ export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, exis
     })
   }
   if (advancedMetrics.dnsTunnelingSuspected) push('DNS-TUNNEL-001', 'Possible DNS Tunneling', 'Exfiltration', 4, 80, advancedMetrics.dnsTunnelEvidence ?? 'DNS tunneling behavior detected')
-  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Data Exfiltration Suspected', 'Exfiltration', 5, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs')
+  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Suspected Large Outbound Transfer', 'Exfiltration', 5, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs')
   if (advancedMetrics.beaconDetected) push('C2-BEACON-001', 'Regular Beaconing Detected', 'Command and Control', 5, 65, advancedMetrics.beaconEvidence ?? 'C2 beaconing behavior detected')
   if (advancedMetrics.ja3Suspicious) push('TLS-SUSPICIOUS-001', 'Suspicious TLS Certificate', 'Command and Control', 2, 75, 'Suspicious TLS fingerprint or oversized SNI')
   return out
@@ -1980,8 +1980,22 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       x.d !== null && x.d.out > RISK_PARAMS.data_exfil_min_bytes && x.d.out > 5 * x.d.in
     )
   const dataExfiltrationSuspected = externalFlows.length > 0
+  // The evidence names the exact flow (id, ports, protocol, packets, bytes,
+  // duration) so the alert is investigable without a second query, and states
+  // explicitly what the rule does and does not prove: the byte counts include
+  // retransmitted segments as captured, and a directional ratio is behavior,
+  // not payload evidence of exfiltration (QA: open.pcapng — the finding read
+  // as confirmed exfiltration from the ratio alone).
   const dataExfilDetail = externalFlows.length > 0
-    ? `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received; top: ${externalFlows[0].d.priv} → ${externalFlows[0].d.pub}, ${(externalFlows[0].d.out / 1024).toFixed(0)} KB sent)`
+    ? (() => {
+        const { f, d } = externalFlows[0]
+        const privPort = d.priv === f.srcIp ? f.srcPort : f.dstPort
+        const pubPort = d.pub === f.dstIp ? f.dstPort : f.srcPort
+        const proto = f.appProtocol && f.appProtocol !== "UNKNOWN" ? f.appProtocol : f.protocol
+        const retransNote = f.retrans ? `, including ${f.retrans} retransmitted segment(s) as captured` : ""
+        const dur = Number.isFinite(f.duration) ? f.duration : 0
+        return `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received). Top flow: ${f.id} — ${d.priv}:${privPort} → ${d.pub}:${pubPort} (${proto}), ${(d.out / 1024).toFixed(0)} KB sent vs ${(d.in / 1024).toFixed(1)} KB received, ${f.packets} packets over ${dur.toFixed(1)}s${retransNote}. Directional byte-ratio behavior only — no payload evidence of what the data was; the destination is not established as malicious`
+      })()
     : ''
 
   // Tor exit-node subnet (ASN-TOR, 185.220.101.0/24) in either direction. A

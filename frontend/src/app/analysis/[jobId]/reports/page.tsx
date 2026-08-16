@@ -348,6 +348,19 @@ export default function ReportsPage() {
   // instead of a template that hides the rounding.
   const riskCurve = risk ? 100 * (1 - Math.exp(-risk.rawScore / RISK_CURVE_K)) : null
 
+  // The strongest finding's DETECTION status: a CRITICAL/HIGH verdict floored
+  // by an unconfirmed (SUSPECTED/LIKELY) finding must never read as a
+  // confirmed incident — the verdict header and risk card state the status
+  // explicitly (QA: open.pcapng "53/100 CRITICAL" with "No findings were
+  // confirmed" read as a confirmed critical incident).
+  const highestSev = risk?.highestSeverity ?? job?.highestSeverity ?? 0
+  const topUnconfirmedAlert = highestSev > 0
+    ? alerts.find((a) => a.severity === highestSev && effectiveStatus(a) !== "CONFIRMED")
+    : undefined
+  const verdictStatusHint = topUnconfirmedAlert
+    ? ` — unconfirmed (strongest finding: ${statusLabel(topUnconfirmedAlert.status ?? "SUSPECTED")})`
+    : ""
+
   // Capture window from the actual packet timestamps (min/max — pcap files can
   // hold out-of-order packets), normalized from ISO or epoch-second shapes.
   const captureClock = useMemo(() => {
@@ -652,8 +665,11 @@ export default function ReportsPage() {
         ["Duration", durLabel(durationSec)],
         ["Risk score", riskValue()],
         // Severity is never hidden by the score: a HIGH finding is stated
-        // next to a LOW numeric score, not swallowed by it.
-        ["Highest finding", (risk?.highestSeverity ?? job.highestSeverity ?? 0) > 0 ? `${sevLabel(risk?.highestSeverity ?? job.highestSeverity ?? 0)} (${risk?.highestSeverity ?? job.highestSeverity ?? 0}/5)` : "None"],
+        // next to a LOW numeric score, not swallowed by it. The 1–5 severity
+        // scale is distinct from the 0–100 risk score, and an unconfirmed
+        // finding is labeled as such (QA: open.pcapng "5/5 Critical" next to
+        // "53/100" read as contradictory / confirmed).
+        ["Highest finding severity (1–5)", highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5)${verdictStatusHint ? " · unconfirmed" : ""}` : "None"],
       ]),
       "",
       `## Capture Information`,
@@ -708,12 +724,17 @@ export default function ReportsPage() {
       if (report.iocs.some((i) => i.type === "credential-theft")) {
         lines.push("_A Plaintext Credential Exposure IOC lists the affected internal host (the machine that transmitted the credentials) — not an external indicator of compromise. The capture proves the transmission, not theft, interception, or a malicious destination._", "")
       }
+      if (report.iocs.some((i) => ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"].includes(i.type))) {
+        lines.push("_Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are findings about observed traffic patterns, not indicators of a known-malicious artifact: the value describes the behavior itself, and the endpoints are not established as malicious._", "")
+      }
     }
     if (calls.length) {
       lines.push("## VoIP / SIP Calls", ...mdTable(["Caller", "Callee", "Status", "Start", "Duration", "RTP Packets", "RTP Payload"], calls.map((c) => [c.from, c.to, c.status, formatTime(c.startTime), c.durationSec !== null ? fmtClock(c.durationSec) : "—", c.rtpPackets > 0 ? c.rtpPackets.toLocaleString() : "—", c.rtpPayloadType !== null ? `PT ${c.rtpPayloadType}` : "—"])), "")
     }
     if (mitre.length) {
       lines.push("## MITRE ATT&CK", ...mitre.map((m) => `- ${m.id} ${m.technique} (${sevLabel(m.severity)}) — ${m.description} (${findingSourceLabel(m.source, m.status)})`), "")
+    } else if (report.alerts.length > 0) {
+      lines.push("## MITRE ATT&CK", "- No techniques mapped — mappings attach only to LIKELY/CONFIRMED detections; SUSPECTED findings (threshold crossed on pattern evidence) deliberately receive none, because the evidence does not establish the technique was executed.", "")
     }
     const recLines: string[] = []
     if (recs.High.length) recLines.push("### High", ...recs.High.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
@@ -721,7 +742,7 @@ export default function ReportsPage() {
     if (recs.Low.length) recLines.push("### Low", ...recs.Low.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
-    lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable), `- ${conclusionText}`)
+    lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable, verdictStatusHint), `- ${conclusionText}`)
     lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
@@ -853,7 +874,7 @@ export default function ReportsPage() {
                   // Severity is surfaced ALONGSIDE the score — numeric
                   // normalization must never hide the strongest finding
                   // (a 39/100 LOW score with a HIGH finding reads as HIGH present).
-                  { label: "Highest Finding", value: (risk?.highestSeverity ?? job.highestSeverity ?? 0) > 0 ? `${sevLabel(risk?.highestSeverity ?? job.highestSeverity ?? 0)} (${risk?.highestSeverity ?? job.highestSeverity ?? 0}/5)` : "None", icon: ShieldAlert, color: (risk?.highestSeverity ?? 0) >= 4 ? "text-danger" : "text-muted-foreground" },
+                  { label: "Highest Finding", value: highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5)${verdictStatusHint ? " · unconfirmed" : ""}` : "None", icon: ShieldAlert, color: highestSev >= 4 ? "text-danger" : "text-muted-foreground" },
                   { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
                   { label: "Avg Packet Size", value: avgPacketBytes + " B", icon: Package, color: "text-muted-foreground" },
                 ].map(({ label, value, color }) => (
@@ -1573,6 +1594,15 @@ export default function ReportsPage() {
                       </tbody>
                     </table>
                   </div>
+                  {report.groups.some((g) => g.ruleId === "DATA-EXFIL-001") && (
+                    <p className="text-[10px] text-muted-foreground border border-border/30 rounded p-2">
+                      <strong>DATA-EXFIL-001</strong> fires on a directional byte-ratio rule: a local host sent more than
+                      100&nbsp;KB with at least 5× more sent than received. The finding is <strong>behavior only</strong> — the
+                      capture carries no payload evidence of what the bytes contained, retransmitted bytes are included in
+                      the counts as captured, the destination is not established as malicious, and a normal upload, API call
+                      or sync can match the same pattern.
+                    </p>
+                  )}
                   <div className="text-[10px] text-muted-foreground mt-1">Detection states come from evidence quality: CONFIRMED = payload-verified (e.g. cleartext credentials decoded from the wire); LIKELY = strong multi-indicator or high-evidence behavioral findings; SUSPECTED = a rule crossed its threshold on weaker evidence (scans, floods and behavioral heuristics can never reach CONFIRMED — the evidence is pattern-based, and the finding text says so). The Evidence badge (LOW/MEDIUM/HIGH) is the strength of that evidence — separate from the numeric confidence, which is the detector&rsquo;s calibration: payload-verified findings carry 100% and HIGH, a 24-port scan reads ~62% and MEDIUM. C2-beacon, exfil and DNS-tunnel rules that fire during a detected traffic burst get a bonus in the Risk Breakdown (e.g. 70% base can appear there as 85%), and behavioral detections state their measured basis in Evidence &mdash; see the risk contribution formula under &ldquo;Risk Breakdown&rdquo;. MITRE mappings are attached only to LIKELY/CONFIRMED detections. Pkts/Bytes read N/A when an alert spans multiple flows &mdash; the Evidence column then carries the measured numbers.</div>
                 </CardContent>
               </Card>
@@ -1701,7 +1731,7 @@ export default function ReportsPage() {
                   <SectionTitle icon={Shield} title="18. Risk Score" />
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     {[
-                      { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle, sub: !undecodable && scoreVal === 0 ? "no configured detection rule triggered — not a compromise probability" : undefined },
+                      { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle, sub: !undecodable && scoreVal === 0 ? "no configured detection rule triggered — not a compromise probability" : (!undecodable && verdictStatusHint ? "rule-engine score, not a probability of compromise" : undefined) },
                       { label: "Throughput Avg", value: rateLabel(advancedMetrics.throughputAvg), color: "text-info", icon: BarChart3 },
                       { label: "Throughput Peak (100 ms window)", value: rateLabel(advancedMetrics.throughputPeak100ms ?? null), color: "text-chart-2", icon: BarChart3 },
                        { label: "Burst", value: advancedMetrics.burst?.detected ? "Detected" : "Not Detected", color: advancedMetrics.burst?.detected ? "text-danger" : "text-success", icon: Zap, sub: advancedMetrics.burst?.detected ? `${advancedMetrics.burst.ratio.toFixed(1)}× average · ${advancedMetrics.burst.duration.toFixed(1)} s` : undefined },
@@ -1717,7 +1747,7 @@ export default function ReportsPage() {
                       <>
                         {advancedMetrics.beaconDetected && <Badge variant="destructive">Beaconing Detected</Badge>}
                         {advancedMetrics.dnsTunnelingSuspected && <Badge variant="destructive">DNS Tunneling Suspected</Badge>}
-                        {advancedMetrics.dataExfiltrationSuspected && <Badge variant="destructive">Data Exfiltration Suspected</Badge>}
+                        {advancedMetrics.dataExfiltrationSuspected && <Badge variant="destructive">Suspected Large Outbound Transfer</Badge>}
                         {advancedMetrics.torVpnProxyDetected && <Badge variant="warning">TOR/VPN/Proxy Detected</Badge>}
                         {advancedMetrics.ja3Suspicious && <Badge variant="destructive">Suspicious JA3</Badge>}
                       </>
@@ -1725,6 +1755,14 @@ export default function ReportsPage() {
                       <Badge variant="outline" className="text-info">Traffic burst detected (informational — no anomaly rules fired)</Badge>
                     ) : (
                       <Badge variant="success">No anomalies detected</Badge>
+                    )}
+                    {advancedMetrics.burst?.detected && risk && !risk.burstApplied && (
+                      <p className="text-[10px] text-muted-foreground border border-border/30 rounded p-2 mt-2 w-full">
+                        The traffic burst is <strong>not itself evidence of exfiltration</strong> and contributed no
+                        confidence bonus to any rule (the burst bonus applies only to C2-beacon, exfil and DNS-tunnel rules
+                        — here: <strong>No</strong>). Short high-rate bursts are consistent with normal web, streaming or
+                        update traffic.
+                      </p>
                     )}
                   </div>
 
@@ -1756,7 +1794,7 @@ export default function ReportsPage() {
                               <div className="flex justify-between"><span className="text-muted-foreground">Raw score</span><span className="font-medium">{Math.round(risk.rawScore * 10) / 10}</span></div>
                               <div className="flex justify-between"><span className="text-muted-foreground">Normalization formula</span><span className="font-medium whitespace-nowrap">100 × (1 − exp(−{risk.rawScore} / {RISK_CURVE_K})) ≈ {riskCurve !== null ? riskCurve.toFixed(1) : "—"} → {risk.normalizedScore}/100</span></div>
                               <div className="flex justify-between"><span className="text-muted-foreground">Burst bonus applied <span title="Only C2-beacon, exfil and DNS-tunnel rules receive the burst confidence bonus; a bare burst with nothing to boost shows No.">(C2/exfil/DNS rules only)</span></span><span className="font-medium">{risk.burstApplied ? "Yes" : "No"}</span></div>
-                              <div className="flex justify-between"><span className="text-muted-foreground">Normalized score</span><span className="text-foreground font-bold">{undecodable ? "N/A — insufficient data" : `${risk.normalizedScore}/100 ${risk.levelLabel}`}</span></div>
+                              <div className="flex justify-between"><span className="text-muted-foreground">Normalized score</span><span className="text-foreground font-bold">{undecodable ? "N/A — insufficient data" : `${risk.normalizedScore}/100 ${risk.levelLabel}`}{!undecodable && verdictStatusHint && <span className="text-xs text-muted-foreground font-normal">{verdictStatusHint}</span>}</span></div>
                               <div className="border-t border-border/30 pt-2 mt-2">
                                 <div className="font-semibold mb-1 text-xs">Contributions (sorted by impact):</div>
                                 {risk.items.length === 0 ? (
@@ -1922,6 +1960,13 @@ export default function ReportsPage() {
                           transmission, not theft, interception, or a malicious destination.
                         </p>
                       )}
+                      {report.iocs.some((i) => ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"].includes(i.type)) && (
+                        <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-3">
+                          Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are
+                          <strong> findings about observed traffic patterns, not indicators of a known-malicious artifact</strong>:
+                          the value describes the behavior itself, and the endpoints are not established as malicious.
+                        </p>
+                      )}
                       {report.iocs.length === 0 ? (
                         <p className="text-sm text-muted-foreground">No IOCs detected</p>
                       ) : (
@@ -1959,7 +2004,17 @@ export default function ReportsPage() {
                   <Card>
                     <CardContent className="pt-6">
                       {mitre.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">No MITRE ATT&CK techniques mapped</p>
+                        <div>
+                          <p className="text-sm text-muted-foreground">No MITRE ATT&CK techniques mapped</p>
+                          {alerts.length > 0 && (
+                            <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mt-2">
+                              Techniques are attached only to <strong>LIKELY/CONFIRMED</strong> detections. SUSPECTED
+                              findings — rules that crossed a threshold on pattern evidence (e.g. the directional
+                              byte-ratio exfiltration rule) — deliberately receive no technique mapping, because the
+                              evidence does not establish the technique was executed.
+                            </p>
+                          )}
+                        </div>
                       ) : (
                         <div className="space-y-4">
                           {(["High", "Medium", "Low"] as const).map((sev) => {
@@ -2097,10 +2152,11 @@ export default function ReportsPage() {
                         <Shield className={cn("h-5 w-5", levelColor)} />
                         <span className={cn("text-lg font-bold", levelColor)}>{levelLabel}</span>
                         {levelLabel === "SAFE" && <span className="text-xs text-muted-foreground">— no configured detection rule triggered (not a proof of a clean network)</span>}
+                        {levelLabel !== "SAFE" && verdictStatusHint && <span className="text-xs text-muted-foreground">{verdictStatusHint}</span>}
                         <span className="text-xs text-muted-foreground">Final verdict · Risk score {riskValue()}</span>
                       </div>
                       <p className="text-sm text-muted-foreground">{conclusionText}</p>
-                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "SAFE means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only`} — it is not proof that the capture is universally safe or clean.</p>
+                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "SAFE means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only${verdictStatusHint ? " — the level is floored by the strongest finding's rule severity (1–5), which is NOT the same scale as the 0–100 risk score" : ""}`} — it is not proof that the capture is universally safe or clean.</p>
                     </CardContent>
                   </Card>
                 </section>

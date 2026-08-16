@@ -1268,7 +1268,7 @@ export function bandwidthStats(bw: { in: number; out: number }[]): { min: number
 const IOC_TYPE_LABELS: Record<string, string> = {
   threat: "Network Threat",
   "dns-tunneling": "DNS Tunneling",
-  "data-exfiltration": "Data Exfiltration",
+  "data-exfiltration": "Suspected Large Outbound Transfer",
   beaconing: "Beaconing",
   "tor-vpn-proxy": "TOR/VPN/Proxy",
   ja3: "Suspicious JA3",
@@ -1294,10 +1294,13 @@ export function shortAlertName(signature: string): string {
 
 // The analyst-conclusion verdict line, shared by the markdown export and tests
 // so the export can't regress to "N/A" or a fake score (QA: verdict text).
-export function verdictLine(levelLabel: string, scoreVal: number, undecodable: boolean): string {
+export function verdictLine(levelLabel: string, scoreVal: number, undecodable: boolean, statusHint = ""): string {
   // A SAFE verdict only means nothing matched the configured rules — the
-  // wrapper must not read as an absolute safety guarantee (QA audit).
-  return `- **Final verdict:** **${levelLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered" : ""}`
+  // wrapper must not read as an absolute safety guarantee (QA audit). An
+  // unconfirmed hint (e.g. "strongest finding: Suspected alert") prevents an
+  // unconfirmed finding from reading as a confirmed incident (QA: open.pcapng
+  // "53/100 CRITICAL" with "No findings were confirmed").
+  return `- **Final verdict:** **${levelLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered" : ""}${statusHint}`
 }
 
 // Escaping for the standalone HTML report export. Escapes ONCE: the mdInline
@@ -1700,7 +1703,14 @@ export function analystConclusion(opts: {
     const credNote = opts.alerts.some((a) => /[Cc]redential/.test(a.signature) && effectiveStatus(a) === "CONFIRMED")
       ? " A plaintext credential submission is confirmed, but the capture does not establish that the credential was intercepted, that the destination is malicious, or that the host was compromised."
       : ""
-    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.${credNote}`
+    // Outbound-transfer findings: the rule fires on a directional byte ratio
+    // (sent > threshold, ≥5× received) — behavior only. The capture never
+    // establishes exfiltration or compromise without payload evidence (QA:
+    // open.pcapng read "Data Exfiltration" from the ratio alone).
+    const exfilNote = opts.alerts.some((a) => /[Oo]utbound [Tt]ransfer/.test(a.signature))
+      ? " A behavioral rule flagged a potentially asymmetric outbound transfer; the capture does not by itself establish data exfiltration or compromise — no payload evidence ties the transferred bytes to stolen data."
+      : ""
+    const head = `${summary} (${names}).${noneConfirmed} The capture is NOT clean under the configured rules — this verdict is not proof that the capture is universally malicious; review the alerts, IOCs, and MITRE mappings above and apply the recommended mitigations. The risk score reflects the configured detection rules and does not represent a probability of compromise.${credNote}${exfilNote}`
     // Findings on a poor-quality capture are still findings, but the missing
     // rate/burst evidence must be stated — never a bare "clean" or a bare
     // "significant" that implies full analysis.

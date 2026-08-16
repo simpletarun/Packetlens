@@ -1570,7 +1570,8 @@ describe("v3.2 QA regression fixes", () => {
     const t = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
     expect(t).toBeDefined()
     // Evidence reads private → public regardless of key order
-    expect(t?.evidence).toMatch(/192\.168\.1\.10 → 104\.20\.1\.154/)
+    expect(t?.evidence).toMatch(/192\.168\.1\.10:50000 → 104\.20\.1\.154:443/)
+    expect(t?.evidence).toContain("Directional byte-ratio behavior only")
   })
 
   it("exfil detector: a LAN-only transfer between private hosts is NEVER exfiltration", () => {
@@ -1957,7 +1958,7 @@ describe("v3.2 QA regression fixes", () => {
     expect(t).toBeDefined()
     expect(t?.category).toBe("Exfiltration")
     // Evidence reads local-v6 → public, never the reverse.
-    expect(t?.evidence).toMatch(/2401:4900:8911:7943:754b:ad97:bd76:275b → 2001:db8::1/)
+    expect(t?.evidence).toMatch(/2401:4900:8911:7943:754b:ad97:bd76:275b:50000 → 2001:db8::1:443/)
   })
 
   it("beacon detector: remoteOf names the SERVER when the local side is a delegated public IPv6 that sorts first (QA: test.pcapng)", () => {

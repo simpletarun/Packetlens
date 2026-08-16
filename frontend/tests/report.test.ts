@@ -403,7 +403,7 @@ it("burst bonus is reported as applied only when an eligible rule actually benef
     expect(iocTypeLabel("threat")).toBe("Network Threat")
     expect(iocTypeLabel("dns-tunneling")).toBe("DNS Tunneling")
     expect(iocTypeLabel("beaconing")).toBe("Beaconing")
-    expect(iocTypeLabel("data-exfiltration")).toBe("Data Exfiltration")
+    expect(iocTypeLabel("data-exfiltration")).toBe("Suspected Large Outbound Transfer")
     expect(iocTypeLabel("weird-type")).toBe("Weird Type")
   })
 
@@ -1352,9 +1352,9 @@ describe("duplicateFrameCountOf — the report's duplicate count never re-derive
   })
 })
 
-// Shared fixture: the open.pcapng "Data Exfiltration Suspected" finding shape.
+// Shared fixture: the open.pcapng "Suspected Large Outbound Transfer" finding shape.
 const exfil = (status: "SUSPECTED" | "CONFIRMED"): AlertEntry => ({
-  id: "a9", timestamp: new Date(T0 * 1000).toISOString(), signature: "Data Exfiltration Suspected",
+  id: "a9", timestamp: new Date(T0 * 1000).toISOString(), signature: "Suspected Large Outbound Transfer",
   category: "Exfiltration", severity: 4, confidence: status === "CONFIRMED" ? 100 : 70, ruleId: "DATA-EXFIL-001",
   srcIp: "192.168.1.10", dstIp: "172.64.155.209", srcPort: 0, dstPort: 0, protocol: "TCP",
   evidence: "1 flow sending >100 KB outbound; 5x received bytes",
@@ -1384,7 +1384,7 @@ describe("detection status is the ONE source of truth across every report layer 
     expect(rec!.status).toBe("SUSPECTED")
     expect(r.mitre).toHaveLength(0)
     const conclusion = analystConclusion({ ...base, alerts: [alert], score: 40 })
-    expect(conclusion).toContain("1 suspected finding detected (Data Exfiltration Suspected)")
+    expect(conclusion).toContain("1 suspected finding detected (Suspected Large Outbound Transfer)")
     expect(conclusion).toContain("No findings were confirmed")
     expect(conclusion).not.toContain("confirmed finding")
   })
@@ -1404,7 +1404,7 @@ describe("detection status is the ONE source of truth across every report layer 
     const rec = r.recommendations.find((x) => x.text.includes("Investigate large outbound transfers"))
     expect(rec!.status).toBe("CONFIRMED")
     const conclusion = analystConclusion({ ...base, alerts: [alert], score: 40 })
-    expect(conclusion).toContain("1 confirmed finding detected (Data Exfiltration Suspected)")
+    expect(conclusion).toContain("1 confirmed finding detected (Suspected Large Outbound Transfer)")
     expect(conclusion).not.toContain("No findings were confirmed")
   })
 

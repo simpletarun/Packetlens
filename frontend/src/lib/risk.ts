@@ -95,7 +95,7 @@ const RULE_NAMES: Record<string, string> = {
   "CRED-LEAK-001": "Credential Exposure",
   "MALWARE-DL-001": "Malware Download",
   "C2-BEACON-001": "C2 Beaconing",
-  "DATA-EXFIL-001": "Data Exfiltration",
+  "DATA-EXFIL-001": "Suspected Large Outbound Transfer",
   "TLS-SUSPICIOUS-001": "Suspicious TLS",
   "HTTP-CREDS-001": "HTTP Credentials",
 }
@@ -107,7 +107,7 @@ const RULE_CATEGORIES: Record<string, string> = {
   "CRED-LEAK-001": "Data Exposure",
   "MALWARE-DL-001": "Malware Activity",
   "C2-BEACON-001": "C2 Channels",
-  "DATA-EXFIL-001": "Data Exfiltration",
+  "DATA-EXFIL-001": "Suspected Exfiltration",
   "TLS-SUSPICIOUS-001": "C2 Channels",
   "HTTP-CREDS-001": "Plaintext Credential Exposure",
 }

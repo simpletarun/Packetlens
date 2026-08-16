@@ -382,7 +382,7 @@ describe("Reports page render", () => {
     const criticalSuspected: AlertEntry = {
       ...useAnalysisStore.getState().alerts[0],
       id: "a9",
-      signature: "Data Exfiltration Suspected",
+      signature: "Suspected Large Outbound Transfer",
       category: "Exfiltration",
       severity: 5,
       confidence: 70,
