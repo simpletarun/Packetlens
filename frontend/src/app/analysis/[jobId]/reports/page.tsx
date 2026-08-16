@@ -9,7 +9,7 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -499,7 +499,7 @@ export default function ReportsPage() {
     // large/verylarge reported a fabricated multicast observation).
     if (!undecodable && packets.some((p) => p.dstIp && p.dstIp !== "\u2014" && isNonUnicast(p.dstIp))) obs.push("multicast/broadcast traffic")
     if (undecodable) obs.push(`capture payloads undecodable (${dltName(linkTypes)} — unsupported encapsulation); only lengths and timestamps parsed`)
-    if (dnsQueries > 0) obs.push(`${dns.length.toLocaleString()} DNS packets — ${dnsQueries.toLocaleString()} query packets, ${dnsLookupCount(dns).toLocaleString()} distinct name/type lookups for the capturing client, ${stats.domains.toLocaleString()} unique domain${stats.domains === 1 ? "" : "s"}`)
+    if (dnsQueries > 0) obs.push(`${dns.length.toLocaleString()} DNS packets — ${dnsQueries.toLocaleString()} query packets, ${dnsLookupCount(dns).toLocaleString()} distinct name/type lookups for the capturing client, ${dnsUniqueDomains(dns).size.toLocaleString()} unique domain${dnsUniqueDomains(dns).size === 1 ? "" : "s"}`)
     // 0 DNS + any hostname-bearing traffic = the capture began mid-session:
     // the resolution phase predates the capture, so hostname↔IP correlation
     // and PTR lookups are unavailable (QA: login.pcapng talks to 4+ named
@@ -554,7 +554,7 @@ export default function ReportsPage() {
       obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} removed before analysis (double-capture artifact, ${dupPct}% of ${rawCount.toLocaleString()} raw frames) — detections and the risk score are computed on the analyzed set (${(rawCount - duplicateFrames).toLocaleString()} analyzed)${dupPct >= 25 ? "; capture quality POOR — interpret packet-rate, loss, retransmission and timing statistics cautiously" : dupPct >= 5 ? "; capture quality DEGRADED — interpret packet-rate and timing statistics cautiously" : ""}`)
     }
     return obs
-  }, [packets, dns, http, tls, stats.domains, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job])
+  }, [packets, dns, http, tls, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job])
   const recs = useMemo(() => {
     type RecRow = { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC"; status?: DetectionStatus }
     const groups = { High: [] as RecRow[], Medium: [] as RecRow[], Low: [] as RecRow[] }
@@ -1070,7 +1070,7 @@ export default function ReportsPage() {
                       { label: "DNS Messages", value: dns.length.toLocaleString(), sub: "queries + responses" },
                       { label: "Query Packets", value: dnsQueries.toLocaleString(), sub: "client-originated" },
                       { label: "Distinct Lookups", value: dnsLookupCount(dns).toLocaleString(), sub: "name+type, relay copies collapsed" },
-                      { label: "Unique Domains", value: new Set(dns.map((d) => d.query)).size.toLocaleString(), sub: "distinct names" },
+                      { label: "Unique Domains", value: dnsUniqueDomains(dns).size.toLocaleString(), sub: "distinct names — case-insensitive, trailing dot stripped" },
                     ]} />
                   </div>
                   <div className="grid grid-cols-2 gap-4 text-xs">
@@ -1079,7 +1079,7 @@ export default function ReportsPage() {
                       { label: "Resolution Source", value: dns.filter((d) => d.isResponse && (d.answer && d.answer !== '\u2014')).length.toLocaleString(), sub: "responses carrying an answer" },
                     ]} />
                   </div>
-                  <p className="text-[10px] text-muted-foreground">Terminology: every decoded DNS message counts once (DNS Messages); of those, the messages carrying a question count as Query Packets; Distinct Lookups counts each name+type once for the capturing client — a LAN router relaying a query upstream is not counted as a second querier; Unique Domains counts distinct queried names. The four numbers therefore describe different scopes and should not be expected to agree{dns.length <= 15 ? " (the table below still lists every DNS message: queries and responses)" : ""}.</p>
+                  <p className="text-[10px] text-muted-foreground">Terminology: every decoded DNS message counts once (DNS Messages); of those, the messages carrying a question count as Query Packets; Distinct Lookups counts each name+type once for the capturing client — a LAN router relaying a query upstream is not counted as a second querier; Unique Domains counts each distinct queried name once (case-insensitive, trailing dots stripped — "Example.COM." and "example.com" are one domain). The four numbers therefore describe different scopes and should not be expected to agree{dns.length <= 15 ? " (the table below still lists every DNS message: queries and responses)" : ""}.</p>
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
@@ -1116,7 +1116,7 @@ export default function ReportsPage() {
                   <div className="grid grid-cols-4 gap-4 text-xs">
                     <StatGrid items={[
                       { label: "Requests", value: http.length.toLocaleString() },
-                      { label: "Hosts", value: new Set(http.map((h) => h.host)).size.toLocaleString() },
+                      { label: "Hosts", value: new Set(http.map((h) => dnsNameOf(h.host)).filter(Boolean)).size.toLocaleString() },
                       { label: "Errors (4xx/5xx)", value: http.filter((h) => h.status >= 400).length.toLocaleString() },
                       { label: "HTTP Bytes", value: formatBytes(http.reduce((s, h) => s + h.length, 0)), sub: "Total HTTP request+response bytes carried by the capture (headers and bodies) — distinct from downloadable file bodies, which section 10 reports separately." },
                     ]} />
@@ -1164,7 +1164,7 @@ export default function ReportsPage() {
                       { label: "Handshakes", value: tls.length.toLocaleString() },
                       { label: "TLSv1.3", value: tls.filter((t) => t.version === "TLSv1.3" || t.version === "TLS 1.3").length.toLocaleString() },
                       { label: "TLSv1.2", value: tls.filter((t) => t.version === "TLSv1.2" || t.version === "TLS 1.2").length.toLocaleString() },
-                      { label: "SNIs", value: new Set(tls.map((t) => t.sni)).size.toLocaleString() },
+                      { label: "SNIs", value: new Set(tls.map((t) => dnsNameOf(t.sni)).filter(Boolean)).size.toLocaleString() },
                     ]} />
                   </div>
                   {tls.length === 0 && (

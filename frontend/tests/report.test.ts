@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel, reportDurationSec } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, 
+packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, 
+duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel, 
+reportDurationSec, dnsUniqueDomains, dnsNameOf } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -326,6 +329,20 @@ describe("top ports and throughput helpers", () => {
   it("dnsLookupCount: direct-to-resolver queries dedupe by name+type", () => {
     const mk = (query: string, type = "A") => ({ id: "d", timestamp: "", srcIp: "10.0.0.5", dstIp: "1.1.1.1", query, type, responseCode: "NOERROR", answer: "", ttl: 1 })
     expect(dnsLookupCount([mk("a.com"), mk("a.com"), mk("b.com")])).toBe(2)
+  })
+
+  it("dnsUniqueDomains: case and trailing-dot variants are ONE name (RFC 4343)", () => {
+    const mk = (query: string) => ({ id: "d", timestamp: "", srcIp: "10.0.0.5", dstIp: "1.1.1.1", query, type: "A", responseCode: "NOERROR", answer: "", ttl: 1 })
+    const names = dnsUniqueDomains([mk("Example.COM."), mk("example.com"), mk("example.com"), mk("a.b.com")])
+    expect(names).toEqual(new Set(["example.com", "a.b.com"]))
+    expect(dnsUniqueDomains([mk(""), mk("")]).size).toBe(0)
+  })
+
+  it("dnsNameOf: strips one trailing dot and lowercases", () => {
+    expect(dnsNameOf("Example.COM.")).toBe("example.com")
+    expect(dnsNameOf("www.example.com.")).toBe("www.example.com")
+    expect(dnsNameOf("")).toBe("")
+    expect(dnsNameOf(undefined)).toBe("")
   })
 
 it("burst bonus is reported as applied only when an eligible rule actually benefits", () => {

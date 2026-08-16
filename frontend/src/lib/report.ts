@@ -1217,6 +1217,24 @@ export function dnsLookupCount(entries: DnsEntry[]): number {
   return seen.size
 }
 
+// Canonical DNS-name form for distinct-name counts (RFC 4343, same rule as
+// dnsLookupCount): lowercase and trailing dot stripped, empties dropped —
+// "Example.COM." and "example.com" are ONE name, never two.
+export function dnsNameOf(name?: string | null): string {
+  return (name ?? "").replace(/\.$/, "").toLowerCase()
+}
+
+// Distinct DNS names in a capture, normalized (case-insensitive, trailing dot
+// stripped). Responses echo the question name, so they dedupe naturally.
+export function dnsUniqueDomains(entries: { query?: string | null }[]): Set<string> {
+  const names = new Set<string>()
+  for (const d of entries) {
+    const q = dnsNameOf(d.query)
+    if (q) names.add(q)
+  }
+  return names
+}
+
 // Distribution stats over capture interval sums. null when there is no data
 // to characterize (empty or single-bin captures).
 export function bandwidthStats(bw: { in: number; out: number }[]): { min: number | null; median: number | null; p95: number | null } {
