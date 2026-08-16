@@ -51,6 +51,9 @@ export interface Packet {
   // On-wire frame size (captured length when snaplen truncated the frame).
   origLength?: number
   appProtocol?: string
+  // True only when the appProtocol label was confirmed by payload content;
+  // absent = port-inferred (a QUIC Initial that parsed vs UDP/443 by port).
+  appPayloadConfirmed?: boolean
 }
 
 export interface Flow {

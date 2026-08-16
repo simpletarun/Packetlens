@@ -192,7 +192,7 @@ export default function ReportsPage() {
   // external traffic (QA: country attribution audit).
   const localOwned = useMemo(() => localOwnedAddresses(devices), [devices])
 
-  const { totalBytes, avgPacketBytes, topProto, uniqueSrcIps, uniqueDstIps, topSrcIps, topDstIps, srcConns, dstConns, srcProtos, dstProtos } = useMemo(() => {
+  const { totalBytes, avgPacketBytes, topProto, uniqueSrcIps, uniqueDstIps, topSrcIps, topDstIps, srcConns, dstConns, srcProtos, dstProtos, noSrcAddrCount, noDstAddrCount } = useMemo(() => {
     const totalBytes = packets.reduce((s, p) => s + p.length, 0)
     // Wire-size average: origLength is the on-wire size when the capture
     // truncated frames (snaplen), so the raw length would understate real
@@ -207,30 +207,42 @@ export default function ReportsPage() {
     // the row's packet totals), not flow-level ones: the old flow key read
     // the local side as dst only for DNS flows, so the internal host showed
     // "1 conns · DNS" next to 13,865 destination packets (QA: top talkers).
+    // A conversation is the 4-tuple (srcIp:srcPort ↔ dstIp:dstPort), the SAME
+    // key on both sides: the source and destination views of the same
+    // conversations must never disagree (QA: mamaji.pcapng — 8 Samsung
+    // discovery conversations with different source ports showed "1 conns" on
+    // the source side and "8 conns" on the destination side).
     const srcConns: Record<string, Set<string>> = {}
     const dstConns: Record<string, Set<string>> = {}
     const srcProtos: Record<string, Set<string>> = {}
     const dstProtos: Record<string, Set<string>> = {}
+    let noSrcAddrCount = 0
+    let noDstAddrCount = 0
     for (const p of packets) {
       protoCount[p.protocol] = (protoCount[p.protocol] || 0) + 1
+      const hasSrc = !!p.srcIp && p.srcIp !== "\u2014"
+      const hasDst = !!p.dstIp && p.dstIp !== "\u2014"
+      if (!hasSrc) noSrcAddrCount += 1
+      if (!hasDst) noDstAddrCount += 1
+      const conv = hasSrc && hasDst && p.srcPort !== undefined && p.dstPort !== undefined ? `${p.srcIp}:${p.srcPort}↔${p.dstIp}:${p.dstPort}` : null
       // Undecodable packets carry the "—" placeholder, never a real address;
       // counting them would fabricate a phantom endpoint with every packet.
-      if (p.srcIp && p.srcIp !== "\u2014") {
-        const src = ownerOf.get(p.srcIp) ?? p.srcIp
+      if (hasSrc) {
+        const src = ownerOf.get(p.srcIp!) ?? p.srcIp
         srcIps.add(src)
         const s = (srcCount[src] ||= { count: 0, bytes: 0 })
         s.count += 1
         s.bytes += p.length
-        if (p.dstIp && p.dstIp !== "\u2014") (srcConns[src] ??= new Set()).add(p.dstPort !== undefined ? `${p.dstIp}:${p.dstPort}` : p.dstIp)
+        if (hasDst) (srcConns[src] ??= new Set()).add(conv ?? p.dstIp)
         if (p.protocol) (srcProtos[src] ??= new Set()).add(p.protocol)
       }
-      if (p.dstIp && p.dstIp !== "\u2014") {
-        const dst = ownerOf.get(p.dstIp) ?? p.dstIp
+      if (hasDst) {
+        const dst = ownerOf.get(p.dstIp!) ?? p.dstIp
         dstIps.add(dst)
         const d = (dstCount[dst] ||= { count: 0, bytes: 0 })
         d.count += 1
         d.bytes += p.length
-        if (p.srcIp && p.srcIp !== "\u2014") (dstConns[dst] ??= new Set()).add(p.srcPort !== undefined ? `${p.srcIp}:${p.srcPort}` : p.srcIp)
+        if (hasSrc) (dstConns[dst] ??= new Set()).add(conv ?? p.srcIp)
         if (p.protocol) (dstProtos[dst] ??= new Set()).add(p.protocol)
       }
     }
@@ -242,7 +254,7 @@ export default function ReportsPage() {
       uniqueDstIps: dstIps.size,
       topSrcIps: Object.entries(srcCount).map(([ip, v]) => ({ ip, ...v })).sort((a, b) => b.count - a.count),
       topDstIps: Object.entries(dstCount).map(([ip, v]) => ({ ip, ...v })).sort((a, b) => b.count - a.count),
-      srcConns, dstConns, srcProtos, dstProtos,
+      srcConns, dstConns, srcProtos, dstProtos, noSrcAddrCount, noDstAddrCount,
     }
   }, [packets, ownerOf])
 
@@ -435,6 +447,11 @@ export default function ReportsPage() {
   // Rate formatting: no time interval -> N/A, never a fabricated number.
   const rateLabel = (bps: number | null) => (bps === null ? "N/A" : formatBytes(bps) + "/s")
   const durLabel = (sec: number | null) => (sec === null ? "—" : formatDuration(sec))
+  // Duration at the precision rates are computed from: formatDuration rounds
+  // to whole seconds, so "Duration 48 s" next to "Avg Packets/s 584.0" (from
+  // 48.17 s) would read as internally inconsistent (QA: mamaji.pcapng). Sub-
+  // minute captures show the exact value; ≥ 1 min keeps the m/s format.
+  const durPrecise = (sec: number | null) => (sec === null ? "—" : sec < 60 ? `${sec.toFixed(2).replace(/\.?0+$/, "")} s` : formatDuration(sec))
 
   // Query packets only (QR=0). Responses echo the question name in the header
   // and come back from the resolver, so they are packets, not queries.
@@ -498,7 +515,12 @@ export default function ReportsPage() {
     // STUN is the ICE handshake for real-time media; on its own it is NAT
     // traversal signaling, not a WebRTC session — wording must stay at
     // "consistent with", never "is" (§10, audit: WebRTC over-attribution).
-    if (packets.some((p) => p.appProtocol === "STUN" || p.appProtocol === "QUIC")) obs.push("STUN traffic detected, consistent with NAT traversal/ICE activity; QUIC traffic also observed — no WebRTC session was confirmed")
+    // The gate is STUN ONLY: QUIC shares UDP/443's neighborhood but is a
+    // completely different protocol, and an appProtocol of QUIC must never
+    // fabricate a STUN observation (QA: mamaji.pcapng reported "STUN traffic
+    // detected" with zero STUN flows — the OR clause was the bug).
+    if (packets.some((p) => p.appProtocol === "STUN")) obs.push("STUN traffic detected, consistent with NAT traversal/ICE activity — no WebRTC session was confirmed")
+    else if (packets.some((p) => p.appProtocol === "QUIC")) obs.push("QUIC traffic observed (UDP/443, encrypted transport) — no STUN or WebRTC activity present")
     // WhatsApp: STUN + XMPP (5222) + WhatsApp's chat/media domains together
     // are that app's signature (A3).
     const whatsappLike =
@@ -676,7 +698,7 @@ export default function ReportsPage() {
         ["Flows", stats.totalFlows.toLocaleString()],
         ["Sessions", stats.sessions.toLocaleString()],
         ["Local Devices", stats.devices.toLocaleString()],
-        ["Duration", durLabel(durationSec)],
+        ["Duration", durPrecise(durationSec)],
         ["Risk score", riskValue()],
         // Severity is never hidden by the score: a HIGH finding is stated
         // next to a LOW numeric score, not swallowed by it. The 1–5 severity
@@ -691,7 +713,7 @@ export default function ReportsPage() {
       `- **Capture file:** \`${job.filename}\`` + (job.sha256 ? `\n- **SHA256:** \`${job.sha256}\`` : "") + (job.sha1 ? `\n- **SHA1:** \`${job.sha1}\`` : "") + (job.md5 ? `\n- **MD5:** \`${job.md5}\`` : ""),
       `- **File size:** ${formatBytes(job.fileSize)}`,
       `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (typeof job?.rawPacketCount === "number" ? ` analyzed (raw ${job.rawPacketCount.toLocaleString()} · ${(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicates removed)` : "") + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
-      `- **Duration:** ${durLabel(durationSec)} · Risk score: ${riskValue()}`,
+      `- **Duration:** ${durPrecise(durationSec)} · Risk score: ${riskValue()}`,
       `- **Alerts:** ${report.alerts.length} — Severity: ${severityCounts(report.alerts)} · Status: ${statusCountsLabel(summarizeStatuses(report.alerts))}${credentialEventCount(report.alerts) > 0 ? ` — covering ${credentialEventCount(report.alerts)} credential-submission event${credentialEventCount(report.alerts) === 1 ? "" : "s"}` : ""}`,
       "",
       "## Traffic",
@@ -723,12 +745,12 @@ export default function ReportsPage() {
       "| IP | Host | Packets | Bytes | Services |",
       "| --- | --- | --- | --- | --- |",
       ...topSrcIps.slice(0, 5).map(({ ip, count, bytes }) => talkerRow(ip, count, bytes, "src")),
-      "",
+      ...(noSrcAddrCount > 0 ? [`_${noSrcAddrCount.toLocaleString()} packet${noSrcAddrCount === 1 ? "" : "s"} with no decodable source address excluded from this table — not attributable to any host._`, ""] : [""]),
       "## Top Talkers (destination)",
       "| IP | Host | Packets | Bytes | Services |",
       "| --- | --- | --- | --- | --- |",
       ...topDstIps.slice(0, 5).map(({ ip, count, bytes }) => talkerRow(ip, count, bytes, "dst")),
-      "",
+      ...(noDstAddrCount > 0 ? [`_${noDstAddrCount.toLocaleString()} packet${noDstAddrCount === 1 ? "" : "s"} with no decodable destination address excluded from this table — not attributable to any host._`, ""] : [""]),
     ]
     if (report.alerts.length) {
       lines.push("## Alerts", ...report.alerts.slice(0, 20).map((t) => `- [${sevLabel(t.severity)}] ${t.signature} (${t.srcIp} → ${t.dstIp})`), "")
@@ -830,12 +852,12 @@ export default function ReportsPage() {
               <SectionTitle icon={FileText} title="1. Executive Summary" />
               <Card>
                 <CardContent className="text-sm text-muted-foreground space-y-2 pt-6">
-                  <p>Report generated for <strong>{job.filename}</strong>, containing <strong>{stats.totalPackets.toLocaleString()}</strong> packets over <strong>{durLabel(durationSec)}</strong>. File: <strong>{formatBytes(job.fileSize)}</strong>, payload: <strong>{formatBytes(totalBytes)}</strong>.</p>
+                  <p>Report generated for <strong>{job.filename}</strong>, containing <strong>{stats.totalPackets.toLocaleString()}</strong> packets over <strong>{durPrecise(durationSec)}</strong>. File: <strong>{formatBytes(job.fileSize)}</strong>, payload: <strong>{formatBytes(totalBytes)}</strong>.</p>
                   {undecodable ? (
                     <p><strong>{stats.totalFlows}</strong> undecodable traffic bucket{stats.totalFlows === 1 ? "" : "s"} — no endpoints were parsed (unsupported encapsulation).</p>
                   ) : (
                     <>
-                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({endpointRows.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
+                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({endpointRows.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(1) + "%"}).</p>
                     <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers from these counts by design.</p>
                     </>
                   )}
@@ -843,7 +865,9 @@ export default function ReportsPage() {
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
                   )}
                   {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{plural(dnsQueries, "DNS query packet")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
-                  {tls.length === 0 && packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS" || p.appProtocol === "QUIC") && <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>}
+                  {tls.length === 0 && (packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS") || packets.some((p) => p.appProtocol === "QUIC")) && (packets.some((p) => p.appProtocol === "QUIC" && p.appPayloadConfirmed)
+                    ? <p className="text-warning">QUIC traffic is present (payload-verified, UDP/443) — the TLS sessions inside QUIC are encrypted and no ClientHello/ServerHello packets were captured, so no TLS details, SNI or certificates are decoded.</p>
+                    : <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>)}
                   {files.length > 0 && <p><strong>{plural(files.length, "HTTP payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong> ({credentials.length > 0 ? "HTTP requests whose decoded body carried a username and/or password field — not every HTTP request" : "none of the HTTP requests carried credential fields"}), <strong>{plural(certificates.length, "unique certificate")}</strong> decoded.</p>}
                   {alerts.length > 0 ? (
                     <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
@@ -858,7 +882,7 @@ export default function ReportsPage() {
             </section>
 
             <section>
-              <SectionTitle icon={Package} title="2. Traffic Summary" sub={`${stats.totalPackets.toLocaleString()} analyzed packets over ${durLabel(durationSec)}`} />
+              <SectionTitle icon={Package} title="2. Traffic Summary" sub={`${stats.totalPackets.toLocaleString()} analyzed packets over ${durPrecise(durationSec)}`} />
               {typeof job?.rawPacketCount === "number" && (
                 <div className="mb-3 text-[11px] text-muted-foreground space-y-1">
                   <p>
@@ -922,7 +946,7 @@ export default function ReportsPage() {
                       {[
                         { label: "File", value: job.filename },
                         { label: "Size", value: formatBytes(job.fileSize) },
-                        { label: "Duration", value: durLabel(durationSec) },
+                        { label: "Duration", value: durPrecise(durationSec) },
                         { label: "Capture Start", value: fmtDateTime(captureClock.start) },
                         { label: "Capture End", value: fmtDateTime(captureClock.end) },
                         { label: "Total Bytes", value: formatBytes(totalBytes) },
@@ -1714,6 +1738,7 @@ export default function ReportsPage() {
                         </div>
                       )
                     })}
+                    {noSrcAddrCount > 0 && <p className="text-[10px] text-muted-foreground pt-1">{noSrcAddrCount.toLocaleString()} packet{noSrcAddrCount === 1 ? "" : "s"} with no decodable source address excluded from this table — not attributable to any host.</p>}
                   </CardContent>
                 </Card>
                 <Card>
@@ -1739,6 +1764,7 @@ export default function ReportsPage() {
                         </div>
                       )
                     })}
+                    {noDstAddrCount > 0 && <p className="text-[10px] text-muted-foreground pt-1">{noDstAddrCount.toLocaleString()} packet{noDstAddrCount === 1 ? "" : "s"} with no decodable destination address excluded from this table — not attributable to any host.</p>}
                   </CardContent>
                 </Card>
               </div>
@@ -1932,7 +1958,7 @@ export default function ReportsPage() {
                       </table>
                     )}
                     {topCountries.length < allCountries.length && <p className="text-[10px] text-muted-foreground pt-1">+{allCountries.length - topCountries.length} more countries (top {topCountries.length} shown)</p>}
-                    <p className="text-[10px] text-muted-foreground pt-1">Methodology: each packet is counted once, by its destination address&rsquo;s country (the destination leg of each conversation). The CSV export&rsquo;s dstCountry column totals whole conversations including both directions, so its country sums are larger than these packet counts by design — the two artifacts are not directly comparable.</p>
+                    <p className="text-[10px] text-muted-foreground pt-1">{countryTotal < packets.length ? `Shares are of the ${countryTotal.toLocaleString()} packets attributable to a country (${((countryTotal / packets.length) * 100).toFixed(1)}% of the ${packets.length.toLocaleString()} captured packets) — the remaining packets have no GeoIP mapping and cannot be country-attributed. ` : ""}Methodology: each packet is counted once, by its destination address&rsquo;s country (the destination leg of each conversation). The CSV export&rsquo;s dstCountry column totals whole conversations including both directions, so its country sums are larger than these packet counts by design — the two artifacts are not directly comparable.</p>
                   </CardContent>
                 </Card>
               </div>
