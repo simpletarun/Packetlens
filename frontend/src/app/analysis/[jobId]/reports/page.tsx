@@ -9,7 +9,7 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -402,11 +402,12 @@ export default function ReportsPage() {
   // Duration from the CANONICAL metrics engine (real min/max packet span);
   // null = no time interval (single packet / zero duration) — rates are N/A,
   // never a fabricated 0.001 s / 1 s denominator (QA: 1-SYN capture showed
-  // 66 B/s average over a fake 1 s interval).
+  // 66 B/s average over a fake 1 s interval), and never a 0 divisor (legacy
+  // jobs write captureDuration 0 → "Infinity B/s" would render).
   // Legacy jobs (pre-metrics) have no advancedMetrics: fall back to the job's
   // capture duration exactly like the report builder does, so the page and
   // the report never disagree on the window.
-  const durationSec = advancedMetrics?.rates?.durationSec ?? (job?.captureDuration ?? null)
+  const durationSec = reportDurationSec(advancedMetrics, job)
   const ratesAvailable = durationSec !== null
 
   // The label must describe the divisor the data was actually divided by:
@@ -789,7 +790,7 @@ export default function ReportsPage() {
                     <p><strong>{stats.totalFlows}</strong> undecodable traffic bucket{stats.totalFlows === 1 ? "" : "s"} — no endpoints were parsed (unsupported encapsulation).</p>
                   ) : (
                     <>
-                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({devices.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
+                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({endpointRows.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(0) + "%"}).</p>
                     <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers from these counts by design.</p>
                     </>
                   )}
@@ -1629,7 +1630,7 @@ export default function ReportsPage() {
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.size > 0 && ` · services: ${svcList(detail)}`}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{[conns > 0 ? `${conns} conns` : null, protos || null, detail && detail.size > 0 ? `services: ${svcList(detail)}` : null].filter(Boolean).join(" · ")}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
@@ -1654,7 +1655,7 @@ export default function ReportsPage() {
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{conns} conns · {protos}{detail && detail.size > 0 && ` · services: ${svcList(detail)}`}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{[conns > 0 ? `${conns} conns` : null, protos || null, detail && detail.size > 0 ? `services: ${svcList(detail)}` : null].filter(Boolean).join(" · ")}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}

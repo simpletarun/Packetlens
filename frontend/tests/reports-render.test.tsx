@@ -368,7 +368,7 @@ describe("Reports page render", () => {
     // Build-identity comment rides the export (jsdom's Blob.text() strips
     // the BOM, so the round-tripped artifact starts at the comment line);
     // one data row per flow follows.
-    expect(lines[0]).toMatch(/^# PacketLens v\d+\.\d+\.\d+ · (commit|src):.* · 2 flow\(s\)$/)
+    expect(lines[0]).toMatch(/^# PacketLens v\d+\.\d+\.\d+ · (commit|src):.* · 2 flows$/)
     expect(lines[1]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct")
     expect(lines).toHaveLength(4)
     expect(lines[2]).toContain("192.168.1.20,42315,8.8.8.8,443,TCP,5,300,300,600")

@@ -396,10 +396,15 @@ function groupAlerts(alerts: AlertEntry[]): AlertGroup[] {
         return cur >= best ? (a.status ?? "CONFIRMED") : m
       }, undefined),
       evidenceQuality: list.reduce<AlertGroup["evidenceQuality"]>((m, a) => {
+        // Alerts that predate the field carry NO quality — skipping them keeps
+        // the badge honest: a group of legacy alerts must not fabricate a
+        // "MEDIUM" (the old default silently promoted missing → MEDIUM, and a
+        // later LOW could never downgrade it).
+        if (!a.evidenceQuality) return m
         const order = ["LOW", "MEDIUM", "HIGH"]
-        const cur = order.indexOf(a.evidenceQuality ?? "LOW")
-        const best = order.indexOf(m ?? "LOW")
-        return cur >= best ? (a.evidenceQuality ?? "MEDIUM") : m
+        const cur = order.indexOf(a.evidenceQuality)
+        const best = m ? order.indexOf(m) : -1
+        return cur >= best ? a.evidenceQuality : m
       }, undefined),
       occurrences: list.length,
       srcHosts: [...new Set(list.map((a) => a.srcIp))],
@@ -769,6 +774,18 @@ export function packetEpochSec(p: { timestamp: string | number }): number {
   return new Date(p.timestamp).getTime() / 1000
 }
 
+// Duration for rates: null when no measurable interval exists. Legacy jobs
+// that predate the metrics engine write captureDuration 0 for single-packet
+// captures — a 0 divisor would render "Infinity B/s" / "Infinity packets/s"
+// in the report (QA). 0/negative/NaN never becomes a rate denominator.
+export function reportDurationSec(
+  advancedMetrics: { rates?: { durationSec: number | null } } | null | undefined,
+  job: { captureDuration?: number | null } | null | undefined,
+): number | null {
+  const d = advancedMetrics?.rates?.durationSec ?? (job?.captureDuration ?? null)
+  return d !== null && Number.isFinite(d) && d > 0 ? d : null
+}
+
 // Shared decode-rate predicate for the verdict gate. Unsupported link types
 // parse lengths + timestamps only, so a SAFE/risk verdict on invisible
 // traffic is dishonest — the report says UNKNOWN and the dashboard/viz cards
@@ -781,14 +798,18 @@ export function decodeRateOf(decode: { decoded: number; total: number } | null |
 
 // Min/max epoch seconds over packets. First/last array elements lie when the
 // capture is out of order (QA: [100, 50, 90] s read a -10 s duration).
+// Non-finite timestamps (unparseable strings) are skipped — one bad row must
+// not poison the whole span.
 function packetSpanSec(packets: Array<{ timestamp: string | number }>): [number, number] {
   let min = Infinity
   let max = -Infinity
   for (const p of packets) {
     const t = packetEpochSec(p)
+    if (!Number.isFinite(t)) continue
     if (t < min) min = t
     if (t > max) max = t
   }
+  if (min === Infinity) return [0, 0]
   return [min, max]
 }
 
@@ -829,7 +850,12 @@ export function binPackets(packets: Packet[], durationSec: number, maxBins = 120
   const t0 = s0
   const buckets = new Map<number, TimelineBin>()
   for (const p of packets) {
-    const idx = Math.floor((packetEpochSec(p) - t0) / bin)
+    // A packet with an unparseable timestamp has no position in time — skip
+    // it rather than emitting a phantom "NaN" bin (its byte count still shows
+    // in every total; the timeline is a time-ordered visualization).
+    const t = packetEpochSec(p)
+    if (!Number.isFinite(t)) continue
+    const idx = Math.floor((t - t0) / bin)
     const b = buckets.get(idx) || {
       time: timelineLabel(idx * bin),
       startSec: t0 + idx * bin,
@@ -1580,7 +1606,7 @@ export function buildFlowsCsv(
   // Git identity and could not be certified against a release). Comment
   // lines are legal CSV preamble (RFC 4180 section 2.1) and the earlier
   // audit's "no comment rows" rule is superseded by this requirement.
-  const comment = `# PacketLens ${BUILD_STAMP} · ${rows.length} flow(s)`
+  const comment = `# PacketLens ${BUILD_STAMP} · ${rows.length} flow${rows.length === 1 ? "" : "s"}`
   return "\uFEFF" + [comment, header, ...rows].join("\n")
 }
 
@@ -1655,7 +1681,7 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
   // Fixtures without the engine's rates field fall back to the engine-written
   // job summary value — the renderer never recomputes a duration from raw
   // packets (renderers are read-only consumers of the canonical result).
-  const durationSec = advancedMetrics?.rates?.durationSec ?? (job?.captureDuration ?? null)
+  const durationSec = reportDurationSec(advancedMetrics, job)
 
   const risk = buildReportRisk(alerts, advancedMetrics)
   const groups = groupAlerts(alerts)
@@ -1673,10 +1699,20 @@ export function buildReportAnalysis(state: ReportState): ReportAnalysis {
       const key = [a.srcIp, a.dstIp].sort().join("|") + "|" + [a.srcPort, a.dstPort].sort((x, y) => x - y).join("|")
       if (!uniq.has(key)) uniq.set(key, a)
     }
-    const traffic = [...uniq.values()]
-      .map((a) => alertTrafficFor(a, flows))
-      .reduce((acc, t) => ({ packets: (acc.packets ?? 0) + (t.packets ?? 0), bytes: (acc.bytes ?? 0) + (t.bytes ?? 0) }), { packets: null, bytes: null })
-    return { ...g, ...refs, packets: traffic.packets || null, bytes: traffic.bytes || null }
+    const traffic = [...uniq.values()].map((a) => alertTrafficFor(a, flows))
+    // A group spanning tuples can mix retained pairs with unretained ones
+    // (the payload cap drops some flow rows): a PARTIAL sum must never read
+    // as the group's complete traffic — any missing pair flips the whole
+    // group to N/A (QA: partial sums presented as exact).
+    let anyMissing = false
+    let totalPackets = 0
+    let totalBytes = 0
+    for (const t of traffic) {
+      if (t.packets === null) { anyMissing = true; continue }
+      totalPackets += t.packets
+      totalBytes += t.bytes ?? 0
+    }
+    return { ...g, ...refs, packets: anyMissing ? null : totalPackets || null, bytes: anyMissing ? null : totalBytes || null }
   })
 
   const iocs: IocFinding[] = (advancedMetrics?.iocs ?? []).map((i) => {

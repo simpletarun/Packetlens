@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel } from "@/lib/report"
+import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel, reportDurationSec } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -1456,7 +1456,7 @@ it("statusCountsLabel always states the confirmed count, zero included", () => {
     expect(r.risk!.highestSeverity).toBeGreaterThanOrEqual(4)
   })
 
-  it("a CONFIRMED finding reports 1 confirmed while severity stays CRITICAL", () => {
+it("a CONFIRMED finding reports 1 confirmed while severity stays CRITICAL", () => {
     const r = buildReportAnalysis({
       ...state,
       alerts: [exfil("CONFIRMED")],
@@ -1465,5 +1465,96 @@ it("statusCountsLabel always states the confirmed count, zero included", () => {
     const label = statusCountsLabel(summarizeStatuses(r.alerts))
     expect(label).toBe("1 confirmed")
     expect(label).not.toContain("suspected")
+  })
+})
+
+describe("alert group evidence quality — never fabricated for legacy alerts", () => {
+  const noQ = (id: string): AlertEntry => ({ ...portScanAlert, id })
+  const withQ = (id: string, q: "LOW" | "MEDIUM" | "HIGH"): AlertEntry => ({ ...portScanAlert, id, evidenceQuality: q })
+
+  it("a group of legacy alerts without the field carries NO badge (undefined, not a made-up MEDIUM)", () => {
+    const r = buildReportAnalysis({ ...state, alerts: [noQ("a1"), noQ("a2")] })
+    expect(r.groups[0].evidenceQuality).toBeUndefined()
+  })
+
+  it("missing quality never inflates the group (LOW + missing stays LOW, in either order)", () => {
+    const r1 = buildReportAnalysis({ ...state, alerts: [withQ("a1", "LOW"), noQ("a2")] })
+    expect(r1.groups[0].evidenceQuality).toBe("LOW")
+    const r2 = buildReportAnalysis({ ...state, alerts: [noQ("a1"), withQ("a2", "LOW")] })
+    expect(r2.groups[0].evidenceQuality).toBe("LOW")
+  })
+
+  it("the strongest REAL quality wins (HIGH over LOW)", () => {
+    const r = buildReportAnalysis({ ...state, alerts: [withQ("a1", "HIGH"), withQ("a2", "LOW")] })
+    expect(r.groups[0].evidenceQuality).toBe("HIGH")
+  })
+})
+
+describe("group alert traffic — a partial sum never reads as the group total", () => {
+  it("a group spanning tuples reads N/A when ANY backing tuple's flow rows were not retained", () => {
+    const scanA = { ...portScanAlert, id: "s1", srcIp: "10.0.0.5", dstIp: "203.0.113.9" }
+    const scanB = { ...portScanAlert, id: "s2", srcIp: "10.0.0.5", dstIp: "203.0.113.10" }
+    const flows = [{ id: "f1", srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1234, dstPort: 80, protocol: "TCP", packets: 42, bytesTotal: 6000, bytesSent: 4000, bytesRecv: 2000, duration: 10, startTime: "", endTime: "" }] as Flow[]
+    const r = buildReportAnalysis({ ...state, alerts: [scanA, scanB], flows })
+    const g = r.groups.find((x) => x.ruleId === "PORT-SCAN-001")!
+    expect(g.occurrences).toBe(2)
+    // scanB's pair has no retained flow row: 42 pkts/6 KB would be a PARTIAL
+    // sum presented as the group total — the honest answer is N/A.
+    expect(g.packets).toBeNull()
+    expect(g.bytes).toBeNull()
+  })
+
+  it("a group whose every tuple is retained keeps the exact summed traffic", () => {
+    const scanA = { ...portScanAlert, id: "s1", srcIp: "10.0.0.5", dstIp: "203.0.113.9" }
+    const scanB = { ...portScanAlert, id: "s2", srcIp: "10.0.0.5", dstIp: "203.0.113.10" }
+    const flows = [
+      { id: "f1", srcIp: "10.0.0.5", dstIp: "203.0.113.9", srcPort: 1234, dstPort: 80, protocol: "TCP", packets: 42, bytesTotal: 6000, bytesSent: 4000, bytesRecv: 2000, duration: 10, startTime: "", endTime: "" },
+      { id: "f2", srcIp: "10.0.0.5", dstIp: "203.0.113.10", srcPort: 2000, dstPort: 443, protocol: "TCP", packets: 7, bytesTotal: 800, bytesSent: 300, bytesRecv: 500, duration: 4, startTime: "", endTime: "" },
+    ] as Flow[]
+    const r = buildReportAnalysis({ ...state, alerts: [scanA, scanB], flows })
+    const g = r.groups.find((x) => x.ruleId === "PORT-SCAN-001")!
+    expect(g.packets).toBe(49)
+    expect(g.bytes).toBe(6800)
+  })
+})
+
+describe("reportDurationSec — the report's rate denominator is never 0 or NaN", () => {
+  it("the metrics engine's duration wins when present", () => {
+    expect(reportDurationSec({ rates: { durationSec: 42 } }, { captureDuration: 88 })).toBe(42)
+  })
+
+  it("legacy jobs fall back to the job's capture duration", () => {
+    expect(reportDurationSec(null, { captureDuration: 88 })).toBe(88)
+    expect(reportDurationSec(undefined, undefined)).toBeNull()
+  })
+
+  it("no interval → null, never a 0 divisor (single packet / zero duration / NaN)", () => {
+    expect(reportDurationSec({ rates: { durationSec: null } }, { captureDuration: 0 })).toBeNull()
+    expect(reportDurationSec({ rates: { durationSec: null } }, null)).toBeNull()
+    expect(reportDurationSec(null, { captureDuration: 0 })).toBeNull()
+    expect(reportDurationSec(null, { captureDuration: -5 })).toBeNull()
+    expect(reportDurationSec(null, { captureDuration: Number.NaN })).toBeNull()
+  })
+})
+
+describe("binPackets — unparseable timestamps never poison the timeline", () => {
+  it("skips bad-timestamp packets: no NaN bins, and the valid packets stay in their real bins", () => {
+    const pkts: Packet[] = [
+      packet(0),
+      { ...packet(2), timestamp: "not-a-date" },
+      packet(4),
+    ]
+    const bins = binPackets(pkts, 10)
+    expect(bins.length).toBe(2)
+    expect(bins.reduce((s, b) => s + b.packets, 0)).toBe(2)
+    expect(bins.every((b) => b.time !== "NaN")).toBe(true)
+  })
+
+  it("an all-invalid-timestamp capture yields no bins, not NaN rows", () => {
+    const pkts: Packet[] = [
+      { ...packet(0), timestamp: "garbage" },
+      { ...packet(1), timestamp: "garbage" },
+    ]
+    expect(binPackets(pkts, 10)).toEqual([])
   })
 })
