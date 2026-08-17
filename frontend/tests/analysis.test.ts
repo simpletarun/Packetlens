@@ -735,6 +735,34 @@ describe("Analysis engine", () => {
     expect(alert!.timestamp).toBe(new Date(1000025 * 1000).toISOString())
   })
 
+  it("does NOT flag periodic ICMPv6 Neighbor Discovery to solicited-node multicast as beaconing", () => {
+    // big.pcapng: the host's global v6 sends NS bursts to five different
+    // ff02::1:ffxx solicited-node multicast addresses at a ~140.4 s cadence
+    // (CV 0.184) — a regular interval, but LAN ND chatter, never C2. The old
+    // detector keyed the conversation by the sender (neither side looked
+    // "local") and raised C2-BEACON-001 "5 connections to 2401:…:1:0".
+    const packets: ParsedPacket[] = []
+    const src = "2401:4900:8911:7943:0:0:0:1"
+    const dsts = [
+      "ff02:0:0:0:0:1:ff5c:c355", "ff02:0:0:0:0:1:ff88:2f67",
+      "ff02:0:0:0:0:1:ff95:fcc1", "ff02:0:0:0:0:1:ff4e:8215",
+      "ff02:0:0:0:0:1:ff2d:21d6",
+    ]
+    const starts = [1000000, 1000000 + 100.7, 1000000 + 272.6, 1000000 + 422.7, 1000000 + 561.7]
+    dsts.forEach((dst, i) => {
+      for (let k = 0; k < 3; k++) {
+        packets.push(makePacket({ num: packets.length + 1, protocol: "ICMPv6", srcIp: src, dstIp: dst, srcPort: 0, dstPort: 0, timestamp: starts[i] + k, length: 86 }))
+      }
+    })
+    const result: PCAPResult = {
+      packets,
+      stats: { totalPackets: packets.length, totalBytes: packets.reduce((s, p) => s + p.length, 0), duration: 562, startTime: 1000000, endTime: 1000562, protocols: { ICMPv6: packets.length } },
+    }
+    const analysis = analyzePcap(result)
+    expect(analysis.advancedMetrics.beaconDetected).toBe(false)
+    expect(analysis.threats.find((t) => t.ruleId === "C2-BEACON-001")).toBeUndefined()
+  })
+
   it("assigns MACs only to private IPs (public IPs show the router, not a device)", () => {
     const packets: ParsedPacket[] = [
       makePacket({ num: 1, srcMac: "aa:bb:cc:dd:ee:ff", srcIp: "192.168.1.5", dstIp: "8.8.8.8", dstPort: 443 }),

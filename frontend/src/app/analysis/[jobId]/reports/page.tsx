@@ -447,6 +447,11 @@ export default function ReportsPage() {
   // Rate formatting: no time interval -> N/A, never a fabricated number.
   const rateLabel = (bps: number | null) => (bps === null ? "N/A" : formatBytes(bps) + "/s")
   const durLabel = (sec: number | null) => (sec === null ? "—" : formatDuration(sec))
+  // ONE immutable export timestamp per page session: the printed PDF and the
+  // HTML/markdown export stamped the same analysis with two independent
+  // `new Date()` calls, so the artifacts of one export session disagreed
+  // (QA: big.pcapng PDF 03:23:24 vs HTML 03:23:35 UTC).
+  const exportTs = useMemo(() => new Date().toISOString().slice(0, 19).replace("T", " "), [])
   // Duration at the precision rates are computed from: formatDuration rounds
   // to whole seconds, so "Duration 48 s" next to "Avg Packets/s 584.0" (from
   // 48.17 s) would read as internally inconsistent (QA: mamaji.pcapng). Sub-
@@ -779,7 +784,7 @@ export default function ReportsPage() {
     if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable, verdictStatusHint), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${exportTs} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
     return lines.join("\n")
   }
 
@@ -2187,7 +2192,7 @@ export default function ReportsPage() {
                           {burst && <p><strong>Burst Detected:</strong> {formatBytes(burst.peakThroughput)}/s peak</p>}
                         </div>
                       </div>
-                      <p><strong>Analysis completed:</strong> {job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · <strong>Export generated:</strong> {new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · <strong>Build:</strong> {BUILD_STAMP}</p>
+                      <p><strong>Analysis completed:</strong> {job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · <strong>Export generated:</strong> {exportTs} UTC · <strong>Build:</strong> {BUILD_STAMP}</p>
                     </CardContent>
                   </Card>
                 </section>

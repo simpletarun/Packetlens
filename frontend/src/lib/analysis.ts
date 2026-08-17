@@ -1877,11 +1877,22 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         : { ip: f.srcIp, port: f.srcPort }
     }
     const byRemote = new Map<string, AnalysisFlow[]>()
+    const remoteIpOf = new Map<string, string>()
     for (const f of flows) {
+      // Multicast/broadcast/unspecified endpoints (IPv6 Neighbor Discovery,
+      // DAD, DHCP, SSDP…) are LAN chatter, never C2 servers. A conversation
+      // to or from them has no remote host to beacon to — and when neither
+      // side looks "local" (a global v6 sender probing ff02::1:ffxx
+      // solicited-node multicast), remoteOf keyed the conversation by the
+      // SENDER, inventing a beacon target out of the sender itself
+      // (QA: big.pcapng — periodic ICMPv6 NS to ff02::1:ffxx fired
+      // C2-BEACON-001 "5 connections to 2401:4900:8911:7943:0:0:0:1:0").
+      if (isNonUnicast(f.srcIp) || isNonUnicast(f.dstIp)) continue
       const r = remoteOf(f)
       if (isBenignBeaconEndpoint(f.protocol, r.port, r.ip, dstNames.get(r.ip))) continue
       const key = `${r.ip}:${r.port}`
       if (!byRemote.has(key)) byRemote.set(key, [])
+      remoteIpOf.set(key, r.ip)
       byRemote.get(key)!.push(f)
     }
     for (const [key, list] of byRemote) {
@@ -1903,7 +1914,14 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       const variance = intervals.reduce((s, x) => s + (x - mean) ** 2, 0) / intervals.length
       if (Math.sqrt(variance) / mean < 0.35) {
         const cv = Math.sqrt(variance) / mean
-        return `${list.length} connections to ${key} at ~${mean.toFixed(1)}s intervals (σ ${Math.sqrt(variance).toFixed(2)}s, CV ${cv.toFixed(3)})`
+        // "Connections" only for TCP (handshake-bearing); stateless UDP/ICMP
+        // conversations are FLOWS, and port-less protocols (ICMP, ICMPv6, GRE,
+        // ESP…) never carry a ":0" pseudo-port in the target (QA: big.pcapng
+        // beacon evidence read "5 connections to …:0" for ICMPv6).
+        const portless = list.every((f) => f.srcPort === 0 && f.dstPort === 0)
+        const noun = list.every((f) => f.protocol === 'TCP') ? 'connections' : 'flows'
+        const target = portless ? remoteIpOf.get(key)! : key
+        return `${list.length} ${noun} to ${target} at ~${mean.toFixed(1)}s intervals (σ ${Math.sqrt(variance).toFixed(2)}s, CV ${cv.toFixed(3)})`
       }
     }
     return ''
