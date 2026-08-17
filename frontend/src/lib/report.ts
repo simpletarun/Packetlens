@@ -1312,11 +1312,16 @@ export function shortAlertName(signature: string): string {
 // so the export can't regress to "N/A" or a fake score (QA: verdict text).
 export function verdictLine(levelLabel: string, scoreVal: number, undecodable: boolean, statusHint = ""): string {
   // A SAFE verdict only means nothing matched the configured rules — the
-  // wrapper must not read as an absolute safety guarantee (QA audit). An
-  // unconfirmed hint (e.g. "strongest finding: Suspected alert") prevents an
-  // unconfirmed finding from reading as a confirmed incident (QA: open.pcapng
-  // "53/100 CRITICAL" with "No findings were confirmed").
-  return `- **Final verdict:** **${levelLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered" : ""}${statusHint}`
+  // wrapper must not read as an absolute safety guarantee (QA audit). The
+  // SAFE level label (risk-spec.json, shared with the engine) is rendered as
+  // NO DETECTIONS here so the verdict states what it actually is: the absence
+  // of detections, not a claim of safety (QA: random.pcapng "0/100 SAFE" read
+  // as an all-clear on a 5,598-packet capture). An unconfirmed hint (e.g.
+  // "strongest finding: Suspected alert") prevents an unconfirmed finding
+  // from reading as a confirmed incident (QA: open.pcapng "53/100 CRITICAL"
+  // with "No findings were confirmed").
+  const displayLabel = levelLabel === "SAFE" ? "NO DETECTIONS" : levelLabel
+  return `- **Final verdict:** **${displayLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered (absence of detection is not proof of a clean network)" : ""}${statusHint}`
 }
 
 // Escaping for the standalone HTML report export. Escapes ONCE: the mdInline
@@ -1390,7 +1395,9 @@ export function markdownToHtml(
       if (html.includes("Final verdict")) {
         // Verdict label gets the risk color class (lv-safe/lv-low/…), derived
         // from the markdown itself so the converter needs no page state.
-        html = html.replace(/<strong>([^<]*)<\/strong>(?!.*<strong>)/, (_, lbl) => `<strong class="lv-${lbl.toLowerCase()}">${lbl}</strong>`)
+        // "NO DETECTIONS" is the SAFE level rendered without the word SAFE
+        // (verdictLine) — it must still carry the SAFE green (lv-safe).
+        html = html.replace(/<strong>([^<]*)<\/strong>(?!.*<strong>)/, (_, lbl) => `<strong class="lv-${lbl.toLowerCase() === "no detections" ? "safe" : lbl.toLowerCase()}">${lbl}</strong>`)
       }
       out.push(`<li>${html}</li>`)
       continue

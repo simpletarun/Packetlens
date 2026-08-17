@@ -539,7 +539,7 @@ export default function ReportsPage() {
     // large/verylarge reported a fabricated multicast observation).
     if (!undecodable && packets.some((p) => p.dstIp && p.dstIp !== "\u2014" && isNonUnicast(p.dstIp))) obs.push("multicast/broadcast traffic")
     if (undecodable) obs.push(`capture payloads undecodable (${dltName(linkTypes)} — unsupported encapsulation); only lengths and timestamps parsed`)
-    if (dnsQueries > 0) obs.push(`${dns.length.toLocaleString()} DNS packets — ${dnsQueries.toLocaleString()} query packets, ${dnsLookupCount(dns).toLocaleString()} distinct name/type lookups for the capturing client, ${dnsUniqueDomains(dns).size.toLocaleString()} unique domain${dnsUniqueDomains(dns).size === 1 ? "" : "s"}`)
+    if (dnsQueries > 0) obs.push(`${dns.length.toLocaleString()} DNS packets — ${dnsQueries.toLocaleString()} queries + ${(dns.length - dnsQueries).toLocaleString()} responses, ${dnsLookupCount(dns).toLocaleString()} distinct name/type lookups for the capturing client, ${dnsUniqueDomains(dns).size.toLocaleString()} unique domain${dnsUniqueDomains(dns).size === 1 ? "" : "s"}`)
     // 0 DNS + any hostname-bearing traffic = the capture began mid-session:
     // the resolution phase predates the capture, so hostname↔IP correlation
     // and PTR lookups are unavailable (QA: login.pcapng talks to 4+ named
@@ -599,7 +599,7 @@ export default function ReportsPage() {
       const rstNote = rsts > 0
         ? `${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST${rstRate >= 0.3 ? " (elevated rate — informational, not treated as a security finding; RSTs commonly follow cancelled connections, short-lived flows, rejected connections and capture timing)" : ""}`
         : ""
-      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total) showed retransmissions, from which loss is inferred (worst ${worst.lossPct}% estimated loss in flow ${worstOrient} — ${worstConf} confidence, n=${worst.packets} packets in that flow; not a confirmed network-loss measurement${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% inferred loss` : ""}${rstNote ? `; ${rstNote}` : ""}) — no security detection rule was triggered by these network-health observations`)
+      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total; ${tcpFlowsAll.length - measuredTcp.length} had no handshake and no observable health signal — no RTT, retransmission, out-of-order, zero-window or RST event — so loss cannot be measured on them) showed retransmissions, from which loss is inferred (worst ${worst.lossPct}% estimated loss in flow ${worstOrient} — ${worst.retrans ?? 0} retransmitted of ${worst.packets} packets in that flow (${worst.lossPct}% of its data segments; ${worstConf} confidence, n=${worst.packets}); not a confirmed network-loss measurement${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% inferred loss` : ""}${rstNote ? `; ${rstNote}` : ""}) — no security detection rule was triggered by these network-health observations`)
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
@@ -636,8 +636,12 @@ export default function ReportsPage() {
   const riskValue = (): string => undecodable
     ? "UNKNOWN / INSUFFICIENT DATA"
     : risk
-      ? `${risk.normalizedScore}/100 ${risk.levelLabel}`
-      : `${jobScore}/100 ${fallbackVerdict.label}`
+      // A zero score next to a "SAFE" badge reads as a cleanliness rating;
+      // it only means no configured rule triggered, so the score line says
+      // exactly that instead of parading the level label (QA: random.pcapng
+      // "0/100 SAFE" on a 5,598-packet capture).
+      ? `${risk.normalizedScore}/100${risk.normalizedScore === 0 ? " — no detection rules triggered" : ` ${risk.levelLabel}`}`
+      : `${jobScore}/100${jobScore === 0 ? " — no detection rules triggered" : ` ${fallbackVerdict.label}`}`
 
   // job.riskScore is absent on legacy/malformed job records — a bare
   // undefined would render "undefined/100" in the verdict and conclusion.
@@ -701,7 +705,7 @@ export default function ReportsPage() {
       ...mdTable(["Metric", "Value"], [
         ["Packets", stats.totalPackets.toLocaleString()],
         ["Flows", stats.totalFlows.toLocaleString()],
-        ["Sessions", stats.sessions.toLocaleString()],
+        ["Sessions (conversations)", stats.sessions.toLocaleString()],
         ["Local Devices", stats.devices.toLocaleString()],
         ["Duration", durPrecise(durationSec)],
         ["Risk score", riskValue()],
@@ -717,17 +721,17 @@ export default function ReportsPage() {
       `- **Analysis ID:** \`${job.id}\`${jobInfo?.isDemo ? " (Demo Dataset)" : ""}`,
       `- **Capture file:** \`${job.filename}\`` + (job.sha256 ? `\n- **SHA256:** \`${job.sha256}\`` : "") + (job.sha1 ? `\n- **SHA1:** \`${job.sha1}\`` : "") + (job.md5 ? `\n- **MD5:** \`${job.md5}\`` : ""),
       `- **File size:** ${formatBytes(job.fileSize)}`,
-      `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (typeof job?.rawPacketCount === "number" ? ` analyzed (raw ${job.rawPacketCount.toLocaleString()} · ${(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicates removed)` : "") + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`),
+      `- **Packets:** ${stats.totalPackets.toLocaleString()}` + (typeof job?.rawPacketCount === "number" ? ` analyzed (raw ${job.rawPacketCount.toLocaleString()} · ${(job.duplicateFrameCount ?? 0).toLocaleString()} consecutive duplicates removed)` : "") + (undecodable ? ` · Undecodable traffic buckets: ${stats.totalFlows.toLocaleString()}` : ` · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()} (unique local hosts — MAC/IP aliases merged)`),
       `- **Duration:** ${durPrecise(durationSec)} · Risk score: ${riskValue()}`,
       `- **Alerts:** ${report.alerts.length} — Severity: ${severityCounts(report.alerts)} · Status: ${statusCountsLabel(summarizeStatuses(report.alerts))}${credentialEventCount(report.alerts) > 0 ? ` — covering ${credentialEventCount(report.alerts)} credential-submission event${credentialEventCount(report.alerts) === 1 ? "" : "s"}` : ""}`,
       "",
       "## Traffic",
-      `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)}`,
-      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design.`,
-      `- DNS queries: ${dnsQueries} (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
+      `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)} (unique GeoIP-resolved countries across external endpoints, either direction)`,
+      `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design. Sessions equal the conversation count: flows are already direction-agnostic (both directions merged into one flow), and each session is that conversation with its TCP state (ESTABLISHED / STATELESS / …) attached.`,
+      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} (credential submissions are the HTTP requests whose decoded body carried a username and/or password field — not every HTTP request) · ${plural(certificates.length, "unique certificate")} decoded (deduplicated by subject+serial across the capture)`,
-      ...(report.notables.length ? [`- Notable destinations (neutral, not findings): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
+      ...(report.notables.length ? [`- Notable destinations (neutral, not findings — these domains appeared in the capture's own TLS Server Name or HTTP Host fields, so the connection was made by a host inside the capture, not by PacketLens; presence alone is not a malicious indicator): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
       ...(undecodable ? [`## Data Quality`, `- **WARNING:** only ${(decodeRate * 100).toFixed(0)}% of packets decoded (${linkTypes.length > 0 ? dltName(linkTypes) : "encapsulation unknown"}). Lengths and timestamps were parsed; headers were not. Verdict is UNKNOWN — re-capture with a decodable link type or explicit DLT override.`, ""] : []),
@@ -862,14 +866,14 @@ export default function ReportsPage() {
                     <p><strong>{stats.totalFlows}</strong> undecodable traffic bucket{stats.totalFlows === 1 ? "" : "s"} — no endpoints were parsed (unsupported encapsulation).</p>
                   ) : (
                     <>
-                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{plural(stats.devices, "local device")}</strong> ({endpointRows.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(1) + "%"}).</p>
-                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers from these counts by design.</p>
+                    <p><strong>{plural(stats.totalFlows, "flow")}</strong>, <strong>{plural(stats.sessions, "session")}</strong>, <strong>{stats.devices} local device{stats.devices === 1 ? "" : "s"}</strong> (unique local hosts — MAC/IP aliases merged; {endpointRows.length} endpoints) across {uniqueSrcIps} source and {uniqueDstIps} destination IPs ({stats.externalIps} external, {countriesLabel(stats.countries, stats.externalIps)} countries/regions — unique GeoIP-resolved countries across external endpoints, either direction). Top protocol: <strong>{topProto[0]?.[0] || ""}</strong> ({packets.length === 0 ? "—" : ((topProto[0]?.[1] || 0) / packets.length * 100).toFixed(1) + "%"}).</p>
+                    <p className="text-xs text-muted-foreground">Source/destination IP counts are packet-direction counts — each endpoint is counted once per side it appeared on. Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers from these counts by design. Sessions equal the conversation count: flows are already direction-agnostic (both directions merged into one flow), and each session is that conversation with its TCP state (ESTABLISHED / STATELESS / …) attached.</p>
                     </>
                   )}
                   {undecodable && (
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
                   )}
-                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p><strong>{plural(dnsQueries, "DNS query packet")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
+                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p>DNS: <strong>{plural(dnsQueries, "query packet")}</strong> + <strong>{plural(dns.length - dnsQueries, "response")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
                   {tls.length === 0 && (packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS") || packets.some((p) => p.appProtocol === "QUIC")) && (packets.some((p) => p.appProtocol === "QUIC" && p.appPayloadConfirmed)
                     ? <p className="text-warning">QUIC traffic is present (payload-verified, UDP/443) — the TLS sessions inside QUIC are encrypted and no ClientHello/ServerHello packets were captured, so no TLS details, SNI or certificates are decoded.</p>
                     : <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>)}
@@ -2203,13 +2207,13 @@ export default function ReportsPage() {
                     <CardContent className="pt-6 space-y-2">
                       <div className="flex items-center gap-2 flex-wrap">
                         <Shield className={cn("h-5 w-5", levelColor)} />
-                        <span className={cn("text-lg font-bold", levelColor)}>{levelLabel}</span>
+                        <span className={cn("text-lg font-bold", levelColor)}>{levelLabel === "SAFE" ? "NO DETECTIONS" : levelLabel}</span>
                         {levelLabel === "SAFE" && <span className="text-xs text-muted-foreground">— no configured detection rule triggered (not a proof of a clean network)</span>}
                         {levelLabel !== "SAFE" && verdictStatusHint && <span className="text-xs text-muted-foreground">{verdictStatusHint}</span>}
                         <span className="text-xs text-muted-foreground">Final verdict · Risk score {riskValue()}</span>
                       </div>
                       <p className="text-sm text-muted-foreground">{conclusionText}</p>
-                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "SAFE means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only${verdictStatusHint ? " — the level is floored by the strongest finding's rule severity (1–5), which is NOT the same scale as the 0–100 risk score" : ""}`} — it is not proof that the capture is universally safe or clean.</p>
+                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "NO DETECTIONS means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only${verdictStatusHint ? " — the level is floored by the strongest finding's rule severity (1–5), which is NOT the same scale as the 0–100 risk score" : ""}`} — it is not proof that the capture is universally safe or clean.</p>
                     </CardContent>
                   </Card>
                 </section>

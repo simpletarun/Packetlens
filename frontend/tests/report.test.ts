@@ -952,8 +952,8 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     expect(escHtml(`say "hi" <now>`)).toBe("say &quot;hi&quot; &lt;now&gt;")
   })
 
-it("verdictLine renders per-class text: LOW/MEDIUM/HIGH/CRITICAL and UNKNOWN on undecodable", () => {
-    expect(verdictLine("SAFE", 0, false)).toBe("- **Final verdict:** **SAFE** \u2014 risk 0/100 \u2014 no configured detection rules triggered")
+it("verdictLine renders per-class text: SAFE becomes NO DETECTIONS; LOW/MEDIUM/HIGH/CRITICAL and UNKNOWN on undecodable", () => {
+    expect(verdictLine("SAFE", 0, false)).toBe("- **Final verdict:** **NO DETECTIONS** \u2014 risk 0/100 \u2014 no configured detection rules triggered (absence of detection is not proof of a clean network)")
     expect(verdictLine("LOW", 12, false)).toBe("- **Final verdict:** **LOW** \u2014 risk 12/100")
     expect(verdictLine("MEDIUM", 55, false)).toBe("- **Final verdict:** **MEDIUM** \u2014 risk 55/100")
     expect(verdictLine("HIGH", 73, false)).toBe("- **Final verdict:** **HIGH** \u2014 risk 73/100")

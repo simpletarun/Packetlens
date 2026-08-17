@@ -342,7 +342,7 @@ describe("end-to-end export artifact — the files users audit are regenerated f
       `| Flows | ${stats.totalFlows.toLocaleString()} |`,
       `| Sessions | ${stats.sessions.toLocaleString()} |`,
       `| Local Devices | ${stats.devices.toLocaleString()} |`,
-      `| Risk score | ${stats.riskScore}/100 ${stats.riskScore >= 70 ? "HIGH" : stats.riskScore >= 40 ? "MEDIUM" : stats.riskScore > 0 ? "LOW" : "SAFE"} |`,
+      `| Risk score | ${stats.riskScore === 0 ? "0/100 — no detection rules triggered" : `${stats.riskScore}/100 ${stats.riskScore >= 70 ? "HIGH" : stats.riskScore >= 40 ? "MEDIUM" : "LOW"}`} |`,
       "",
       "## Capture Information",
       `- **Packets:** ${stats.totalPackets.toLocaleString()} · Flows: ${stats.totalFlows.toLocaleString()} · Sessions: ${stats.sessions.toLocaleString()} · Local Devices: ${stats.devices.toLocaleString()}`,
@@ -352,7 +352,7 @@ describe("end-to-end export artifact — the files users audit are regenerated f
       `- DNS queries: ${a.packets.filter((p) => p.protocol === "DNS").length} (${dnsLookupCount(a.dns)} distinct lookups) · HTTP requests: ${a.http.length} · TLS handshakes: ${a.tls.length}`,
       "",
       "## Analyst Conclusion",
-      `- **Final verdict:** **${stats.riskScore >= 70 ? "HIGH" : stats.riskScore >= 40 ? "MEDIUM" : stats.riskScore > 0 ? "LOW" : "SAFE"}** — risk ${stats.riskScore}/100`,
+      `- **Final verdict:** **${stats.riskScore === 0 ? "NO DETECTIONS" : stats.riskScore >= 70 ? "HIGH" : stats.riskScore >= 40 ? "MEDIUM" : "LOW"}** — risk ${stats.riskScore}/100${stats.riskScore === 0 ? " — no configured detection rules triggered (absence of detection is not proof of a clean network)" : ""}`,
     ].join("\n")
     const html = markdownToHtml(md, { jobId: "export-e2e", jobFilename: name, origin: "http://localhost:3000" })
     expect.soft(html, `${name}: packets cell`).toContain(`<td>${stats.totalPackets.toLocaleString()}</td>`)
