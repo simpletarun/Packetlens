@@ -56,19 +56,6 @@ npm run dev          # → http://localhost:3456
 | **Exports** | Print-ready PDF, standalone HTML, SIEM-friendly CSV (UTF-8 BOM, IPv6-safe) |
 | **Privacy** | Beginner mode masks IPs · no analytics · no telemetry |
 
----
-
-## 🛠️ Tech stack
-
-| Layer | Choice |
-| --- | --- |
-| Framework | Next.js (App Router) + TypeScript |
-| Graph | cytoscape + cytoscape-svg |
-| Map | d3-geo (Natural Earth, bundled — no tile servers) |
-| GeoIP | mmdb-lib (DB-IP City Lite) |
-| State | zustand |
-
----
 
 ## 📖 FAQ
 
