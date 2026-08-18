@@ -543,8 +543,17 @@ function parseUDP(dv: DataView, off: number, maxLen: number, p: ParsedPacket): v
   // A port-only "STUN" label needs the RFC 5389 magic cookie to be real —
   // every STUN message carries 0x2112A442 at offset 4. Without it the
   // datagram is just UDP on a service port (audit: observation honesty).
-  if (p.appProtocol === 'STUN' && (appLen < 20 || dv.getUint32(appOff + 4) !== 0x2112a442)) {
-    p.appProtocol = 'UDP'
+  // When the cookie IS present the label is payload-verified — same
+  // appPayloadConfirmed contract as HTTP/TLS/DNS — so flow protocolSource
+  // and the exfil STUN exclusion can trust it (QA: long.pcapng cookie-
+  // verified STUN read as port-inferred, so 3478 traffic fired
+  // DATA-EXFIL-001 on a byte ratio).
+  if (p.appProtocol === 'STUN') {
+    if (appLen < 20 || dv.getUint32(appOff + 4) !== 0x2112a442) {
+      p.appProtocol = 'UDP'
+    } else {
+      p.appPayloadConfirmed = true
+    }
   }
 }
 

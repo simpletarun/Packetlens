@@ -600,6 +600,123 @@ describe("Analysis engine", () => {
     expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(true)
   })
 
+  describe("flag alerts carry evidence timestamps and real endpoints (QA: long.pcapng)", () => {
+    const upload = (overrides: Partial<ParsedPacket> = {}): ParsedPacket[] => {
+      // 5 × 50 KB = 250 KB sent, 0 received — over the 100 KB / 5× gates.
+      const packets: ParsedPacket[] = []
+      for (let i = 0; i < 5; i++) {
+        packets.push(makePacket({
+          num: i + 1,
+          timestamp: 1000000 + i,
+          srcIp: "192.168.1.10",
+          dstIp: "116.119.214.99",
+          srcPort: 63107,
+          dstPort: 3478,
+          protocol: "UDP",
+          length: 50000,
+          ...overrides,
+        }))
+      }
+      return packets
+    }
+    const run = (packets: ParsedPacket[]) =>
+      analyzePcap({
+        packets,
+        stats: {
+          totalPackets: packets.length,
+          totalBytes: packets.reduce((s, p) => s + p.length, 0),
+          duration: 10, startTime: 1000000, endTime: 1000004,
+          protocols: { UDP: packets.length },
+        },
+      })
+
+    it("stamps DATA-EXFIL-001 at the last contributing flow's end, not the capture end", () => {
+      const analysis = run(upload())
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+      expect(exfil).toBeDefined()
+      // Last packet timestamp 1000004 → flow end 1000004 (capture end is
+      // also 1000004 here, so use an offset capture end to prove the source):
+      // timestamps must equal the FLOW end, which is what the evidence names.
+      const flow = analysis.flows[0]
+      expect(exfil!.timestamp).toBe(new Date(flow.endTime).toISOString())
+    })
+
+    it("points the alert at the evidence when the flow ends before the capture", () => {
+      const packets = upload()
+      // One last burst packet AFTER the flow (different flow) extends the
+      // capture; the exfil alert must still cite the triggering flow's end.
+      packets.push(makePacket({ num: 6, timestamp: 2000000, srcIp: "192.168.1.10", dstIp: "8.8.8.8", srcPort: 50000, dstPort: 53, protocol: "UDP", length: 64 }))
+      const analysis = run(packets)
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+      expect(exfil!.timestamp).toBe(new Date(1000004 * 1000).toISOString())
+      expect(exfil!.timestamp).not.toBe(new Date(2000000 * 1000).toISOString())
+    })
+
+    it("names the real endpoints on the header for a single flow (not 'multiple → external')", () => {
+      const analysis = run(upload())
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+      expect(exfil!.srcIp).toBe("192.168.1.10")
+      expect(exfil!.dstIp).toBe("116.119.214.99")
+    })
+
+    it("keeps 'multiple → external' when several flows contribute", () => {
+      const packets = upload()
+      for (let i = 0; i < 5; i++) {
+        packets.push(makePacket({ num: 6 + i, timestamp: 3000000 + i, srcIp: "192.168.1.20", dstIp: "93.184.216.34", srcPort: 40000, dstPort: 443, protocol: "UDP", length: 50000 }))
+      }
+      const analysis = run(packets)
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+      expect(exfil).toBeDefined()
+      expect(exfil!.srcIp).toBe("multiple")
+      expect(exfil!.dstIp).toBe("external")
+    })
+
+    it("does NOT fire DATA-EXFIL-001 on payload-verified STUN (RFC 5389 cookie decoded)", () => {
+      const analysis = run(upload({ appProtocol: "STUN", appPayloadConfirmed: true }))
+      expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+      expect(analysis.threats.some((t) => t.ruleId === "DATA-EXFIL-001")).toBe(false)
+    })
+
+    it("still fires on port-inferred STUN — the service label is only a port guess", () => {
+      const analysis = run(upload({ appProtocol: "STUN" }))
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
+      expect(exfil).toBeDefined()
+      expect(exfil!.evidence).toContain("RFC-5389-cookie-verified")
+    })
+
+    it("evidence states the payload-verification gap and the flow window", () => {
+      // STUN-labelled flow → the STUN-specific payload evidence branch.
+      const inferred = run(upload({ appProtocol: "STUN" }))
+      const exfil = inferred.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
+      expect(exfil.evidence).toContain("STUN payload evidence: 0 of 5 packets RFC-5389-cookie-verified")
+      expect(exfil.evidence).toContain("flow window 1970-01-12T13:46:40.000Z → 1970-01-12T13:46:44.000Z UTC")
+      // Non-STUN flow → the generic branch names the verification gap.
+      const plain = run(upload())
+      const plainExfil = plain.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
+      expect(plainExfil.evidence).toContain("payload evidence: 0 of 5 packets payload-verified (UNKNOWN)")
+    })
+
+    it("DNS-tunnel and beacon alerts carry their own evidence times, not the capture end", () => {
+      // DNS tunneling: 5 tunneling-like queries at the END of the capture.
+      const q = (num: number, t: number) => makePacket({
+        num, timestamp: t, srcIp: "192.168.1.10", dstIp: "8.8.8.8",
+        srcPort: 50000, dstPort: 53, protocol: "UDP",
+        dnsQuery: "a".repeat(45) + ".example.com", dnsQr: false,
+      })
+      const packets = [
+        makePacket({ num: 1, timestamp: 1000, srcIp: "192.168.1.10", dstIp: "203.0.113.5", protocol: "UDP", length: 64 }),
+        q(2, 9000), q(3, 9100), q(4, 9200), q(5, 9300), q(6, 9400),
+      ]
+      const analysis = analyzePcap({
+        packets,
+        stats: { totalPackets: packets.length, totalBytes: packets.reduce((s, p) => s + p.length, 0), duration: 9, startTime: 1000, endTime: 9400, protocols: { UDP: packets.length } },
+      })
+      const tunnel = analysis.threats.find((t) => t.ruleId === "DNS-TUNNEL-001")
+      expect(tunnel).toBeDefined()
+      expect(tunnel!.timestamp).toBe(new Date(9400 * 1000).toISOString())
+    })
+  })
+
   it("maps MITRE techniques for port scans", () => {
     const packets: ParsedPacket[] = []
     for (let i = 0; i < 21; i++) {

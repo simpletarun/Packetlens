@@ -624,10 +624,10 @@ export default function ReportsPage() {
     return obs
   }, [packets, dns, http, tls, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job, credentials])
   const recs = useMemo(() => {
-    type RecRow = { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC"; status?: DetectionStatus }
+    type RecRow = { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC"; status?: DetectionStatus; priority?: "IMMEDIATE" | "INVESTIGATE" | "MONITOR" }
     const groups = { High: [] as RecRow[], Medium: [] as RecRow[], Low: [] as RecRow[] }
     for (const r of report.recommendations.sort((a, b) => b.severity - a.severity)) {
-      groups[r.severity >= 4 ? "High" : r.severity >= 3 ? "Medium" : "Low"].push({ text: r.text, source: r.source, status: r.status })
+      groups[r.severity >= 4 ? "High" : r.severity >= 3 ? "Medium" : "Low"].push({ text: r.text, source: r.source, status: r.status, priority: r.priority })
     }
     if (undecodable) {
       groups.Medium.push({ text: `Capture not decodable (${dltName(linkTypes)}) — re-capture with an explicit DLT override (e.g. Wireshark: edit capture file settings or dumpcap -L) so headers can be parsed.`, source: "BEHAVIORAL_METRIC" })
@@ -640,15 +640,14 @@ export default function ReportsPage() {
   // Verdict gate: near-zero decode rate (unsupported encapsulation) means
   // the traffic is invisible — a 0/100 SAFE verdict would whitelist it. The
   // verdict must be UNKNOWN / INSUFFICIENT DATA instead (QA: large/verylarge).
+  // The score displays its OWN numeric band (riskLevel) — never the floored
+  // verdict level — so "53/100" reads as the MEDIUM band it is, while the
+  // verdict badge still floors to CRITICAL from a 5/5 finding (QA:
+  // open.pcapng "53/100 CRITICAL" conflated the score band with the finding
+  // severity). The "Highest finding severity" row carries the 1–5 severity.
   const riskValue = (): string => undecodable
     ? "UNKNOWN / INSUFFICIENT DATA"
-    : risk
-      // A zero score next to a "SAFE" badge reads as a cleanliness rating;
-      // it only means no configured rule triggered, so the score line says
-      // exactly that instead of parading the level label (QA: random.pcapng
-      // "0/100 SAFE" on a 5,598-packet capture).
-      ? `${risk.normalizedScore}/100${risk.normalizedScore === 0 ? " — no detection rules triggered" : ` ${risk.levelLabel}`}`
-      : `${jobScore}/100${jobScore === 0 ? " — no detection rules triggered" : ` ${fallbackVerdict.label}`}`
+    : `${scoreVal}/100${scoreVal === 0 ? " — no detection rules triggered" : ` — ${riskLevel(scoreVal).label} score band`}`
 
   // job.riskScore is absent on legacy/malformed job records — a bare
   // undefined would render "undefined/100" in the verdict and conclusion.
@@ -789,9 +788,15 @@ export default function ReportsPage() {
       lines.push("## MITRE ATT&CK", "- No techniques mapped — techniques attach only when the evidence demonstrates the technique was executed; SUSPECTED threshold findings and confirmed exposure-style findings (e.g. plaintext credential exposure) are deliberately unmapped, because exposure is a weakness or prerequisite, not observed adversary activity.", "")
     }
     const recLines: string[] = []
-    if (recs.High.length) recLines.push("### High", ...recs.High.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
-    if (recs.Medium.length) recLines.push("### Medium", ...recs.Medium.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
-    if (recs.Low.length) recLines.push("### Low", ...recs.Low.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
+    // A SUSPECTED behavioral recommendation carries its INVESTIGATE action
+    // priority in the export, so it never reads as a blocking mandate (QA:
+    // long.pcapng "consider blocking suspicious destinations" for one
+    // suspected STUN flow).
+    const recLine = (r: { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC"; status?: DetectionStatus; priority?: "IMMEDIATE" | "INVESTIGATE" | "MONITOR" }) =>
+      `- ${r.priority ? `**[${r.priority}]** ` : ""}${r.text} (${findingSourceLabel(r.source, r.status)})`
+    if (recs.High.length) recLines.push("### High", ...recs.High.map(recLine))
+    if (recs.Medium.length) recLines.push("### Medium", ...recs.Medium.map(recLine))
+    if (recs.Low.length) recLines.push("### Low", ...recs.Low.map(recLine))
     if (recLines.length === 0) recLines.push("- No security detections triggered — no corrective security recommendations. Network-health observations above (retransmissions, estimated loss, RTT, RST) are informational network diagnostics, NOT security findings, and do not change this recommendation.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable, verdictStatusHint), `- ${conclusionText}`)
@@ -929,7 +934,8 @@ export default function ReportsPage() {
                   // normalization must never hide the strongest finding
                   // (a 39/100 LOW score with a HIGH finding reads as HIGH present).
                   { label: "Highest Finding", value: highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5)${verdictStatusHint ? " · unconfirmed" : ""}` : "None", icon: ShieldAlert, color: highestSev >= 4 ? "text-danger" : "text-muted-foreground" },
-                  { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
+                  // Explicit measurement window (QA: long.pcapng peak labels).
+                  { label: bwInterval ? `Peak ${bwIntervalLabel} rate` : "Peak rate (whole capture)", value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
                   { label: "Avg Packet Size", value: avgPacketBytes + " B", icon: Package, color: "text-muted-foreground" },
                 ].map(({ label, value, color }) => (
                   <Card key={label}>
@@ -969,7 +975,10 @@ export default function ReportsPage() {
                         { label: "Avg Packets/s", value: ratesAvailable ? (packets.length / durationSec).toFixed(1) : "N/A" },
                         { label: "Avg Throughput", value: advancedMetrics ? rateLabel(advancedMetrics.throughputAvg) : "N/A" },
                         { label: "Avg Packet Size", value: avgPacketBytes + " bytes" },
-                        { label: `Peak Bandwidth (${bwIntervalLabel} interval)`, value: rateLabel(peakBandwidth) },
+                        // Explicit measurement window: "Peak Bandwidth" alone
+                        // never says what second-scale the peak is measured
+                        // over (QA: long.pcapng peak labels).
+                        { label: bwInterval ? `Peak ${bwIntervalLabel} rate` : "Peak rate (whole capture)", value: rateLabel(peakBandwidth) },
                         { label: "Source IPs", value: uniqueSrcIps.toLocaleString() },
                         { label: "Dest IPs", value: uniqueDstIps.toLocaleString() },
                       ].map(({ label, value }) => (
@@ -1795,8 +1804,8 @@ export default function ReportsPage() {
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     {[
                       { label: "Risk Score", value: riskValue(), color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))), icon: AlertTriangle, sub: !undecodable && scoreVal === 0 ? "no configured detection rule triggered — not a compromise probability" : (!undecodable && verdictStatusHint ? "rule-engine score, not a probability of compromise" : undefined) },
-                      { label: "Throughput Avg", value: rateLabel(advancedMetrics.throughputAvg), color: "text-info", icon: BarChart3 },
-                      { label: "Throughput Peak (100 ms window)", value: rateLabel(advancedMetrics.throughputPeak100ms ?? null), color: "text-chart-2", icon: BarChart3 },
+                      { label: "Avg rate (capture span)", value: rateLabel(advancedMetrics.throughputAvg), color: "text-info", icon: BarChart3 },
+                      { label: "Peak 100-ms rate", value: rateLabel(advancedMetrics.throughputPeak100ms ?? null), color: "text-chart-2", icon: BarChart3 },
                        { label: "Burst", value: advancedMetrics.burst?.detected ? "Detected" : "Not Detected", color: advancedMetrics.burst?.detected ? "text-danger" : "text-success", icon: Zap, sub: advancedMetrics.burst?.detected ? `${advancedMetrics.burst.ratio.toFixed(1)}× average · ${advancedMetrics.burst.duration.toFixed(1)} s` : undefined },
                     ].map(({ label, value, color, icon: Icon, sub }) => (
                       <Card key={label}>
@@ -2139,7 +2148,7 @@ export default function ReportsPage() {
                             {recs.High.map((r, i) => (
                               <div key={i} className="flex gap-2 text-sm">
                                 <AlertTriangle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
-                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
+                                <span>{r.priority && <Badge variant="warning" className="mr-1.5 align-middle text-[10px]">{r.priority}</Badge>}{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
                               </div>
                             ))}
                           </div>
@@ -2152,7 +2161,7 @@ export default function ReportsPage() {
                             {recs.Medium.map((r, i) => (
                               <div key={i} className="flex gap-2 text-sm">
                                 <AlertTriangle className="h-4 w-4 text-warning shrink-0 mt-0.5" />
-                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
+                                <span>{r.priority && <Badge variant="warning" className="mr-1.5 align-middle text-[10px]">{r.priority}</Badge>}{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
                               </div>
                             ))}
                           </div>
@@ -2165,7 +2174,7 @@ export default function ReportsPage() {
                             {recs.Low.map((r, i) => (
                               <div key={i} className="flex gap-2 text-sm">
                                 <AlertTriangle className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
-                                <span>{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
+                                <span>{r.priority && <Badge variant="warning" className="mr-1.5 align-middle text-[10px]">{r.priority}</Badge>}{r.text} <span className="text-[10px] text-muted-foreground whitespace-nowrap">({findingSourceLabel(r.source, r.status)})</span></span>
                               </div>
                             ))}
                           </div>

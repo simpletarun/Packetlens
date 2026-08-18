@@ -151,6 +151,15 @@ it("IOC sources: signature-backed type is CONFIRMED_ALERT; flag types are CONFIR
     expect(beaconRec!.severity).toBe(beaconAlert.severity)
     expect(dnsRec!.source).toBe("CONFIRMED_ALERT")
     expect(dnsRec!.severity).toBe(dnsTunnelAlert.severity)
+    // Legacy alerts (no status) default to CONFIRMED — established findings
+    // keep no INVESTIGATE override; a SUSPECTED backing gets INVESTIGATE.
+    expect(beaconRec!.priority).toBeUndefined()
+    const suspected = buildReportAnalysis({
+      ...state,
+      alerts: [...state.alerts, { ...beaconAlert, status: "SUSPECTED" as const }, { ...dnsTunnelAlert, status: "SUSPECTED" as const }],
+    })
+    expect(suspected.recommendations.find((r) => r.text.includes("Periodic communication"))!.priority).toBe("INVESTIGATE")
+    expect(suspected.recommendations.find((r) => r.text.includes("Unusual DNS query"))!.priority).toBe("INVESTIGATE")
     const flagsOnly = buildReportAnalysis(state)
     expect(flagsOnly.recommendations.find((r) => r.text.includes("Unusual DNS query"))!.source).toBe("BEHAVIORAL_METRIC")
   })
@@ -973,7 +982,7 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
 
 it("verdictLine renders per-class text: SAFE becomes NO DETECTIONS; LOW/MEDIUM/HIGH/CRITICAL and UNKNOWN on undecodable", () => {
     expect(verdictLine("SAFE", 0, false)).toBe("- **Final verdict:** **NO DETECTIONS** \u2014 risk 0/100 \u2014 no configured detection rules triggered (absence of detection is not proof of a clean network)")
-    expect(verdictLine("LOW", 12, false)).toBe("- **Final verdict:** **LOW** \u2014 risk 12/100")
+    expect(verdictLine("LOW", 12, false)).toBe("- **Final verdict:** **LOW** \u2014 risk 12/100 \u2014 risk 12/100 is in the SAFE score band; the verdict level is the strongest finding's rule severity (1\u20135), not the score band")
     expect(verdictLine("MEDIUM", 55, false)).toBe("- **Final verdict:** **MEDIUM** \u2014 risk 55/100")
     expect(verdictLine("HIGH", 73, false)).toBe("- **Final verdict:** **HIGH** \u2014 risk 73/100")
     expect(verdictLine("CRITICAL", 86, false)).toBe("- **Final verdict:** **CRITICAL** \u2014 risk 86/100")
@@ -1426,9 +1435,12 @@ describe("detection status is the ONE source of truth across every report layer 
     const ioc = r.iocs.find((i) => i.ruleId === "DATA-EXFIL-001")
     expect(ioc).toBeDefined()
     expect(ioc!.status).toBe("SUSPECTED")
-    const rec = r.recommendations.find((x) => x.text.includes("Investigate large outbound transfers"))
+    const rec = r.recommendations.find((x) => x.text.includes("Investigate the flagged outbound transfer"))
     expect(rec).toBeDefined()
     expect(rec!.status).toBe("SUSPECTED")
+    // A SUSPECTED behavioral finding is INVESTIGATE-priority: the rec must
+    // never read as a blocking mandate (QA: long.pcapng "consider blocking").
+    expect(rec!.priority).toBe("INVESTIGATE")
     expect(r.mitre).toHaveLength(0)
     const conclusion = analystConclusion({ ...base, alerts: [alert], score: 40 })
     expect(conclusion).toContain("1 suspected finding detected (Suspected Large Outbound Transfer)")
@@ -1448,8 +1460,11 @@ describe("detection status is the ONE source of truth across every report layer 
     const mitre = r.mitre.find((m) => m.id === "T1041")
     expect(mitre).toBeDefined()
     expect(mitre!.status).toBe("CONFIRMED")
-    const rec = r.recommendations.find((x) => x.text.includes("Investigate large outbound transfers"))
+    const rec = r.recommendations.find((x) => x.text.includes("Investigate the flagged outbound transfer"))
     expect(rec!.status).toBe("CONFIRMED")
+    // A CONFIRMED finding keeps no INVESTIGATE downgrade — the priority
+    // override exists only for behavioral (unconfirmed) findings.
+    expect(rec!.priority).toBeUndefined()
     const conclusion = analystConclusion({ ...base, alerts: [alert], score: 40 })
     expect(conclusion).toContain("1 confirmed finding detected (Suspected Large Outbound Transfer)")
     expect(conclusion).not.toContain("No findings were confirmed")

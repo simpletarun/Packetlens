@@ -214,6 +214,11 @@ describe("PCAP parser", () => {
     // Payload with the cookie at offset 4, from the client side too.
     const req = await parsePcap(buildUdpPcap(40000, 3478, stunBindingResponse()))
     expect(req.packets[0].appProtocol).toBe("STUN")
+    // A cookie-verified STUN label is PAYLOAD evidence: it must carry
+    // appPayloadConfirmed like HTTP/TLS/DNS, so flow protocolSource and the
+    // exfil detector can trust it (QA: long.pcapng cookie-verified STUN read
+    // as port-inferred and fired DATA-EXFIL-001 on a byte ratio).
+    expect(req.packets[0].appPayloadConfirmed).toBe(true)
   })
 
   it("walks IPv6 extension headers to the real transport (HOPOPT → TCP)", async () => {

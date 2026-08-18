@@ -509,6 +509,10 @@ interface Recommendation {
   source: FindingSource
   /** Detection status of the backing alert (undefined = legacy/metric). */
   status?: DetectionStatus
+  /** Action urgency — behavioral (SUSPECTED) findings are INVESTIGATE, never
+   *  "block now": they prove a pattern, not malice (QA: long.pcapng exfil
+   *  rec read as an aggressive blocking mandate for one suspected STUN flow). */
+  priority?: "IMMEDIATE" | "INVESTIGATE" | "MONITOR"
 }
 
 export interface NotableDestination {
@@ -734,27 +738,43 @@ function buildRecommendations(
   const items: Recommendation[] = []
   if (!advancedMetrics) return items
   if (advancedMetrics.dataExfiltrationSuspected) {
+    const exfil = flagRec(alerts, "DATA-EXFIL-001", 4)
     items.push({
-      text: "Investigate large outbound transfers to external IPs. Consider blocking suspicious destinations and implementing egress filtering.",
-      ...flagRec(alerts, "DATA-EXFIL-001", 4),
+      // Evidence-specific, never generic: the alert evidence names the exact
+      // flow (endpoints, service, bytes, window), and a SUSPECTED behavioral
+      // finding warrants investigation — blocking comes only after the
+      // destination is confirmed unauthorized (QA: long.pcapng rec said
+      // "consider blocking suspicious destinations" for one suspected STUN
+      // flow with no payload evidence).
+      text: "Investigate the flagged outbound transfer cited in the DATA-EXFIL-001 alert evidence (exact flow, endpoints, service, bytes and window). The finding is directional byte-ratio behavior only — no payload evidence of exfiltration — so validate the traffic (media/STUN sessions, cloud sync and backups legitimately upload) before acting; block the destination only after confirming it is unauthorized or malicious, and review egress filtering.",
+      ...exfil,
+      // SUSPECTED/LIKELY (behavioral) findings get INVESTIGATE, not a
+      // blocking mandate; a CONFIRMED finding keeps no priority override.
+      priority: exfil.status === "CONFIRMED" ? undefined : "INVESTIGATE",
     })
   }
   if (advancedMetrics.dnsTunnelingSuspected) {
+    const dns = flagRec(alerts, "DNS-TUNNEL-001", 4)
     items.push({
       text: "Unusual DNS query patterns detected. Monitor DNS traffic for encoded data and consider implementing DNS security policies.",
-      ...flagRec(alerts, "DNS-TUNNEL-001", 4),
+      ...dns,
+      priority: dns.status === "CONFIRMED" ? undefined : "INVESTIGATE",
     })
   }
   if (advancedMetrics.beaconDetected) {
+    const beacon = flagRec(alerts, "C2-BEACON-001", 3)
     items.push({
       text: "Periodic communication patterns detected. Investigate for C2 activity and malware beaconing behavior.",
-      ...flagRec(alerts, "C2-BEACON-001", 3),
+      ...beacon,
+      priority: beacon.status === "CONFIRMED" ? undefined : "INVESTIGATE",
     })
   }
   if (advancedMetrics.portScanEnhanced) {
+    const scan = flagRec(alerts, "PORT-SCAN-001", 3)
     items.push({
       text: "Port scan activity detected. Block source IPs and review firewall rules.",
-      ...flagRec(alerts, "PORT-SCAN-001", 3),
+      ...scan,
+      priority: scan.status === "CONFIRMED" ? undefined : "INVESTIGATE",
     })
   }
   // Credential exposure recommendations no longer ride on a T1040 MITRE row
@@ -1334,12 +1354,16 @@ export function verdictLine(levelLabel: string, scoreVal: number, undecodable: b
   // from reading as a confirmed incident (QA: open.pcapng "53/100 CRITICAL"
   // with "No findings were confirmed").
   const displayLabel = levelLabel === "SAFE" ? "NO DETECTIONS" : levelLabel
-  // When an unconfirmed (SUSPECTED/LIKELY) strongest finding floors the
-  // verdict, the level is the finding's SEVERITY, not the score band — the
-  // line must never read "73/100 CRITICAL" as if 73 itself were the critical
-  // band (QA: my.pcapng "73/100 CRITICAL — unconfirmed" conflated score,
-  // severity and confidence).
-  const floorNote = statusHint ? " — the verdict level is the strongest finding's rule severity (1–5), not the 0–100 risk-score band" : ""
+  // When the verdict level is the strongest finding's SEVERITY, not the score
+  // band, the line must never read "53/100 CRITICAL" as if 53 itself were the
+  // critical band (QA: my.pcapng "73/100 CRITICAL — unconfirmed" and
+  // open.pcapng "53/100 CRITICAL" conflated score, severity and confidence).
+  // The band note fires exactly when they differ: SAFE/LOW/MEDIUM/HIGH/CRITICAL
+  // scores that sit in their own band carry no note.
+  const band = undecodable ? null : riskLevel(scoreVal).label
+  const floorNote = !undecodable && levelLabel !== "SAFE" && band !== null && band !== levelLabel
+    ? ` — risk ${scoreVal}/100 is in the ${band} score band; the verdict level is the strongest finding's rule severity (1–5), not the score band`
+    : ""
   return `- **Final verdict:** **${displayLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered (absence of detection is not proof of a clean network)" : ""}${statusHint}${floorNote}`
 }
 

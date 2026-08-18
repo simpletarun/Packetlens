@@ -296,6 +296,21 @@ export interface AnalysisAdvancedMetrics {
   ja3Suspicious: boolean
   dnsTunnelEvidence?: string
   beaconEvidence?: string
+  /** Detection time of each behavioral flag — the last triggering packet's
+   *  epoch seconds — so the flag alerts carry evidence timestamps, not the
+   *  capture end (QA: long.pcapng DATA-EXFIL-001 was stamped 11:29:18 =
+   *  capture end while the flagged flow ended 05:54:28 UTC). Undefined =
+   *  evidence lost (legacy/mock data) — the caller falls back to capture end. */
+  dataExfilDetectedAtSec?: number
+  beaconDetectedAtSec?: number
+  dnsTunnelDetectedAtSec?: number
+  ja3DetectedAtSec?: number
+  /** Real endpoints when exactly ONE conversation/host triggered the flag —
+   *  "multiple → external" must not hide a single flow (QA: long.pcapng
+   *  alert header hid flow-85's endpoints). Undefined = multiple sources. */
+  dataExfilEndpoints?: { srcIp: string; dstIp: string }
+  beaconEndpoints?: { srcIp: string; dstIp: string }
+  ja3Endpoints?: { srcIp: string; dstIp: string }
   topTalkers: { ip: string; bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }[]
   iocs: { type: string; value: string; description: string; severity: number; ruleId?: string }[]
   mitreMappings: { technique: string; id: string; description: string; severity: number }[]
@@ -1676,25 +1691,35 @@ function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
 // analyzer/src/threat/mod.rs.
 export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, existing: number, captureEndSec?: number): AnalysisThreat[] {
   const out: AnalysisThreat[] = []
-  const push = (ruleId: string, signature: string, category: string, severity: number, confidence: number, evidence: string) => {
+  const push = (
+    ruleId: string, signature: string, category: string, severity: number, confidence: number, evidence: string,
+    opts: { atSec?: number; srcIp?: string; dstIp?: string } = {},
+  ) => {
     out.push({
       id: `alert-${existing + out.length + 1}`,
       // The Rust engine stamps alerts with the last triggering packet's time
-      // (stats.flow_end) — mirror that with the capture end, never "now".
-      timestamp: safeIso((captureEndSec ?? Date.now() / 1000) * 1000),
+      // (stats.flow_end). The local path mirrors that with each rule's own
+      // evidence time (the flow/packet that tripped it — flow end for exfil
+      // and beacon, last suspicious query for DNS tunnel, last oversized-SNI
+      // packet for TLS-SUSPICIOUS), falling back to the capture end when the
+      // evidence time was lost (legacy/mock data). Never "now" (QA:
+      // long.pcapng alert stamped at capture end, timeline dot at 11:25).
+      timestamp: safeIso((opts.atSec ?? captureEndSec ?? Date.now() / 1000) * 1000),
       signature, category, severity, confidence, ruleId,
       // Behavioral heuristics are SUSPECTED by definition: they aggregate
       // traffic patterns, not payload proof — "confirmed" would overstate.
       status: 'SUSPECTED',
       evidenceQuality: 'MEDIUM',
-      srcIp: 'multiple', dstIp: 'external', srcPort: 0, dstPort: 0,
+      // A single triggering conversation names its real endpoints on the
+      // header ("192.168.1.10 → 116.119.214.99", not "multiple → external").
+      srcIp: opts.srcIp ?? 'multiple', dstIp: opts.dstIp ?? 'external', srcPort: 0, dstPort: 0,
       protocol: 'TCP', evidence,
     })
   }
-  if (advancedMetrics.dnsTunnelingSuspected) push('DNS-TUNNEL-001', 'Possible DNS Tunneling', 'Exfiltration', 4, 80, advancedMetrics.dnsTunnelEvidence ?? 'DNS tunneling behavior detected')
-  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Suspected Large Outbound Transfer', 'Exfiltration', 5, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs')
-  if (advancedMetrics.beaconDetected) push('C2-BEACON-001', 'Regular Beaconing Detected', 'Command and Control', 5, 65, advancedMetrics.beaconEvidence ?? 'C2 beaconing behavior detected')
-  if (advancedMetrics.ja3Suspicious) push('TLS-SUSPICIOUS-001', 'Suspicious TLS Certificate', 'Command and Control', 2, 75, 'Suspicious TLS fingerprint or oversized SNI')
+  if (advancedMetrics.dnsTunnelingSuspected) push('DNS-TUNNEL-001', 'Possible DNS Tunneling', 'Exfiltration', 4, 80, advancedMetrics.dnsTunnelEvidence ?? 'DNS tunneling behavior detected', { atSec: advancedMetrics.dnsTunnelDetectedAtSec })
+  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Suspected Large Outbound Transfer', 'Exfiltration', 5, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs', { atSec: advancedMetrics.dataExfilDetectedAtSec, srcIp: advancedMetrics.dataExfilEndpoints?.srcIp, dstIp: advancedMetrics.dataExfilEndpoints?.dstIp })
+  if (advancedMetrics.beaconDetected) push('C2-BEACON-001', 'Regular Beaconing Detected', 'Command and Control', 5, 65, advancedMetrics.beaconEvidence ?? 'C2 beaconing behavior detected', { atSec: advancedMetrics.beaconDetectedAtSec, srcIp: advancedMetrics.beaconEndpoints?.srcIp, dstIp: advancedMetrics.beaconEndpoints?.dstIp })
+  if (advancedMetrics.ja3Suspicious) push('TLS-SUSPICIOUS-001', 'Suspicious TLS Certificate', 'Command and Control', 2, 75, 'Suspicious TLS fingerprint or oversized SNI', { atSec: advancedMetrics.ja3DetectedAtSec, srcIp: advancedMetrics.ja3Endpoints?.srcIp, dstIp: advancedMetrics.ja3Endpoints?.dstIp })
   return out
 }
 
@@ -1913,7 +1938,7 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       dstNames.set(p.dstIp, set)
     }
   }
-  const beaconEvidence = (() => {
+  const beaconMeta = (() => {
     // Flows key lexicographically, so "dstIp" is NOT always the server: for a
     // client 192.168.x talking to 8.8.8.8 the flow srcIp IS 8.8.8.8. Group by
     // the REMOTE endpoint instead — the side that is not the local host (a
@@ -1972,12 +1997,37 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         const portless = list.every((f) => f.srcPort === 0 && f.dstPort === 0)
         const noun = list.every((f) => f.protocol === 'TCP') ? 'connections' : 'flows'
         const target = portless ? remoteIpOf.get(key)! : key
-        return `${list.length} ${noun} to ${target} at ~${mean.toFixed(1)}s intervals (σ ${Math.sqrt(variance).toFixed(2)}s, CV ${cv.toFixed(3)})`
+        // Evidence time = the LAST triggering flow's end — the beacon alert
+        // must point at the conversation that tripped it, not the capture end
+        // (QA: long.pcapng alerts stamped at capture end).
+        let lastEnd = -Infinity
+        for (const f of list) {
+          const t = new Date(f.endTime).getTime() / 1000
+          if (Number.isFinite(t) && t > lastEnd) lastEnd = t
+        }
+        return {
+          evidence: `${list.length} ${noun} to ${target} at ~${mean.toFixed(1)}s intervals (σ ${Math.sqrt(variance).toFixed(2)}s, CV ${cv.toFixed(3)})`,
+          flows: list,
+          remoteIp: remoteIpOf.get(key)!,
+          lastEndSec: lastEnd === -Infinity ? undefined : lastEnd,
+        }
       }
     }
-    return ''
+    return { evidence: '', flows: [] as AnalysisFlow[], remoteIp: '', lastEndSec: undefined }
   })()
+  const beaconEvidence = beaconMeta.evidence
   const beaconDetected = beaconEvidence !== ''
+  const beaconDetectedAtSec = beaconDetected ? beaconMeta.lastEndSec : undefined
+  // A beacon to a single remote host names the LOCAL side too: all triggering
+  // flows share the remote by construction, and the local endpoint is the
+  // non-remote side of the first flow (localIps makes a delegated v6 local).
+  const beaconEndpoints = beaconDetected && beaconMeta.flows.length > 0
+    ? (() => {
+        const f = beaconMeta.flows[0]
+        const local = localIps.has(f.srcIp) || isPrivateIp(f.srcIp) ? f.srcIp : f.dstIp
+        return { srcIp: local, dstIp: beaconMeta.remoteIp }
+      })()
+    : undefined
 
   // DNS tunneling: queries with very long or high-entropy labels (encoded
   // data), or a sustained abnormal query rate. Ordinary dotted names — any
@@ -2017,6 +2067,15 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         ? `${dnsQueries.length} queries at ${dnsRate.toFixed(1)}/s sustained (${new Set(dnsQueries).size} domains)`
         : ''
   const dnsTunnelingSuspected = dnsTunnelEvidence !== ''
+  // Evidence time = the LAST suspicious query packet (the behavior's final
+  // trigger), so the DNS-TUNNEL alert points at the traffic, not capture end.
+  const suspiciousSet = new Set(suspiciousDns)
+  let dnsTunnelDetectedAtSec: number | undefined
+  for (const p of raw) {
+    if (p.dnsQuery && suspiciousSet.has(p.dnsQuery) && (dnsTunnelDetectedAtSec === undefined || p.timestamp > dnsTunnelDetectedAtSec)) {
+      dnsTunnelDetectedAtSec = p.timestamp
+    }
+  }
 
   // Upload-style exfiltration: a private host SENDING > spec threshold
   // outward, at least 5× what it receives. Triggering on bytesTotal flags
@@ -2043,12 +2102,37 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       pub: privateIsSrc ? f.dstIp : f.srcIp,
     }
   }
+  // Payload-VERIFIED STUN (RFC 5389 magic cookie decoded in the payload) is a
+  // confirmed NAT-traversal/media-session helper — its sustained uploads are
+  // signaling/keepalive behavior, not exfiltration evidence, and calling it
+  // DATA-EXFIL-001 on a byte ratio reads as a false positive. The exclusion
+  // is deliberately narrow: a STUN label inferred only from port 3478 is NOT
+  // excluded, because anything could sit on that well-known port (QA:
+  // long.pcapng — one payload-confirmed STUN session fired DATA-EXFIL-001).
+  const verifiedStun = (f: AnalysisFlow) => f.appProtocol === "STUN" && f.protocolSource === "PAYLOAD_CONFIRMED"
   const externalFlows = flows
     .map((f) => ({ f, d: exfilDirection(f) }))
     .filter((x): x is { f: AnalysisFlow; d: NonNullable<ReturnType<typeof exfilDirection>> } =>
-      x.d !== null && x.d.out > RISK_PARAMS.data_exfil_min_bytes && x.d.out > 5 * x.d.in
+      x.d !== null && !verifiedStun(x.f) && x.d.out > RISK_PARAMS.data_exfil_min_bytes && x.d.out > 5 * x.d.in
     )
   const dataExfiltrationSuspected = externalFlows.length > 0
+  // Evidence time = the last contributing flow's end — the alert must point
+  // at the conversation that tripped it, never the capture end (QA:
+  // long.pcapng alert stamped 11:29:18 = capture end; flow ended 05:54:28Z).
+  const dataExfilDetectedAtSec = (() => {
+    let last = -Infinity
+    for (const { f } of externalFlows) {
+      const t = new Date(f.endTime).getTime() / 1000
+      if (Number.isFinite(t) && t > last) last = t
+    }
+    return last === -Infinity ? undefined : last
+  })()
+  // One contributing flow → the alert header names the real endpoints
+  // (priv → pub) instead of "multiple → external" (QA: long.pcapng header
+  // hid flow-85's endpoints next to "Top flow: flow-85" in the evidence).
+  const dataExfilEndpoints = externalFlows.length === 1
+    ? { srcIp: externalFlows[0].d.priv, dstIp: externalFlows[0].d.pub }
+    : undefined
   // The evidence names the exact flow (id, ports, protocol, packets, bytes,
   // duration) so the alert is investigable without a second query, and states
   // explicitly what the rule does and does not prove: the byte counts include
@@ -2063,7 +2147,26 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         const proto = f.appProtocol && f.appProtocol !== "UNKNOWN" ? f.appProtocol : f.protocol
         const retransNote = f.retrans ? `, including ${f.retrans} retransmitted segment(s) as captured` : ""
         const dur = Number.isFinite(f.duration) ? f.duration : 0
-        return `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received). Top flow: ${f.id} — ${d.priv}:${privPort} → ${d.pub}:${pubPort} (${proto}), ${(d.out / 1024).toFixed(0)} KB sent vs ${(d.in / 1024).toFixed(1)} KB received, ${f.packets} packets over ${dur.toFixed(1)}s${retransNote}. Directional byte-ratio behavior only — no payload evidence of what the data was; the destination is not established as malicious`
+        // Payload evidence honesty: how many of the flow's packets were
+        // actually payload-verified (STUN = RFC 5389 cookie verified) vs
+        // merely port-inferred — the analyst must see the gap between the
+        // service label and the verification (QA: long.pcapng STUN context).
+        // The flow's canonical key matches flowKeyOf(p) over raw packets.
+        const flowKey = (fl: AnalysisFlow) => {
+          const a = fl.srcIp, b = fl.dstIp, ap = fl.srcPort, bp = fl.dstPort
+          return a < b || (a === b && ap < bp)
+            ? `${a}|${b}|${ap}|${bp}|${fl.protocol}`
+            : `${b}|${a}|${bp}|${ap}|${fl.protocol}`
+        }
+        let verified = 0
+        const key = flowKey(f)
+        for (const p of raw) {
+          if (flowKeyOf(p) === key && p.appPayloadConfirmed) verified++
+        }
+        const payloadNote = proto === "STUN"
+          ? `, STUN payload evidence: ${verified} of ${f.packets} packets RFC-5389-cookie-verified`
+          : `, payload evidence: ${verified} of ${f.packets} packets payload-verified (${f.protocolSource ?? "PORT_INFERRED"})`
+        return `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received). Top flow: ${f.id} — ${d.priv}:${privPort} → ${d.pub}:${pubPort} (${proto}), ${(d.out / 1024).toFixed(0)} KB sent vs ${(d.in / 1024).toFixed(1)} KB received, ${f.packets} packets over ${dur.toFixed(1)}s${retransNote}${payloadNote}; flow window ${f.startTime} → ${f.endTime} UTC. Directional byte-ratio behavior only — no payload evidence of what the data was; the destination is not established as malicious`
       })()
     : ''
 
@@ -2075,7 +2178,16 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     (p.srcIp ?? '').startsWith('185.220.101.') || (p.dstIp ?? '').startsWith('185.220.101.')
   )
 
-  const ja3Suspicious = raw.some(p => p.tlsSni && p.tlsSni.length > 100)
+  const ja3SuspiciousPackets = raw.filter(p => p.tlsSni && p.tlsSni.length > 100)
+  const ja3Suspicious = ja3SuspiciousPackets.length > 0
+  // Evidence time = the LAST oversized-SNI packet; a single such packet names
+  // the exact endpoints on the alert header.
+  const ja3DetectedAtSec = ja3SuspiciousPackets.length > 0
+    ? Math.max(...ja3SuspiciousPackets.map(p => p.timestamp))
+    : undefined
+  const ja3Endpoints = ja3SuspiciousPackets.length === 1
+    ? { srcIp: ja3SuspiciousPackets[0].srcIp || 'multiple', dstIp: ja3SuspiciousPackets[0].dstIp || 'external' }
+    : undefined
 
   const portScanEnhanced = threats.some(t => t.signature === 'Port Scan Detected')
 
@@ -2140,6 +2252,13 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     ja3Suspicious,
     dnsTunnelEvidence,
     beaconEvidence,
+    dataExfilDetectedAtSec,
+    beaconDetectedAtSec,
+    dnsTunnelDetectedAtSec,
+    ja3DetectedAtSec,
+    dataExfilEndpoints,
+    beaconEndpoints,
+    ja3Endpoints,
     topTalkers,
     iocs,
     mitreMappings,
