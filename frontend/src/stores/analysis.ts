@@ -76,6 +76,12 @@ export interface Flow {
   rstCount?: number
   rttMs?: number
   lossPct?: number
+  // Observed TCP data segments (payload-carrying packets, both directions
+  // summed) — the exact denominator of lossPct. Exposed on the flow so the
+  // report's loss estimate and confidence can cite the real sample instead
+  // of the total packet count (QA: "1 of 19 packets = 10%" was 1 of 10
+  // data segments; confidence came from the wrong sample).
+  dataSegments?: number
 }
 
 export interface Session {

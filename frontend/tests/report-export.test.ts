@@ -69,7 +69,7 @@ function parseCsv(text: string): string[][] {
   return rows
 }
 
-const HEADER = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct"
+const HEADER = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,dataSegments,estLossPct"
 
 describe("report export data layer parity — every capture must feed the export the same numbers the engine computed", () => {
   const files = corpusFiles()

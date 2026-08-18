@@ -66,13 +66,19 @@ export interface AnalysisFlow {
   // instead of implying a zero-byte or symmetric conversation (QA: large/verylarge).
   directionUnknown?: boolean
   // v3.2 TCP health (TCP flows only): retransmitted segments, out-of-order
-  // segments, zero-window advertisements, RST count, handshake RTT (ms) and
-  // loss % (retrans/data segments). Absent on UDP traffic.
+  // segments, zero-window advertisements, RST count, handshake RTT (ms),
+  // observed TCP data segments and loss % (retrans/data segments, both
+  // directions summed). Absent on UDP traffic. dataSegments is the ONLY
+  // denominator the loss percentage may be read against — the flow's total
+  // packet count includes handshake and pure-ACK control segments that carry
+  // no retransmission evidence (QA: call.pcapng 1 retrans / 10 data segments
+  // read as "1 of 19 packets = 10%").
   retrans?: number
   ooo?: number
   zeroWindow?: number
   rstCount?: number
   rttMs?: number
+  dataSegments?: number
   lossPct?: number
   // Protocol honesty: how the app-layer label was obtained. "PAYLOAD_CONFIRMED"
   // = at least one packet's app protocol was confirmed by payload content
@@ -531,6 +537,7 @@ interface TcpHealth {
   zeroWindow: number
   rstCount: number
   rttMs?: number
+  dataSegments: number
   lossPct?: number
 }
 function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
@@ -571,10 +578,54 @@ function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
   }
   const lossPct = dataSegments === 0 ? null : Math.round((retrans / dataSegments) * 1000) / 10
   return {
-    retrans, ooo, zeroWindow, rstCount,
+    retrans, ooo, zeroWindow, rstCount, dataSegments,
     ...(rttMs !== null ? { rttMs } : {}),
     ...(lossPct !== null ? { lossPct } : {}),
   }
+}
+
+// CANONICAL retransmission-based loss estimate — the ONE function every
+// surface (TCP Health card, network-health observation, CSV, PDF) reads the
+// estimate from. The denominator is the observed TCP DATA-SEGMENT count, never
+// the flow's total packet count: control segments (SYN/SYN-ACK/ACK/FIN/RST)
+// carry no retransmission evidence, so "1 retransmission ÷ 6 packets" is a
+// category error (QA: my.pcapng 1 retrans / 2 data segments = 50% read as
+// "1/6 = 16.7%" from the displayed 6 packets).
+// Confidence scales with the DATA-SEGMENT sample, not total packets — a flow
+// of 100 pure-ACK packets over 2 data segments has a 2-segment estimate, so
+// LOW (QA: 100 ACKs + 2 data segments were rated HIGH by packet count).
+// lossPct comes from the flow's canonical value (set once in tcpHealth, one
+// decimal place); it is never recomputed by consumers. Percentages are not
+// used as inputs to any further calculation.
+export interface TcpLossEstimate {
+  /** Retransmitted data segments observed (both directions summed). */
+  retrans: number
+  /** Observed TCP data segments (both directions summed; includes the
+   *  retransmitted segments themselves). */
+  dataSegments: number
+  /** Total packets in the flow — includes control segments that are NOT loss
+   *  evidence; never the loss denominator. */
+  totalPackets: number
+  /** retrans / dataSegments, one decimal place, or null when not measurable. */
+  lossPct: number | null
+  /** Sample-size confidence on the data-segment count: >=100 HIGH, 20–99
+   *  MEDIUM, <20 LOW, null when not measurable. */
+  confidence: "HIGH" | "MEDIUM" | "LOW" | null
+  /** Human wording for the confidence tier, in the estimator so every
+   *  surface (card tooltip, observation, CSV comment) cites the same rule. */
+  confidenceReason: string | null
+  /** False when the flow carried no data segments (ACK-only, handshake-only,
+   *  empty flows) — never report a loss percentage for those. */
+  measurable: boolean
+}
+export function estimatedTcpLoss(f: AnalysisFlow): TcpLossEstimate {
+  const retrans = f.retrans ?? 0
+  const dataSegments = f.dataSegments ?? 0
+  const measurable = dataSegments > 0
+  const lossPct = measurable ? f.lossPct ?? Math.round((retrans / dataSegments) * 1000) / 10 : null
+  const confidence = measurable ? (dataSegments >= 100 ? "HIGH" : dataSegments >= 20 ? "MEDIUM" : "LOW") : null
+  const confidenceReason = confidence ? (confidence === "HIGH" ? `${dataSegments} data segments (≥100) — a large sample` : confidence === "MEDIUM" ? `${dataSegments} data segments (20–99) — a moderate sample` : `${dataSegments} data segments (<20) — the sample is small`) : null
+  return { retrans, dataSegments, totalPackets: f.packets, lossPct, confidence, confidenceReason, measurable }
 }
 
 // Observed TCP flags per conversation — the session state machine's input.

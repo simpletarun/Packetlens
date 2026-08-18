@@ -1154,6 +1154,19 @@ function servicePortOf(a: number, b: number): number | undefined {
   if (a >= EPHEMERAL_PORT_MIN) return undefined
   return a
 }
+// Percentage-of-whole label with a truthful floor: a nonzero share below
+// 0.05% renders "<0.1%" (never a misleading "0%"), everything else rounds to
+// one decimal. The rounding rule is centralized so every card/table rounds
+// the same way and no table can imply 100% coverage of a larger whole
+// (QA: my.pcapng Top Ports rounded 74%/25% looked like the full 8,068
+// packets while 32 port-less packets sat outside the table).
+export function sharePctLabel(part: number, whole: number): string {
+  if (whole <= 0) return "\u2014"
+  const pct = (part / whole) * 100
+  if (pct <= 0) return part > 0 ? "<0.1%" : "0%"
+  return pct < 0.05 ? "<0.1%" : `${pct.toFixed(1)}%`
+}
+
 export function servicePortCounts(packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string }[]): ServicePortCount[] {
   // Per-conversation pass first: decide the service port ONCE per
   // conversation (deterministic per port pair), counting its packets and
@@ -1321,7 +1334,13 @@ export function verdictLine(levelLabel: string, scoreVal: number, undecodable: b
   // from reading as a confirmed incident (QA: open.pcapng "53/100 CRITICAL"
   // with "No findings were confirmed").
   const displayLabel = levelLabel === "SAFE" ? "NO DETECTIONS" : levelLabel
-  return `- **Final verdict:** **${displayLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered (absence of detection is not proof of a clean network)" : ""}${statusHint}`
+  // When an unconfirmed (SUSPECTED/LIKELY) strongest finding floors the
+  // verdict, the level is the finding's SEVERITY, not the score band — the
+  // line must never read "73/100 CRITICAL" as if 73 itself were the critical
+  // band (QA: my.pcapng "73/100 CRITICAL — unconfirmed" conflated score,
+  // severity and confidence).
+  const floorNote = statusHint ? " — the verdict level is the strongest finding's rule severity (1–5), not the 0–100 risk-score band" : ""
+  return `- **Final verdict:** **${displayLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered (absence of detection is not proof of a clean network)" : ""}${statusHint}${floorNote}`
 }
 
 // Escaping for the standalone HTML report export. Escapes ONCE: the mdInline
@@ -1615,7 +1634,7 @@ export function buildFlowsCsv(
   geo: Map<string, GeoLocation> = new Map(),
   packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; flags?: string }[] = [],
 ): string {
-  const header = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,estLossPct"
+  const header = "srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,dataSegments,estLossPct"
   // Undecodable endpoints (unsupported encapsulation) keep a visible label
   // instead of a silent blank — a blank IP looks like a data loss bug (QA).
   const ipCell = (ip: string) => (ip === "\u2014" ? "Undecoded/unknown endpoint" : ip)
@@ -1660,6 +1679,7 @@ export function buildFlowsCsv(
       flowServiceEvidence(f, pkts),
       f.rttMs ?? "",
       f.retrans ?? "",
+      f.dataSegments ?? "",
       f.lossPct ?? "",
     ].map(csvCell).join(",")
   })
@@ -1676,7 +1696,8 @@ export function buildFlowsCsv(
     `# PacketLens ${BUILD_STAMP} · ${rows.length} flow${rows.length === 1 ? "" : "s"}`,
     "# Rows are initiator-first: the endpoint that sent the SYN (TCP) or the first observed packet is the left (srcIp) side; bytesSent/bytesRecv are relative to the initiator.",
     "# serviceEvidence: \"payload\" = every packet payload-verified; \"mixed\" = at least one packet payload-verified (partial verification still counts as confirmed); \"port\" = port-inferred only, never payload-verified.",
-    "# estLossPct: retransmissions / data segments, both directions summed — an ESTIMATE from the observed sample, not a measured loss rate; the retrans column is not split by direction. rttMs: TCP handshake RTT (SYN→SYN-ACK) when captured.",
+    "# estLossPct: retransmissions / dataSegments, both directions summed — an ESTIMATE from the observed sample, not a measured loss rate; dataSegments is the exact denominator (packets carrying TCP payload; control segments like SYN/ACK/FIN/RST carry no loss evidence, so packets > dataSegments is expected); the retrans column is not split by direction. rttMs: TCP handshake RTT (SYN→SYN-ACK) when captured.",
+    "# srcCountry/dstCountry: FLOW-level — the GeoIP country of the row's endpoint, per conversation. NOT the same aggregation as the report's packet-direction Top Countries (which counts each packet by its destination), so the two never sum identically and are not directly comparable.",
   ].join("\n")
   return "\uFEFF" + [comment, header, ...rows].join("\n")
 }

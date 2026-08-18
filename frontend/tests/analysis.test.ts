@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { analyzePcap, analysisProblems } from "@/lib/analysis"
+import { analyzePcap, analysisProblems, estimatedTcpLoss } from "@/lib/analysis"
 import { isPrivateIP } from "@/lib/map-data"
 import { enrichDeviceVendors } from "@/lib/oui-server"
 import type { PCAPResult, ParsedPacket } from "@/lib/pcap"
@@ -890,6 +890,40 @@ describe("Analysis engine", () => {
     expect(flow!.rstCount).toBe(1)
     expect(flow!.rttMs).toBe(2000)
     expect(flow!.lossPct).toBe(25) // 1 retrans / 4 data segments
+  })
+
+  it("estimatedTcpLoss is the single canonical loss estimator across every report surface", () => {
+    // The QA rule: the reported percentage MUST equal retrans / dataSegments
+    // (payload-carrying segments in BOTH directions), never retrans / packets
+    // — "1 retransmission of 19 packets" was mathematically 5.26%, yet the
+    // report said 10% (the real denominator was 10 data segments). Every
+    // surface (TCP Health card, network-health observation, CSV) consumes
+    // THIS function so the numbers can never diverge again.
+    expect(estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 19, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "", retrans: 1, dataSegments: 10, lossPct: 10 })).toEqual({ retrans: 1, dataSegments: 10, totalPackets: 19, lossPct: 10, confidence: "LOW", confidenceReason: "10 data segments (<20) — the sample is small", measurable: true })
+    // Zero retransmissions on a measurable sample is 0%, never null.
+    expect(estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 500, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "", retrans: 0, dataSegments: 500, lossPct: 0 })).toEqual({ retrans: 0, dataSegments: 500, totalPackets: 500, lossPct: 0, confidence: "HIGH", confidenceReason: "500 data segments (≥100) — a large sample", measurable: true })
+    // Confidence comes from the DATA-SEGMENT sample, never from total packets
+    // (QA: my.pcapng "MEDIUM confidence" from 73+ packets while the true
+    // denominator was 22 data segments).
+    expect(estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 73, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "", retrans: 1, dataSegments: 22, lossPct: 4.5 })).toEqual({ retrans: 1, dataSegments: 22, totalPackets: 73, lossPct: 4.5, confidence: "MEDIUM", confidenceReason: "22 data segments (20–99) — a moderate sample", measurable: true })
+    // Non-TCP and unmeasured TCP flows report null — the report then says
+    // "not measured", never a fabricated 0%.
+    expect(estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "UDP", packets: 50, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "" })).toEqual({ retrans: 0, dataSegments: 0, totalPackets: 50, lossPct: null, confidence: null, confidenceReason: null, measurable: false })
+    expect(estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 19, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "", retrans: 1, lossPct: 10 })).toEqual({ retrans: 1, dataSegments: 0, totalPackets: 19, lossPct: null, confidence: null, confidenceReason: null, measurable: false })
+  })
+
+  it("estimatedTcpLoss invariants: dataSegments >= retrans, loss never exceeds 100, sample floor at 1", () => {
+    // The estimator must be safe against any engine output: a zero-segment
+    // flow is not measurable, retrans without segments cannot happen in the
+    // engine, and confidence tiers are HIGH/MEDIUM/LOW only.
+    expect(estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "TCP", packets: 1, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "", retrans: 0, dataSegments: 0, lossPct: 0 })).toMatchObject({ measurable: false })
+    for (const segs of [1, 2, 19, 20, 99, 100, 250, 1000]) {
+      const est = estimatedTcpLoss({ id: "f", srcIp: "a", dstIp: "b", srcPort: 0, dstPort: 0, protocol: "TCP", packets: segs + 3, bytesTotal: 1, bytesSent: 1, bytesRecv: 0, duration: 1, startTime: "", endTime: "", retrans: 0, dataSegments: segs, lossPct: 0 })
+      expect(est.measurable).toBe(true)
+      expect(["HIGH", "MEDIUM", "LOW"]).toContain(est.confidence)
+      expect(est.lossPct).toBeGreaterThanOrEqual(0)
+      expect(est.lossPct).toBeLessThanOrEqual(100)
+    }
   })
 
   it("calibration: SSDP/mDNS/STUN-only capture stays SAFE", () => {

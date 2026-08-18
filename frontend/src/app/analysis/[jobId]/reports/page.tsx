@@ -9,8 +9,8 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, credentialEventCount, type DetectionStatus } from "@/lib/report"
-import { ANALYZER_VERSION, isNonUnicast } from "@/lib/analysis"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, sharePctLabel, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, credentialEventCount, type DetectionStatus } from "@/lib/report"
+import { ANALYZER_VERSION, isNonUnicast, estimatedTcpLoss } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -266,11 +266,15 @@ export default function ReportsPage() {
   const allPorts = useMemo(() => servicePortCounts(packets), [packets])
   const topPorts = allPorts.slice(0, 8)
   const portTotal = allPorts.reduce((s, e) => s + e.count, 0)
-  // P2P volume excluded from port attribution (conversations between two
-  // dynamic-range ports) — stated in the Top Ports note so the rule's effect
-  // is visible, not hidden (QA: rule text promised exclusion while UDP/40714
-  // kept 159 pkts from 49161→40714).
+  const displayedPortTotal = topPorts.reduce((s, e) => s + e.count, 0)
+  // Packet attribution is exhaustive: every packet is either ports-attributed,
+  // P2P dynamic-range (excluded from port attribution), or port-less
+  // (ARP/ICMP/ICMPv6/IGMP/GRE/… — covered by Top Protocols). The coverage is
+  // stated in the card note so the displayed rows can never be mistaken for
+  // all analyzed packets (QA: my.pcapng 8,036 of 8,068 packets displayed).
+  const otherPortTotal = portTotal - displayedPortTotal
   const p2pExcluded = useMemo(() => packets.reduce((s, p) => s + ((p.srcPort && p.dstPort) ? 1 : 0), 0) - portTotal, [packets, portTotal])
+  const portlessPkts = packets.length - portTotal - p2pExcluded
   // Legacy jobs stored raw frames (dedupe absent): count on the stored set.
   // Fresh jobs record the removal in job.duplicateFrameCount and store the
   // ANALYZED set — the count then comes from the job, not a re-count. A fresh
@@ -578,10 +582,13 @@ export default function ReportsPage() {
       const worst = [...lossyFlows].sort((a, b) => (b.lossPct ?? 0) - (a.lossPct ?? 0))[0]
       const rsts = tcpFlowsAll.filter((f) => (f.rstCount ?? 0) > 0).length
       const high = lossyFlows.filter((f) => (f.lossPct ?? 0) >= 20).length
-      // Confidence travels with the number: a 75% estimate from a 9-packet
-      // flow is LOW-confidence and must not read as genuine 75% loss (QA:
-      // minor.pcapng summary said "worst 75%" while the table showed 9 pkts).
-      const worstConf = worst.packets >= 100 ? "HIGH" : worst.packets >= 20 ? "MEDIUM" : "LOW"
+      // The estimate and its confidence come from the CANONICAL loss function
+      // (estimatedTcpLoss): retrans / data segments, confidence on the
+      // data-segment sample — the worst flow's percentage is always
+      // reproducible from the numbers printed next to it (QA: my.pcapng
+      // "50%" read as 1/6 from the displayed 6 packets; the denominator was
+      // 2 data segments).
+      const worstEst = estimatedTcpLoss(worst)
       // The flow must be read initiator-first, exactly like the flows table,
       // the TCP Health table and the CSV — or the summary's worst flow and
       // the table's rows show opposite endpoint orders (QA: main.pcapng said
@@ -599,7 +606,7 @@ export default function ReportsPage() {
       const rstNote = rsts > 0
         ? `${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST${rstRate >= 0.3 ? " (elevated rate — informational, not treated as a security finding; RSTs commonly follow cancelled connections, short-lived flows, rejected connections and capture timing)" : ""}`
         : ""
-      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total; ${tcpFlowsAll.length - measuredTcp.length} had no handshake and no observable health signal — no RTT, retransmission, out-of-order, zero-window or RST event — so loss cannot be measured on them) showed retransmissions, from which loss is inferred (worst ${worst.lossPct}% estimated loss in flow ${worstOrient} — ${worst.retrans ?? 0} retransmitted of ${worst.packets} packets in that flow (${worst.lossPct}% of its data segments; ${worstConf} confidence, n=${worst.packets}); not a confirmed network-loss measurement${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% inferred loss` : ""}${rstNote ? `; ${rstNote}` : ""}) — no security detection rule was triggered by these network-health observations`)
+      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total; ${tcpFlowsAll.length - measuredTcp.length} had no handshake and no observable health signal — no RTT, retransmission, out-of-order, zero-window or RST event — so loss cannot be measured on them) showed retransmissions, from which loss is estimated (worst ${worstEst.lossPct}% estimated retransmission-based loss in flow ${worstOrient} — ${worstEst.retrans} retransmission${worstEst.retrans === 1 ? "" : "s"} / ${worstEst.dataSegments} observed data segments (of ${worstEst.totalPackets} packets in the flow; ${worstEst.confidence} confidence, ${worstEst.dataSegments}-segment sample) — not a confirmed packet-loss measurement${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% estimated loss` : ""}${rstNote ? `; ${rstNote}` : ""}) — no security detection rule was triggered by these network-health observations`)
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
@@ -743,11 +750,11 @@ export default function ReportsPage() {
       ...topProto.map(([p, c]) => `- ${p}: ${c} (${((c / packets.length) * 100).toFixed(1)}%)`),
       "",
       "## Top Ports",
-      "| Protocol/Port | Service | Packets |",
-      "| --- | --- | --- |",
-      ...topPorts.map(({ protocol, port, count, confirmedFlows, flows }) => `| ${protocol}/${port} | ${serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)} | ${count.toLocaleString()} |`),
-      ...(topPorts.length < allPorts.length ? [`- *(+${allPorts.length - topPorts.length} more services — top ${topPorts.length} shown)*`, ""] : [""]),
-      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded (${p2pExcluded.toLocaleString()} pkts); port-less protocols (ICMP, GRE, ESP…) are covered under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; evidence counts are FLOWS (conversations), never packets — the Packets column holds packet totals. A flow counts as having payload evidence when at least one of its packets was payload-verified, so a partially verified flow still counts (the CSV's "mixed" rows)._`,
+      "| Protocol/Port | Service | Packets | Share |",
+      "| --- | --- | --- | --- |",
+      ...topPorts.map(({ protocol, port, count, confirmedFlows, flows }) => `| ${protocol}/${port} | ${serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)} | ${count.toLocaleString()} | ${sharePctLabel(count, portTotal)} |`),
+      ...(otherPortTotal > 0 ? [`| — Other ports (${allPorts.length - topPorts.length} more services) | — | ${otherPortTotal.toLocaleString()} | ${sharePctLabel(otherPortTotal, portTotal)} |`] : []),
+      `_Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Share is % of the ${portTotal.toLocaleString()} ports-attributable packets (of ${packets.length.toLocaleString()} analyzed): ${portlessPkts.toLocaleString()} packets have no ports (covered under Top Protocols) and ${p2pExcluded.toLocaleString()} are P2P dynamic-range (excluded), so the rows shown plus Other cover 100% of port attribution. Labels are payload-confirmed only when the decoder verified the protocol in the payload; evidence counts are FLOWS (conversations), never packets — the Packets column holds packet totals. A flow counts as having payload evidence when at least one of its packets was payload-verified, so a partially verified flow still counts (the CSV's "mixed" rows)._`,
       "",
       ...(observations.length ? ["## Observations", ...observations.map((o) => `- ${o}`), ""] : []),
       "## Top Talkers (source)",
@@ -785,7 +792,7 @@ export default function ReportsPage() {
     if (recs.High.length) recLines.push("### High", ...recs.High.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
     if (recs.Medium.length) recLines.push("### Medium", ...recs.Medium.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
     if (recs.Low.length) recLines.push("### Low", ...recs.Low.map((r) => `- ${r.text} (${findingSourceLabel(r.source, r.status)})`))
-    if (recLines.length === 0) recLines.push("- No suspicious activity detected — no corrective recommendations. Continue routine monitoring.")
+    if (recLines.length === 0) recLines.push("- No security detections triggered — no corrective security recommendations. Network-health observations above (retransmissions, estimated loss, RTT, RST) are informational network diagnostics, NOT security findings, and do not change this recommendation.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable, verdictStatusHint), `- ${conclusionText}`)
     lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${exportTs} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
@@ -1068,9 +1075,10 @@ export default function ReportsPage() {
                               <tr className="border-b text-muted-foreground">
                                 <th className="text-left py-1.5 pr-2">Flow</th>
                                 <th className="text-right py-1.5 pr-2">Pkts</th>
+                                <th className="text-right py-1.5 pr-2">Data Seg</th>
                                 <th className="text-right py-1.5 pr-2">RTT (ms)</th>
                                 <th className="text-right py-1.5 pr-2">Retrans</th>
-                                <th className="text-right py-1.5 pr-2">Est. Loss %</th>
+                                <th className="text-right py-1.5 pr-2">Est. Retrans Loss %</th>
                                 <th className="text-right py-1.5 pr-2">Loss Conf</th>
                                 <th className="text-right py-1.5 pr-2">OoO</th>
                                 <th className="text-right py-1.5 pr-2">Zero Win</th>
@@ -1093,10 +1101,11 @@ export default function ReportsPage() {
                                 <tr key={f.id} className="border-b border-border/30">
                                   <td className="py-1.5 pr-2 font-mono truncate max-w-[200px]">{o.srcIp}:{o.srcPort} → {o.dstIp}:{o.dstPort}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.packets}</td>
+                                  <td className="py-1.5 pr-2 text-right font-mono">{f.dataSegments ?? "—"}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.rttMs ? f.rttMs : "n/a"}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.retrans ?? 0}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.lossPct ?? "—"}</td>
-                                  <td className="py-1.5 pr-2 text-right">{f.lossPct != null && <Badge variant={f.packets >= 100 ? "default" : f.packets >= 20 ? "warning" : "outline"} className="text-[9px]" title="Loss confidence from the observed packet sample: >=100 pkts High, 20-99 Medium, <20 Low — a 50% estimate from 4 packets is far weaker than from 10,000">{f.packets >= 100 ? "HIGH" : f.packets >= 20 ? "MED" : "LOW"}</Badge>}</td>
+                                  <td className="py-1.5 pr-2 text-right">{(() => { const e = estimatedTcpLoss(f); return e.confidence && <Badge variant={e.confidence === "HIGH" ? "default" : e.confidence === "MEDIUM" ? "warning" : "outline"} className="text-[9px]" title={`Loss confidence scales with the observed data-segment sample, never the total packet count — ${e.confidenceReason}; ${e.retrans} retransmission(s) over ${e.dataSegments} data segments of ${e.totalPackets} packets; control segments carry no loss evidence`}>{e.confidence}</Badge> })()}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.ooo ?? 0}</td>
                                   <td className="py-1.5 pr-2 text-right font-mono">{f.zeroWindow ?? 0}</td>
                                   <td className="py-1.5 text-right font-mono">{f.rstCount ?? 0}</td>
@@ -1106,7 +1115,7 @@ export default function ReportsPage() {
                             </tbody>
                           </table>
                         </div>
-                        <p className="text-[10px] text-muted-foreground mt-1">Endpoints are listed initiator-first, like the flows table and the CSV export. Loss % is estimated from retransmission evidence on the observed packet sample; the Loss Confidence column scales with the sample size (&ge;100 pkts HIGH, 20&ndash;99 MED, &lt;20 LOW) — a 50% estimate from 4 packets is far weaker than from 10,000. Retransmissions are summed over both directions and are not attributed to a side.</p>
+                        <p className="text-[10px] text-muted-foreground mt-1">Endpoints are listed initiator-first, like the flows table and the CSV export. Est. Retrans Loss % = retransmissions &divide; observed data segments (both directions summed; a segment is a packet carrying TCP payload) — it is an ESTIMATE from the observed sample, never a measured packet-loss rate, and a flow&rsquo;s Pkts column also counts control segments (SYN/SYN-ACK/ACK/FIN/RST) that carry no loss evidence. The Data Seg column exposes the exact denominator so every displayed percentage is reproducible (&ldquo;1 retransmission / 10 data segments = 10%&rdquo;, never &ldquo;1 of 19 packets&rdquo;). Loss Conf scales with the data-segment sample (&ge;100 HIGH, 20&ndash;99 MED, &lt;20 LOW) — a 50% estimate from 2 data segments is far weaker than from 10,000, and 100 pure-ACK packets over 2 data segments still rate LOW. Retransmissions are summed over both directions and are not attributed to a side.</p>
                       </div>
                     )
                   })()}
@@ -1896,7 +1905,7 @@ export default function ReportsPage() {
                 <Card>
                   <CardHeader><CardTitle className="text-sm">Top Ports</CardTitle></CardHeader>
                   <CardContent className="space-y-2">
-                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; evidence counts are FLOWS (conversations), never packets — the Count column holds packet totals. A flow counts as having payload evidence when at least one of its packets was payload-verified, so a partially verified flow still counts (the CSV's "mixed" rows).</p>}
+                    {topPorts.length > 0 && <p className="text-[10px] text-muted-foreground">Service-side attribution per conversation (well-known/known service port wins, else lower port); both-leg counts summed. Conversations between two dynamic-range ports (P2P) are excluded ({p2pExcluded.toLocaleString()} pkts). Port-less protocols (ICMP, GRE, ESP…) appear under Top Protocols. Labels are payload-confirmed only when the decoder verified the protocol in the payload; evidence counts are FLOWS (conversations), never packets — the Count column holds packet totals. A flow counts as having payload evidence when at least one of its packets was payload-verified, so a partially verified flow still counts (the CSV's "mixed" rows). Share is % of the {portTotal.toLocaleString()} ports-attributable packets (of {packets.length.toLocaleString()} analyzed): {portlessPkts.toLocaleString()} packets have no ports and {p2pExcluded.toLocaleString()} are P2P dynamic-range, so the rows shown plus the Other row cover 100% of port attribution — they never imply coverage of all analyzed packets.</p>}
                     {topPorts.length === 0 && (
                       <p className="text-xs text-muted-foreground">{undecodable ? `No port data — payloads undecodable (${dltName(linkTypes)}), so ports were not parsed` : "No port data"}</p>
                     )}
@@ -1923,7 +1932,7 @@ export default function ReportsPage() {
                                 {serviceEvidenceLabel(portServiceName(port, protocol), confirmedFlows, flows)}
                               </td>
                               <td className="py-1.5 pr-2 whitespace-nowrap">
-                                <span className="text-[10px] text-muted-foreground mr-1">{((count / portTotal) * 100).toFixed(0)}%</span>
+                                <span className="text-[10px] text-muted-foreground mr-1">{sharePctLabel(count, portTotal)}</span>
                                 <div className="inline-block h-2.5 align-middle bg-muted rounded-full overflow-hidden max-w-[120px]">
                                   <div className="h-full bg-chart-3 rounded-full" style={{ width: (count / topPorts[0].count * 100) + "%" }} />
                                 </div>
@@ -1931,6 +1940,16 @@ export default function ReportsPage() {
                               <td className="py-1.5 text-right text-muted-foreground whitespace-nowrap">{count.toLocaleString()}</td>
                             </tr>
                           ))}
+                          {otherPortTotal > 0 && (
+                            <tr className="border-b border-border/30">
+                              <td className="py-1.5 pr-2 font-mono whitespace-nowrap text-muted-foreground">Other ports</td>
+                              <td className="py-1.5 pr-2 text-muted-foreground">{allPorts.length - topPorts.length} more service{allPorts.length - topPorts.length === 1 ? "" : "s"}</td>
+                              <td className="py-1.5 pr-2 whitespace-nowrap">
+                                <span className="text-[10px] text-muted-foreground mr-1">{sharePctLabel(otherPortTotal, portTotal)}</span>
+                              </td>
+                              <td className="py-1.5 text-right text-muted-foreground whitespace-nowrap">{otherPortTotal.toLocaleString()}</td>
+                            </tr>
+                          )}
                         </tbody>
                       </table>
                     )}
@@ -1955,7 +1974,7 @@ export default function ReportsPage() {
                             <tr key={cc} className="border-b border-border/30">
                               <td className="py-1.5 pr-2 font-mono whitespace-nowrap">{cc}</td>
                               <td className="py-1.5 pr-2 whitespace-nowrap">
-                                <span className="text-[10px] text-muted-foreground mr-1">{(() => { const pct = (count / countryTotal) * 100; return pct > 0 && pct < 1 ? "<1%" : `${pct.toFixed(0)}%` })()}</span>
+                                <span className="text-[10px] text-muted-foreground mr-1">{sharePctLabel(count, countryTotal)}</span>
                                 <div className="inline-block h-2.5 align-middle bg-muted rounded-full overflow-hidden max-w-[120px]">
                                   <div className="h-full bg-warning rounded-full" style={{ width: (count / topCountries[0][1] * 100) + "%" }} />
                                 </div>
@@ -2109,7 +2128,7 @@ export default function ReportsPage() {
                       {recs.High.length === 0 && recs.Medium.length === 0 && recs.Low.length === 0 && (
                         <p className="text-sm text-muted-foreground">
                           {alerts.length === 0
-                            ? "No suspicious activity detected. Continue normal monitoring."
+                            ? "No security detections triggered. Any network-health observations in this report (retransmissions, estimated retransmission-based loss, RTT, RST, out-of-order, zero-window) are informational network diagnostics, not security findings — a 0/100 risk score never means the network is loss-free. Continue routine monitoring."
                             : "No specific recommendations at this time. Continue monitoring network traffic for anomalies."}
                         </p>
                       )}

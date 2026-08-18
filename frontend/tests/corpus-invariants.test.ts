@@ -3,7 +3,7 @@ import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import { parsePcap } from "@/lib/pcap"
-import { analyzePcap, SYN_FLOOD_MIN_PEAK_RATE } from "@/lib/analysis"
+import { analyzePcap, SYN_FLOOD_MIN_PEAK_RATE, estimatedTcpLoss, isNonUnicast } from "@/lib/analysis"
 import { buildReportAnalysis, dnsLookupCount, analystConclusion } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
 import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel, verdictLevel } from "@/lib/risk"
@@ -153,6 +153,29 @@ async function audit(file: string, display: string) {
   }
 
   const totalLen = pkts.reduce((s, p) => s + (p.length || 0), 0)
+
+  // TCP-health canonicality: a measurable flow's lossPct MUST equal
+  // retrans / dataSegments (one decimal) — never retrans / packets — and the
+  // data-segment sample can never be smaller than its retransmission count
+  // (QA: call.pcapng "1 of 19 packets" rendered as 10%, my.pcapng 50% from
+  // 1/6 packets). The estimator is the single source every report surface
+  // consumes; it must agree with the raw flow fields.
+  for (const f of a1.flows) {
+    if (f.protocol !== "TCP") continue
+    const est = estimatedTcpLoss(f)
+    if (est.measurable) {
+      expect.soft(est.dataSegments, `${display}: ${f.id} dataSegments>=retrans`).toBeGreaterThanOrEqual(est.retrans)
+      expect.soft(est.lossPct!, `${display}: ${f.id} loss in 0..100`).toBeGreaterThanOrEqual(0)
+      expect.soft(est.lossPct!, `${display}: ${f.id} loss in 0..100`).toBeLessThanOrEqual(100)
+      if (typeof f.lossPct === "number" && f.dataSegments) {
+        const fromSegs = Math.round((f.retrans ?? 0) / f.dataSegments * 1000) / 10
+        expect.soft(Math.abs(f.lossPct - fromSegs) < 0.05, `${display}: ${f.id} lossPct ${f.lossPct} == retrans/dataSegments ${fromSegs}`).toBe(true)
+        expect.soft(est.lossPct, `${display}: ${f.id} estimator agrees`).toBe(f.lossPct)
+      }
+    } else {
+      expect.soft((f.lossPct ?? 0) === 0, `${display}: ${f.id} unmeasurable flow reports no loss`).toBe(true)
+    }
+  }
 
   // Alert dedup: one event fires one alert — the same (rule, src, dst) never
   // appears twice in the displayed threat list, and risk dedups identically.
@@ -443,5 +466,41 @@ describe("corpus invariants — every capture must be internally consistent", ()
     } catch {
       expect(true).toBe(true) // external corpus not on this machine
     }
+  })
+
+  it("call.pcapng: golden regression — every user-QA'd number is pinned, loss uses data segments", async () => {
+    // The 5-bug review round: the user's arithmetic proved the loss % was
+    // retrans/dataSegments while the caption said "of 19 packets". Every
+    // number below was independently verified against the engine; any engine
+    // change that shifts one of them re-triggers review.
+    const parsed = await parsePcap(readFileSync(join(externalDir, "call.pcapng")))
+    const a = analyzePcap(parsed)
+    expect(a.packets.length).toBe(3209)
+    expect(a.flows.length).toBe(99)
+    expect(a.sessions.length).toBe(99)
+    // "Local Devices" = the report's count rule (private primary or any
+    // private alias; non-unicast placeholders excluded), NOT the device-row
+    // count (33 rows include every remote service IP).
+    expect(a.devices.filter((d) => !isNonUnicast(d.ip) && (isPrivateIP(d.ip) || (d.addresses ?? []).some((a) => isPrivateIP(a)))).length).toBe(5)
+    expect(a.tls.length).toBe(15)
+    expect(a.dns.length).toBe(58)
+    expect(a.dns.filter((d) => !d.isResponse).length).toBe(29)
+    expect(a.dns.filter((d) => d.isResponse).length).toBe(29)
+    const tcpFlows = a.flows.filter((f) => f.protocol === "TCP")
+    expect(tcpFlows.length).toBe(36)
+    const measured = tcpFlows.filter((f) => typeof f.rttMs === "number" || (f.retrans ?? 0) > 0 || (f.ooo ?? 0) > 0 || (f.zeroWindow ?? 0) > 0 || (f.rstCount ?? 0) > 0)
+    expect(measured.length).toBe(18)
+    expect(tcpFlows.filter((f) => (f.retrans ?? 0) > 0).length).toBe(3)
+    expect(tcpFlows.filter((f) => (f.rstCount ?? 0) > 0).length).toBe(3)
+    // The QA target flow: 1 retransmission / 10 data segments = 10% — the
+    // exact case where retrans/packets (1/19 = 5.26%) was wrong.
+    const target = a.flows.find((f) => f.srcIp === "192.168.1.10" && f.dstIp === "192.178.158.156" && f.srcPort === 42345 && f.dstPort === 443)
+    expect(target).toBeDefined()
+    expect(target!.packets).toBe(19)
+    expect(target!.retrans).toBe(1)
+    expect(target!.dataSegments).toBe(10)
+    expect(target!.lossPct).toBe(10)
+    expect(target!.tcpState).toBe("ESTABLISHED")
+    expect(estimatedTcpLoss(target!)).toEqual({ retrans: 1, dataSegments: 10, totalPackets: 19, lossPct: 10, confidence: "LOW", confidenceReason: "10 data segments (<20) — the sample is small", measurable: true })
   })
 })
