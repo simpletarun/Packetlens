@@ -603,6 +603,7 @@ describe("Analysis engine", () => {
   describe("flag alerts carry evidence timestamps and real endpoints (QA: long.pcapng)", () => {
     const upload = (overrides: Partial<ParsedPacket> = {}): ParsedPacket[] => {
       // 5 × 50 KB = 250 KB sent, 0 received — over the 100 KB / 5× gates.
+      // Port 8080 (not a NAT-traversal/media port — 3478 is excluded).
       const packets: ParsedPacket[] = []
       for (let i = 0; i < 5; i++) {
         packets.push(makePacket({
@@ -611,7 +612,7 @@ describe("Analysis engine", () => {
           srcIp: "192.168.1.10",
           dstIp: "116.119.214.99",
           srcPort: 63107,
-          dstPort: 3478,
+          dstPort: 8080,
           protocol: "UDP",
           length: 50000,
           ...overrides,
@@ -671,29 +672,81 @@ describe("Analysis engine", () => {
       expect(exfil!.dstIp).toBe("external")
     })
 
-    it("does NOT fire DATA-EXFIL-001 on payload-verified STUN (RFC 5389 cookie decoded)", () => {
-      const analysis = run(upload({ appProtocol: "STUN", appPayloadConfirmed: true }))
+    it("does NOT fire DATA-EXFIL-001 on STUN — payload-verified OR port-inferred (QA: long.pcapng 189 KB / 21 KB WebRTC false positive)", () => {
+      // The exclusion covers the whole NAT-traversal/media family (STUN/TURN
+      // app labels AND ports 3478/3479/5349/19302/5004/5005): the applications
+      // those ports support are legitimately asymmetric, so a byte ratio is
+      // never exfiltration evidence there — regardless of payload verification.
+      const verified = run(upload({ dstPort: 3478, appProtocol: "STUN", appPayloadConfirmed: true }))
+      expect(verified.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+      expect(verified.threats.some((t) => t.ruleId === "DATA-EXFIL-001")).toBe(false)
+      const inferred = run(upload({ dstPort: 3478, appProtocol: "STUN" }))
+      expect(inferred.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+      expect(inferred.threats.some((t) => t.ruleId === "DATA-EXFIL-001")).toBe(false)
+      // Port 3478 alone (no STUN label at all) is equally excluded.
+      const barePort = run(upload({ dstPort: 3478 }))
+      expect(barePort.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+    })
+
+    it("excludes discovery/multicast uploads (SSDP 239.255.255.250, mDNS, DHCP, NTP, SIP) from the exfil rule", () => {
+      const cases: Array<Partial<ParsedPacket>> = [
+        { dstPort: 1900, dstIp: "239.255.255.250", appProtocol: "SSDP" },
+        { dstPort: 5353, dstIp: "239.255.255.251", appProtocol: "mDNS" },
+        { dstPort: 67, appProtocol: "DHCP" },
+        { dstPort: 123, appProtocol: "NTP" },
+        { dstPort: 5060, appProtocol: "SIP" },
+        { dstPort: 53, appProtocol: "DNS" },
+        { dstPort: 5004, appProtocol: "RTP" },
+      ]
+      for (const over of cases) {
+        const analysis = run(upload({ ...over, protocol: "UDP" }))
+        expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+        expect(analysis.threats.some((t) => t.ruleId === "DATA-EXFIL-001")).toBe(false)
+      }
+    })
+
+    it("regression (QA long.pcapng): STUN/WebRTC 189 KB out / 21 KB in on 3478/UDP fires NOTHING — never DATA-EXFIL-001, not even a low-severity alert", () => {
+      // Real WebRTC session shape: sustained STUN/media on the NAT-traversal
+      // port with a legitimately asymmetric byte ratio (189 KB / 21 KB ≈ 9×).
+      const packets: ParsedPacket[] = []
+      for (let i = 0; i < 189; i++) packets.push(makePacket({ num: i + 1, timestamp: 1000000 + i, srcIp: "192.168.1.10", dstIp: "116.119.214.99", srcPort: 40000 + i, dstPort: 3478, protocol: "UDP", length: 1000 }))
+      for (let i = 0; i < 21; i++) packets.push(makePacket({ num: 500 + i, timestamp: 1000000 + i * 2, srcIp: "116.119.214.99", dstIp: "192.168.1.10", srcPort: 3478, dstPort: 40000 + i, protocol: "UDP", length: 1000 }))
+      const analysis = analyzePcap({
+        packets,
+        stats: { totalPackets: packets.length, totalBytes: packets.reduce((s, p) => s + p.length, 0), duration: 200, startTime: 1000000, endTime: 1000200, protocols: { UDP: packets.length } },
+      })
       expect(analysis.advancedMetrics.dataExfiltrationSuspected).toBe(false)
+      expect(analysis.advancedMetrics.dataExfilSeverity).toBeUndefined()
       expect(analysis.threats.some((t) => t.ruleId === "DATA-EXFIL-001")).toBe(false)
+      expect(analysis.advancedMetrics.iocs.some((i) => i.type === "data-exfiltration")).toBe(false)
     })
 
-    it("still fires on port-inferred STUN — the service label is only a port guess", () => {
-      const analysis = run(upload({ appProtocol: "STUN" }))
-      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")
-      expect(exfil).toBeDefined()
-      expect(exfil!.evidence).toContain("RFC-5389-cookie-verified")
+    it("severity ladder: bare upload = Medium (3), never Critical from the ratio alone", () => {
+      const analysis = run(upload())
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
+      expect(analysis.advancedMetrics.dataExfilSeverity).toBe(3)
+      expect(exfil.severity).toBe(3)
+      expect(analysis.advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.severity).toBe(3)
     })
 
-    it("evidence states the payload-verification gap and the flow window", () => {
-      // STUN-labelled flow → the STUN-specific payload evidence branch.
-      const inferred = run(upload({ appProtocol: "STUN" }))
-      const exfil = inferred.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
-      expect(exfil.evidence).toContain("STUN payload evidence: 0 of 5 packets RFC-5389-cookie-verified")
-      expect(exfil.evidence).toContain("flow window 1970-01-12T13:46:40.000Z → 1970-01-12T13:46:44.000Z UTC")
-      // Non-STUN flow → the generic branch names the verification gap.
+    it("severity ladder: payload-verified flow = High (4)", () => {
+      const analysis = run(upload({ appProtocol: "HTTPS", appPayloadConfirmed: true }))
+      const exfil = analysis.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
+      expect(analysis.advancedMetrics.dataExfilSeverity).toBe(4)
+      expect(exfil.severity).toBe(4)
+      expect(exfil.evidence).toContain("payload visibility: 5 of 5 packets inspected")
+    })
+
+    it("evidence states the payload-visibility gap, upload type and flow window", () => {
       const plain = run(upload())
       const plainExfil = plain.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
-      expect(plainExfil.evidence).toContain("payload evidence: 0 of 5 packets payload-verified (UNKNOWN)")
+      expect(plainExfil.evidence).toContain("payload visibility: 0 of 5 packets inspected — exfiltration content: NOT CONFIRMED (UNKNOWN)")
+      expect(plainExfil.evidence).toContain("Upload type: UDP upload (service unknown — port-inferred or bare transport)")
+      expect(plainExfil.evidence).toContain("flow window 1970-01-12T13:46:40.000Z → 1970-01-12T13:46:44.000Z UTC")
+      const https = run(upload({ appProtocol: "HTTPS", appPayloadConfirmed: true }))
+      const httpsExfil = https.threats.find((t) => t.ruleId === "DATA-EXFIL-001")!
+      expect(httpsExfil.evidence).toContain("Upload type: HTTPS upload (TLS/HTTPS content is encrypted — the byte ratio is all the rule can see)")
+      expect(httpsExfil.evidence).toContain("exfiltration content: NOT CONFIRMED (PAYLOAD_CONFIRMED)")
     })
 
     it("DNS-tunnel and beacon alerts carry their own evidence times, not the capture end", () => {

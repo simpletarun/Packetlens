@@ -825,6 +825,20 @@ export default function ReportsPage() {
     URL.revokeObjectURL(a.href)
   }
 
+  // Behavioral findings get "Observed source: src → dst" prefixes (never
+  // "Affected host" — that implies compromise; the endpoints are where the
+  // behavior was OBSERVED, not established victims) when a single triggering
+  // conversation named its real endpoints (QA: long.pcapng — a suspected
+  // STUN flow read as an "affected asset" next to the confirmed credential
+  // exposure).
+  const observedSourcePrefix = (ioc: { ruleId?: string }): string => {
+    if (!ioc.ruleId) return ""
+    const a = report.alerts.find(
+      (al) => al.ruleId === ioc.ruleId && al.srcIp !== "multiple" && al.dstIp !== "external"
+    )
+    return a ? `Observed source: ${a.srcIp} → ${a.dstIp} — ` : ""
+  }
+
   const buildMarkdown = (): string => {
     let markdownPortInferred = false
     const mdTable = (header: string[], rows: string[][]) => [
@@ -921,13 +935,13 @@ export default function ReportsPage() {
       const exposures = report.iocs.filter((i) => i.type === "credential-theft")
       const behavioral = report.iocs.filter((i) => behavioralTypes.includes(i.type))
       const indicators = report.iocs.filter((i) => i.type !== "credential-theft" && !behavioralTypes.includes(i.type))
-      lines.push("## Findings & Affected Assets")
+      lines.push("## Findings & Observed Sources")
       if (exposures.length) {
         lines.push("### Confirmed exposures", ...exposures.map((i) => `- [${sevLabel(i.severity)}] ${i.type === "credential-theft" ? `Affected host: ${i.value}` : i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
         lines.push("_The Plaintext Credential Exposure row lists the affected host (the machine that transmitted the credentials) and its destination — an affected host is the victim of the exposure, not an indicator of a known-malicious artifact. The capture proves the transmission, not theft, interception, or a malicious destination._", "")
       }
       if (behavioral.length) {
-        lines.push("### Behavioral anomalies", ...behavioral.map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
+        lines.push("### Behavioral anomalies", ...behavioral.map((i) => `- [${sevLabel(i.severity)}] ${observedSourcePrefix(i)}${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
         lines.push("_Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are findings about observed traffic patterns, not indicators of a known-malicious artifact: the value describes the behavior itself, and the endpoints are not established as malicious._", "")
       }
       if (indicators.length) {
@@ -1094,6 +1108,14 @@ export default function ReportsPage() {
                   { label: "Unique Certs", value: certificates.length.toLocaleString(), icon: Verified, color: "text-chart-2" },
                   { label: "Alerts", value: alerts.length.toLocaleString(), icon: AlertTriangle, color: "text-danger" },
                   { label: "Risk Score", value: riskValue(), icon: AlertTriangle, color: undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(riskLevel(job.riskScore))) },
+                  // The score's own numeric band, named explicitly so the
+                  // band can never be conflated with the highest finding's
+                  // severity: a 53/100 MEDIUM report with a 5/5 suspected
+                  // rule reads as "MEDIUM risk band — Critical suspected rule
+                  // (no confirmed findings)", never as Critical outright
+                  // (QA: long.pcapng 78/100 CRITICAL read as a confirmed
+                  // critical incident from a byte-ratio heuristic).
+                  { label: "Risk band", value: undecodable ? "UNKNOWN / INSUFFICIENT DATA" : `${riskLevel(scoreVal).label} (${scoreVal}/100)`, icon: Zap, color: undecodable ? "text-muted-foreground" : riskColorClass(riskLevel(scoreVal)) },
                   // Severity is surfaced ALONGSIDE the score — numeric
                   // normalization must never hide the strongest finding
                   // (a 39/100 LOW score with a HIGH finding reads as HIGH present).
@@ -2193,7 +2215,7 @@ export default function ReportsPage() {
              )}
 
              <section>
-                <SectionTitle icon={AlertTriangle} title="19. Findings & Affected Assets" />
+                <SectionTitle icon={AlertTriangle} title="19. Findings & Observed Sources" />
                   <Card>
                     <CardContent className="pt-6">
                       {report.iocs.length === 0 ? (
@@ -2236,7 +2258,7 @@ export default function ReportsPage() {
                                       {g.rows.map((ioc, i) => (
                                         <tr key={i} className="border-b border-border/30">
                                           <td className="py-1.5 pr-2 text-muted-foreground">{iocTypeLabel(ioc.type)}</td>
-                                          <td className="py-1.5 pr-2 font-mono">{ioc.type === "credential-theft" ? `Affected host: ${ioc.value}` : ioc.value}</td>
+                                          <td className="py-1.5 pr-2 font-mono">{ioc.type === "credential-theft" ? `Affected host: ${ioc.value}` : `${observedSourcePrefix(ioc)}${ioc.value}`}</td>
                                           <td className="py-1.5 pr-2 text-muted-foreground">{ioc.description}</td>
                                           <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{sevLabel(ioc.severity)}</Badge></td>
                                           <td className="py-1.5">{sourceBadge(ioc.source, ioc.status)}</td>

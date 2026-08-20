@@ -776,11 +776,11 @@ function buildRecommendations(
     items.push({
       // Evidence-specific, never generic: the alert evidence names the exact
       // flow (endpoints, service, bytes, window), and a SUSPECTED behavioral
-      // finding warrants investigation — blocking comes only after the
-      // destination is confirmed unauthorized (QA: long.pcapng rec said
-      // "consider blocking suspicious destinations" for one suspected STUN
-      // flow with no payload evidence).
-      text: "Investigate the flagged outbound transfer cited in the DATA-EXFIL-001 alert evidence (exact flow, endpoints, service, bytes and window). The finding is directional byte-ratio behavior only — no payload evidence of exfiltration — so validate the traffic (media/STUN sessions, cloud sync and backups legitimately upload) before acting; block the destination only after confirming it is unauthorized or malicious, and review egress filtering.",
+      // finding warrants investigation — do NOT block on the finding alone;
+      // verify the application and destination first (QA: long.pcapng rec
+      // read as an aggressive blocking mandate for one suspected STUN flow
+      // with no payload evidence).
+      text: "Investigate the flagged outbound transfer cited in the DATA-EXFIL-001 alert evidence (exact flow, endpoints, service, bytes and window). The finding is directional byte-ratio behavior only — no payload evidence of exfiltration — so validate the traffic (media/STUN sessions, cloud sync and backups legitimately upload) before acting. Do not block based on this finding alone; verify the application and destination first, then block only if the destination is confirmed unauthorized or malicious, and review egress filtering.",
       ...exfil,
       // SUSPECTED/LIKELY (behavioral) findings get INVESTIGATE, not a
       // blocking mandate; a CONFIRMED finding keeps no priority override.

@@ -311,14 +311,23 @@ async function audit(file: string, display: string) {
       }
     }
     if (t.ruleId === "DATA-EXFIL-001") {
-      const m = t.evidence.match(/^(\d+) flow\(s\) sending >(\d+) KB to external IPs \(outbound ≥5× received; top: (\S+) → (\S+), (\d+) KB sent\)/)
+      const m = t.evidence.match(/^(\d+) flow\(s\) sending >(\d+) KB to external IPs \(outbound ≥5× received\)\. Top flow: (\S+) — ([^:]+):(\d+) → ([^:]+):(\d+) \(([^)]*)\), (\d+) KB sent/)
       if (m) {
-        const k = Number(m[1]), thrKB = Number(m[2]), topPriv = m[3], topPub = m[4], topKB = Number(m[5])
+        const k = Number(m[1]), thrKB = Number(m[2]), topPriv = m[4], topPub = m[6], topKB = Number(m[9])
+        // The detector gates on UNIQUE TCP payload bytes (retransmissions
+        // excluded) when the flow exposes them, falling back to raw counts —
+        // the invariant must replicate the same effective-bytes gate.
+        const eff = (f: typeof a1.flows[number], side: "out" | "in") => {
+          const privIsSrc = isPrivateIP(f.srcIp)
+          const raw = side === "out" ? (privIsSrc ? f.bytesSent : f.bytesRecv) : (privIsSrc ? f.bytesRecv : f.bytesSent)
+          if (f.protocol !== "TCP") return raw
+          const uniq = side === "out" ? (privIsSrc ? f.uniquePayloadBytesOut : f.uniquePayloadBytesIn) : (privIsSrc ? f.uniquePayloadBytesIn : f.uniquePayloadBytesOut)
+          return (uniq ?? 0) > 0 ? (uniq as number) : raw
+        }
         const candidates = a1.flows.filter((f) => {
           const sPriv = isPrivateIP(f.srcIp), dPriv = isPrivateIP(f.dstIp)
           if (sPriv === dPriv) return false
-          const out = sPriv ? f.bytesSent : f.bytesRecv
-          const inn = sPriv ? f.bytesRecv : f.bytesSent
+          const out = eff(f, "out"), inn = eff(f, "in")
           return out > thrKB * 1024 && out > 5 * inn
         })
         expect.soft(candidates.length, `${display}: exfil count`).toBe(k)

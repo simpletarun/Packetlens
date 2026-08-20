@@ -80,6 +80,12 @@ export interface AnalysisFlow {
   rttMs?: number
   dataSegments?: number
   lossPct?: number
+  /** Unique outbound/inbound TCP payload bytes — retransmitted segments and
+   *  control segments excluded. 0/absent when no TCP payload was observed.
+   *  The exfil detector reads these instead of bytesSent/bytesRecv so
+   *  retransmissions can never inflate a byte-ratio finding (QA: time.pcapng). */
+  uniquePayloadBytesOut?: number
+  uniquePayloadBytesIn?: number
   // Protocol honesty: how the app-layer label was obtained. "PAYLOAD_CONFIRMED"
   // = at least one packet's app protocol was confirmed by payload content
   // (HTTP request/response line, TLS/QUIC handshake, DNS, SIP); "PORT_INFERRED"
@@ -311,6 +317,12 @@ export interface AnalysisAdvancedMetrics {
   dataExfilEndpoints?: { srcIp: string; dstIp: string }
   beaconEndpoints?: { srcIp: string; dstIp: string }
   ja3Endpoints?: { srcIp: string; dstIp: string }
+  /** Severity the byte-ratio exfil heuristic earns — 3 (Medium) base, 4 (High)
+   *  when the flagged flow's app protocol is payload-verified, 5 (Critical)
+   *  only when a credential exposure corroborates the capture. The heuristic
+   *  is directional behavior, so it must never read Critical from the ratio
+   *  alone (QA: long.pcapng — a suspected STUN flow fired CRITICAL). */
+  dataExfilSeverity?: number
   topTalkers: { ip: string; bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }[]
   iocs: { type: string; value: string; description: string; severity: number; ruleId?: string }[]
   mitreMappings: { technique: string; id: string; description: string; severity: number }[]
@@ -533,7 +545,24 @@ function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
       endTime: safeIso(tMax),
       appProtocol,
       protocolSource,
-      ...(protocol === 'TCP' ? tcpHealth(pkts, srcIp) : {}),
+      ...(() => {
+        const h = protocol === 'TCP' ? tcpHealth(pkts, srcIp) : null
+        return h ? {
+          retrans: h.retrans,
+          ooo: h.ooo,
+          zeroWindow: h.zeroWindow,
+          rstCount: h.rstCount,
+          ...(h.rttMs !== undefined ? { rttMs: h.rttMs } : {}),
+          ...(h.lossPct !== undefined ? { lossPct: h.lossPct } : {}),
+          dataSegments: h.dataSegments,
+          // Unique outbound/inbound TCP payload bytes (retransmissions and
+          // control segments excluded) — the exfil detector uses these so
+          // retransmitted bytes can never inflate a byte-ratio finding (QA:
+          // time.pcapng — retransmissions were counted as sent bytes).
+          uniquePayloadBytesOut: h.uniquePayloadBytes[0],
+          uniquePayloadBytesIn: h.uniquePayloadBytes[1],
+        } : {}
+      })(),
     }
   }).sort((a, b) => b.packets - a.packets)
 }
@@ -554,12 +583,18 @@ interface TcpHealth {
   rttMs?: number
   dataSegments: number
   lossPct?: number
+  /** Unique application payload bytes per direction (dir 0 = srcIp/out,
+   *  dir 1 = in) — the sum of data-segment payload lengths whose (seq,len)
+   *  was NOT seen before, i.e. retransmissions and control segments excluded.
+   *  0 when no TCP payload was observed (synthetic/summarized captures). */
+  uniquePayloadBytes: [number, number]
 }
 function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
   const sorted = [...pkts].sort((a, b) => a.timestamp - b.timestamp)
   const dir = (p: ParsedPacket) => (p.srcIp || '\u2014') === srcIp ? 0 : 1
   const seen: [Map<number, number>, Map<number, number>] = [new Map(), new Map()]
   const lastSeq: [number, number] = [-1, -1]
+  const uniquePayloadBytes: [number, number] = [0, 0]
   let retrans = 0, ooo = 0, zeroWindow = 0, rstCount = 0, dataSegments = 0
   let lastSynT: number | null = null
   let rttMs: number | null = null
@@ -587,6 +622,7 @@ function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
     if (seen[d].get(p.tcpSeq) === plen) retrans++
     else {
       seen[d].set(p.tcpSeq, plen)
+      uniquePayloadBytes[d] += plen
       if (lastSeq[d] >= 0 && p.tcpSeq < lastSeq[d]) ooo++
     }
     lastSeq[d] = p.tcpSeq
@@ -596,6 +632,7 @@ function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
     retrans, ooo, zeroWindow, rstCount, dataSegments,
     ...(rttMs !== null ? { rttMs } : {}),
     ...(lossPct !== null ? { lossPct } : {}),
+    uniquePayloadBytes,
   }
 }
 
@@ -1717,7 +1754,12 @@ export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, exis
     })
   }
   if (advancedMetrics.dnsTunnelingSuspected) push('DNS-TUNNEL-001', 'Possible DNS Tunneling', 'Exfiltration', 4, 80, advancedMetrics.dnsTunnelEvidence ?? 'DNS tunneling behavior detected', { atSec: advancedMetrics.dnsTunnelDetectedAtSec })
-  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Suspected Large Outbound Transfer', 'Exfiltration', 5, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs', { atSec: advancedMetrics.dataExfilDetectedAtSec, srcIp: advancedMetrics.dataExfilEndpoints?.srcIp, dstIp: advancedMetrics.dataExfilEndpoints?.dstIp })
+  // DATA-EXFIL-001 severity comes from the detector's ladder (Medium base,
+  // High when payload-verified, Critical only with credential corroboration —
+  // QA: long.pcapng read CRITICAL from a byte ratio alone) and the confidence
+  // stays 70: a heuristic with no content evidence must not outscore the
+  // rules that actually inspect payloads.
+  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Suspected Large Outbound Transfer', 'Exfiltration', advancedMetrics.dataExfilSeverity ?? 3, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs', { atSec: advancedMetrics.dataExfilDetectedAtSec, srcIp: advancedMetrics.dataExfilEndpoints?.srcIp, dstIp: advancedMetrics.dataExfilEndpoints?.dstIp })
   if (advancedMetrics.beaconDetected) push('C2-BEACON-001', 'Regular Beaconing Detected', 'Command and Control', 5, 65, advancedMetrics.beaconEvidence ?? 'C2 beaconing behavior detected', { atSec: advancedMetrics.beaconDetectedAtSec, srcIp: advancedMetrics.beaconEndpoints?.srcIp, dstIp: advancedMetrics.beaconEndpoints?.dstIp })
   if (advancedMetrics.ja3Suspicious) push('TLS-SUSPICIOUS-001', 'Suspicious TLS Certificate', 'Command and Control', 2, 75, 'Suspicious TLS fingerprint or oversized SNI', { atSec: advancedMetrics.ja3DetectedAtSec, srcIp: advancedMetrics.ja3Endpoints?.srcIp, dstIp: advancedMetrics.ja3Endpoints?.dstIp })
   return out
@@ -2102,18 +2144,44 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
       pub: privateIsSrc ? f.dstIp : f.srcIp,
     }
   }
-  // Payload-VERIFIED STUN (RFC 5389 magic cookie decoded in the payload) is a
-  // confirmed NAT-traversal/media-session helper — its sustained uploads are
-  // signaling/keepalive behavior, not exfiltration evidence, and calling it
-  // DATA-EXFIL-001 on a byte ratio reads as a false positive. The exclusion
-  // is deliberately narrow: a STUN label inferred only from port 3478 is NOT
-  // excluded, because anything could sit on that well-known port (QA:
-  // long.pcapng — one payload-confirmed STUN session fired DATA-EXFIL-001).
-  const verifiedStun = (f: AnalysisFlow) => f.appProtocol === "STUN" && f.protocolSource === "PAYLOAD_CONFIRMED"
+  // Protocols whose asymmetric outbound traffic is NORMAL and must not fire
+  // the generic byte-ratio exfil rule: NAT traversal/media (STUN/TURN), DNS
+  // resolvers, DHCP, discovery (mDNS/LLMNR/SSDP), NTP, SIP signalling, and
+  // link-layer ARP/IGMP. Their sustained uploads are signaling/keepalive or
+  // small-query behavior, not exfiltration evidence. The exclusion covers BOTH
+  // payload-confirmed STUN (RFC 5389 magic cookie decoded) and port-inferred
+  // NAT-traversal/media ports (3478/3479/5349/19302/5004/5005): the application
+  // those ports support (WebRTC/ICE) is legitimately asymmetric, so calling it
+  // DATA-EXFIL-001 on a byte ratio reads as a false positive (QA: long.pcapng /
+  // time.pcapng — a 189 KB / 21 KB STUN session fired the Critical rule).
+  const benignAsymmetric = (f: AnalysisFlow) => {
+    if (["STUN", "TURN", "DNS", "DHCP", "NTP", "mDNS", "LLMNR", "SSDP", "SIP", "ARP", "IGMP"].includes(f.appProtocol ?? "")) return true
+    if ([3478, 3479, 5349, 19302, 5004, 5005].includes(f.srcPort) || [3478, 3479, 5349, 19302, 5004, 5005].includes(f.dstPort)) return true
+    const dst = f.dstIp
+    if (dst.includes(":")) return dst.startsWith("ff") || dst.startsWith("fe80")
+    const p = dst.split(".").map(Number)
+    if (p.length !== 4 || p.some((x) => Number.isNaN(x))) return false
+    return p[0] === 224 || p[0] === 239 || p[0] === 255 || p[2] === 255 || p[3] === 255
+  }
+  // Effective direction bytes: the exfil threshold and ratio run on UNIQUE TCP
+  // payload bytes (retransmissions and pure-control segments excluded) when
+  // the flow exposes them, so retransmissions can never inflate a byte-ratio
+  // finding (QA: time.pcapng — retransmitted bytes were counted as sent).
+  // Captures without TCP seq/payload visibility fall back to the raw counts.
+  const effOf = (f: AnalysisFlow, side: "out" | "in") => {
+    const privIsSrc = isPrivateIp(f.srcIp) || localIps.has(f.srcIp)
+    const raw = side === "out" ? (privIsSrc ? f.bytesSent : f.bytesRecv) : (privIsSrc ? f.bytesRecv : f.bytesSent)
+    if (f.protocol !== "TCP") return raw
+    const uniq = side === "out" ? (privIsSrc ? f.uniquePayloadBytesOut : f.uniquePayloadBytesIn) : (privIsSrc ? f.uniquePayloadBytesIn : f.uniquePayloadBytesOut)
+    return (uniq ?? 0) > 0 ? (uniq as number) : raw
+  }
   const externalFlows = flows
     .map((f) => ({ f, d: exfilDirection(f) }))
     .filter((x): x is { f: AnalysisFlow; d: NonNullable<ReturnType<typeof exfilDirection>> } =>
-      x.d !== null && !verifiedStun(x.f) && x.d.out > RISK_PARAMS.data_exfil_min_bytes && x.d.out > 5 * x.d.in
+      x.d !== null
+      && !benignAsymmetric(x.f)
+      && effOf(x.f, "out") > RISK_PARAMS.data_exfil_min_bytes
+      && effOf(x.f, "out") > 5 * effOf(x.f, "in")
     )
   const dataExfiltrationSuspected = externalFlows.length > 0
   // Evidence time = the last contributing flow's end — the alert must point
@@ -2133,12 +2201,23 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   const dataExfilEndpoints = externalFlows.length === 1
     ? { srcIp: externalFlows[0].d.priv, dstIp: externalFlows[0].d.pub }
     : undefined
+  // Severity ladder for the byte-ratio heuristic — a large asymmetric transfer
+  // is BEHAVIOR, never a confirmed incident, so it can not read Critical from
+  // the ratio alone. Base = Medium (3). High (4) when the flow's app protocol
+  // was actually decoded (payload-verified — we know what kind of traffic it
+  // is). Critical (5) only when a separate CONFIRMED sensitive-payload finding
+  // (plaintext credential exposure) corroborates the same host (QA: long.pcapng
+  // — one suspected STUN flow read CRITICAL from the byte ratio alone).
+  const exfilVerified = externalFlows.some(({ f }) => f.protocolSource === "PAYLOAD_CONFIRMED")
+  const exfilCorroborated = threats.some((t) => /[Cc]redential/.test(t.signature))
+  const dataExfilSeverity = exfilCorroborated ? 5 : exfilVerified ? 4 : 3
   // The evidence names the exact flow (id, ports, protocol, packets, bytes,
-  // duration) so the alert is investigable without a second query, and states
-  // explicitly what the rule does and does not prove: the byte counts include
-  // retransmitted segments as captured, and a directional ratio is behavior,
-  // not payload evidence of exfiltration (QA: open.pcapng — the finding read
-  // as confirmed exfiltration from the ratio alone).
+  // duration) so the alert is investigable without a second query, states
+  // explicitly what the rule does and does not prove (a directional ratio is
+  // behavior, not payload evidence of exfiltration — QA: open.pcapng read the
+  // finding as confirmed exfiltration from the ratio alone), and classifies
+  // the upload type so a legitimate cloud/media/sync upload is not mistaken
+  // for a suspicious transfer.
   const dataExfilDetail = externalFlows.length > 0
     ? (() => {
         const { f, d } = externalFlows[0]
@@ -2147,11 +2226,25 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         const proto = f.appProtocol && f.appProtocol !== "UNKNOWN" ? f.appProtocol : f.protocol
         const retransNote = f.retrans ? `, including ${f.retrans} retransmitted segment(s) as captured` : ""
         const dur = Number.isFinite(f.duration) ? f.duration : 0
-        // Payload evidence honesty: how many of the flow's packets were
-        // actually payload-verified (STUN = RFC 5389 cookie verified) vs
-        // merely port-inferred — the analyst must see the gap between the
-        // service label and the verification (QA: long.pcapng STUN context).
-        // The flow's canonical key matches flowKeyOf(p) over raw packets.
+        const effOut = effOf(f, "out"), effIn = effOf(f, "in")
+        const effNote = f.protocol === "TCP" && (f.uniquePayloadBytesOut ?? 0) > 0 && (f.uniquePayloadBytesIn ?? 0) > 0
+          ? ` (threshold evaluated on unique payload bytes: ${(effOut / 1024).toFixed(0)} KB out vs ${(effIn / 1024).toFixed(1)} KB in, retransmitted segments excluded)`
+          : f.retrans
+            ? ` (raw byte counts used — ${f.retrans} retransmitted segment(s) present; retransmissions can inflate the ratio)`
+            : ""
+        // Upload-type context so the pattern is not read as inherently
+        // suspicious: encrypted HTTP(S)/QUIC uploads are ordinary cloud/media/
+        // sync behavior, and the rule has no way to see inside them.
+        const uploadType = proto === "QUIC"
+          ? "QUIC/HTTP3 upload (cloud, media and API traffic commonly match this byte pattern; content is encrypted)"
+          : proto === "HTTPS" || proto === "TLS" || proto === "HTTP"
+            ? `${proto} upload (TLS/HTTPS content is encrypted — the byte ratio is all the rule can see)`
+            : `${proto} upload (service unknown — port-inferred or bare transport)`
+        // Payload visibility honesty: how many of the flow's packets were
+        // actually inspected — NEVER "PAYLOAD_CONFIRMED" as if that confirmed
+        // exfiltration (QA: log.pcapng — 1 of 2,622 packets inspected (0.038%)
+        // read as "payload confirmed"). Exfiltration content is always
+        // NOT CONFIRMED for this rule: it carries no content evidence.
         const flowKey = (fl: AnalysisFlow) => {
           const a = fl.srcIp, b = fl.dstIp, ap = fl.srcPort, bp = fl.dstPort
           return a < b || (a === b && ap < bp)
@@ -2163,10 +2256,8 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
         for (const p of raw) {
           if (flowKeyOf(p) === key && p.appPayloadConfirmed) verified++
         }
-        const payloadNote = proto === "STUN"
-          ? `, STUN payload evidence: ${verified} of ${f.packets} packets RFC-5389-cookie-verified`
-          : `, payload evidence: ${verified} of ${f.packets} packets payload-verified (${f.protocolSource ?? "PORT_INFERRED"})`
-        return `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received). Top flow: ${f.id} — ${d.priv}:${privPort} → ${d.pub}:${pubPort} (${proto}), ${(d.out / 1024).toFixed(0)} KB sent vs ${(d.in / 1024).toFixed(1)} KB received, ${f.packets} packets over ${dur.toFixed(1)}s${retransNote}${payloadNote}; flow window ${f.startTime} → ${f.endTime} UTC. Directional byte-ratio behavior only — no payload evidence of what the data was; the destination is not established as malicious`
+        const payloadNote = `, payload visibility: ${verified} of ${f.packets} packets inspected — exfiltration content: NOT CONFIRMED (${f.protocolSource ?? "PORT_INFERRED"})`
+        return `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received). Top flow: ${f.id} — ${d.priv}:${privPort} → ${d.pub}:${pubPort} (${proto}), ${(d.out / 1024).toFixed(0)} KB sent vs ${(d.in / 1024).toFixed(1)} KB received, ${f.packets} packets over ${dur.toFixed(1)}s${retransNote}${effNote}${payloadNote}; flow window ${f.startTime} → ${f.endTime} UTC. Upload type: ${uploadType}. Directional byte-ratio behavior only — no payload evidence of what the data was; the destination is not established as malicious`
       })()
     : ''
 
@@ -2211,7 +2302,7 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   // payload-verified (0.038%), so the value must read as a potential
   // asymmetric transfer, not an established exfiltration event).
   if (dataExfiltrationSuspected) {
-    iocs.push({ type: "data-exfiltration", value: "Potential asymmetric outbound transfer", description: dataExfilDetail || "Significant data transfer to external IPs", severity: 4 })
+    iocs.push({ type: "data-exfiltration", value: "Potential asymmetric outbound transfer", description: dataExfilDetail || "Significant data transfer to external IPs", severity: dataExfilSeverity })
   }
   if (beaconDetected) {
     iocs.push({ type: "beaconing", value: "Periodic communication detected", description: beaconEvidence, severity: 3 })
@@ -2263,6 +2354,10 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
     dataExfilEndpoints,
     beaconEndpoints,
     ja3Endpoints,
+    // Present only when DATA-EXFIL-001 actually fired — an undefined
+    // dataExfilSeverity means the byte-ratio rule did not trigger (the
+    // excluded NAT-traversal/discovery protocols must leave no trace).
+    ...(dataExfiltrationSuspected ? { dataExfilSeverity } : {}),
     topTalkers,
     iocs,
     mitreMappings,
