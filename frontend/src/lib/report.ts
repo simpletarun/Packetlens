@@ -1524,7 +1524,7 @@ export function talkerServicesOf(
 // "mixed" when only some did (audit: 26 of 622 UDP/3478 packets were
 // cookie-confirmed STUN), "port" when none did. Empty when no service label
 // applies (port-less protocols, unknown direction).
-function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; appPayloadConfirmed?: boolean }[]): string {
+export function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; appPayloadConfirmed?: boolean }[]): string {
   if (f.directionUnknown) return ""
   const service = flowServiceName(f.srcPort, f.dstPort, f.protocol)
   if (!service || service === "N/A") return ""
@@ -1591,6 +1591,35 @@ export function flowInitiatorFlip(f: { directionUnknown?: boolean; srcIp: string
   const syn = pkts.find((p) => p.protocol === "TCP" && p.flags?.includes("SYN") && !p.flags.includes("ACK"))
   const init = syn ? syn.srcIp : pkts[0]?.srcIp
   return init !== undefined && init !== f.srcIp && init === f.dstIp
+}
+
+// RST attribution for the network-health observation: a reset alone is
+// ambiguous, so it is split by direction and connection phase before being
+// reported (QA: another.pcapng — 21 of 56 TCP flows reset with no
+// attribution). Counts rejected connections (RST in answer to a SYN before
+// any SYN-ACK), client-initiated cancels (RST from the initiator) and
+// server-side closes (RST from the responder outside the rejected path).
+export function rstAttribution(
+  f: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string },
+  pkts: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; flags?: string }[],
+): { rejected: number; clientCancel: number; serverClose: number; unclassified: number } {
+  const flip = flowInitiatorFlip(f, pkts)
+  const initiator = flip ? f.dstIp : f.srcIp
+  const responder = flip ? f.srcIp : f.dstIp
+  const flowPkts = pkts.filter((p) => p.protocol === "TCP" && ((p.srcIp === f.srcIp && p.dstIp === f.dstIp) || (p.srcIp === f.dstIp && p.dstIp === f.srcIp)))
+  const synAckSeen = flowPkts.some((p) => p.flags?.includes("SYN") && p.flags.includes("ACK"))
+  const rejected = !synAckSeen && flowPkts.some((p) => p.flags?.includes("SYN") && !p.flags.includes("ACK")) && flowPkts.some((p) => p.flags?.includes("RST") && p.srcIp === responder)
+  const rstPkts = flowPkts.filter((p) => p.flags?.includes("RST"))
+  let clientCancel = 0
+  let serverClose = 0
+  let unclassified = 0
+  for (const p of rstPkts) {
+    if (rejected && p.srcIp === responder) continue
+    if (p.srcIp === initiator) clientCancel++
+    else if (p.srcIp === responder) serverClose++
+    else unclassified++
+  }
+  return { rejected: rejected ? 1 : 0, clientCancel, serverClose, unclassified }
 }
 
 export interface FlowTableRow {
@@ -1848,7 +1877,7 @@ export function analystConclusion(opts: {
     return "Suspicious or anomalous behavior was detected. Review the findings above and apply the recommended mitigations."
   }
   const encNote = typeof opts.encryptedSharePct === "number" && opts.encryptedSharePct >= 50
-    ? ` Note: ${Math.round(opts.encryptedSharePct)}% of traffic is encrypted (QUIC/TLS) and its content was not decodable — the rules evaluated packet/flow statistics and unencrypted protocols only; no content-level verification of the encrypted traffic was possible.`
+    ? ` Note: ${Math.round(opts.encryptedSharePct)}% of packets are associated with TCP/443 or UDP/443 and were treated as encrypted HTTPS/QUIC traffic (TCP/443 payload-verified only where a TLS handshake was captured; UDP/443 port-inferred where payload verification was unavailable) — its content was not decodable, so the rules evaluated packet/flow statistics and unencrypted protocols only; no content-level verification of the encrypted traffic was possible.`
     : ""
   return `No configured detection rules triggered on this capture; under those rules no findings were confirmed. Continue routine monitoring. The risk score reflects the configured detection rules and does not represent a probability of compromise.${encNote}`
 }

@@ -9,7 +9,7 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, sharePctLabel, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, credentialEventCount, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, flowServiceEvidence, flowServiceName, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, sharePctLabel, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, rstAttribution, credentialEventCount, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast, estimatedTcpLoss } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -495,9 +495,9 @@ export default function ReportsPage() {
   const appVisibilityLabel = useMemo(() => {
     if (packets.length === 0) return "N/A — no packets"
     const pct = encSharePct.toFixed(0)
-    if (encSharePct >= 50) return `LIMITED — ${pct}% of packets are encrypted (QUIC/TLS); payload inspection was not possible`
-    if (encSharePct >= 25) return `PARTIAL — ${pct}% of packets are encrypted (QUIC/TLS); content inspection applies to the decodable remainder`
-    return `HIGH — only ${pct}% of packets are encrypted (QUIC/TLS); most traffic carried decodable application content`
+    if (encSharePct >= 50) return `LIMITED — ${pct}% of packets are associated with TCP/443 or UDP/443, treated as encrypted HTTPS/QUIC traffic (TCP/443 payload-verified only where a TLS handshake was captured; UDP/443 port-inferred where payload verification was unavailable); content-level inspection was not possible`
+    if (encSharePct >= 25) return `PARTIAL — ${pct}% of packets are associated with TCP/443 or UDP/443, treated as encrypted HTTPS/QUIC traffic (UDP/443 port-inferred where payload verification was unavailable); content inspection applies to the decodable remainder`
+    return `HIGH — only ${pct}% of packets are associated with TCP/443 or UDP/443 (treated as encrypted HTTPS/QUIC, port-inferred where payload verification was unavailable); most traffic carried decodable application content`
   }, [packets.length, encSharePct])
 
   // Per-talker remote services derive from flows, which carry both directions
@@ -515,11 +515,42 @@ export default function ReportsPage() {
   // Talker service list for the report row: truncated at 4 WITH an overflow
   // count — a silent slice read as "these are all the services" (QA: local
   // host's XMPP vanished behind the cut).
-  const svcList = (svcs?: Set<string>): string => {
-    if (!svcs || svcs.size === 0) return "—"
+  // Services are port-inferred (marked *) when no packet of the talker's
+  // conversations was payload-verified for that service (QA: another.pcapng
+  // listed "XMPP" next to payload-verified HTTPS/QUIC without distinction).
+  const portInferredSvc = useMemo(() => {
+    const map = new Map<string, Set<string>>()
+    const confirmed = new Map<string, Set<string>>()
+    for (const f of flows) {
+      const ev = flowServiceEvidence(f, packets)
+      const svc = flowServiceName(f.srcPort, f.dstPort, f.protocol)
+      if (!svc || svc === "N/A" || svc === "Unknown service" || svc === "Dynamic/Ephemeral") continue
+      const sIp = ownerOf.get(f.srcIp) ?? f.srcIp
+      const dIp = ownerOf.get(f.dstIp) ?? f.dstIp
+      for (const ip of [sIp, dIp]) {
+        const target = ev === "payload" || ev === "mixed" ? confirmed : map
+        const set = target.get(ip) ?? new Set<string>()
+        set.add(svc)
+        target.set(ip, set)
+      }
+    }
+    for (const [ip, set] of confirmed) {
+      const remove = map.get(ip)
+      if (remove) for (const svc of set) remove.delete(svc)
+    }
+    return map
+  }, [flows, packets, ownerOf])
+  const svcList = (svcs?: Set<string>, ip?: string): { text: string; portInferred: boolean } => {
+    if (!svcs || svcs.size === 0) return { text: "—", portInferred: false }
+    const inferred = new Set(ip ? portInferredSvc.get(ip) ?? [] : [])
+    const mark = (svc: string) => (inferred.has(svc) ? `${svc}*` : svc)
     const all = [...svcs].sort()
-    return all.length <= 4 ? all.join(", ") : `${all.slice(0, 4).join(", ")} +${all.length - 4} more`
+    return {
+      text: all.length <= 4 ? all.map(mark).join(", ") : `${all.slice(0, 4).map(mark).join(", ")} +${all.length - 4} more`,
+      portInferred: all.some((svc) => inferred.has(svc)),
+    }
   }
+  const talkersShowPortInferred = useMemo(() => [...topSrcIps.slice(0, 5), ...topDstIps.slice(0, 5)].some(({ ip }) => (portInferredSvc.get(ip)?.size ?? 0) > 0), [topSrcIps, topDstIps, portInferredSvc])
 
   const hostLabel = (ip: string) => {
     // 224.0.0.0/4, ff00::/8 etc. are multicast, not private LAN hosts —
@@ -641,7 +672,6 @@ export default function ReportsPage() {
     const lossyFlows = measuredTcp.filter((f) => (f.retrans ?? 0) > 0)
     if (lossyFlows.length > 0) {
       const worst = [...lossyFlows].sort((a, b) => (b.lossPct ?? 0) - (a.lossPct ?? 0))[0]
-      const rsts = tcpFlowsAll.filter((f) => (f.rstCount ?? 0) > 0).length
       const high = lossyFlows.filter((f) => (f.lossPct ?? 0) >= 20).length
       // The estimate and its confidence come from the CANONICAL loss function
       // (estimatedTcpLoss): retrans / data segments, confidence on the
@@ -657,17 +687,37 @@ export default function ReportsPage() {
       // 192.168.1.10 → 185.199.110.133). "in flow A → B" claims no loss
       // direction: the retrans count sums both directions.
       const worstOrient = flowInitiatorFlip(worst, packets) ? `${worst.dstIp} → ${worst.srcIp}` : `${worst.srcIp} → ${worst.dstIp}`
-      const rstRate = tcpFlowsAll.length > 0 ? rsts / tcpFlowsAll.length : 0
-      // An elevated RST share is common in browser/streaming traffic (cancelled
-      // connections, short-lived flows, rejected connections, capture timing)
-      // — it must be stated as informational, never as a security finding, but
-      // a 30%+ reset share next to a clean verdict reads as unexamined
-      // (QA: never_end.pcapng — 15 of 40 TCP flows reset, "no detection rule
-      // triggered" only).
-      const rstNote = rsts > 0
-        ? `${rsts} of ${tcpFlowsAll.length} TCP flows reset by RST${rstRate >= 0.3 ? " (elevated rate — informational, not treated as a security finding; RSTs commonly follow cancelled connections, short-lived flows, rejected connections and capture timing)" : ""}`
-        : ""
-      obs.push(`Network health: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total; ${tcpFlowsAll.length - measuredTcp.length} had no handshake and no observable health signal — no RTT, retransmission, out-of-order, zero-window or RST event — so loss cannot be measured on them) showed retransmissions, from which loss is estimated (worst ${worstEst.lossPct}% estimated retransmission-based loss in flow ${worstOrient} — ${worstEst.retrans} retransmission${worstEst.retrans === 1 ? "" : "s"} / ${worstEst.dataSegments} observed data segments (of ${worstEst.totalPackets} packets in the flow; ${worstEst.confidence} confidence, ${worstEst.dataSegments}-segment sample) — not a confirmed packet-loss measurement${high > 0 ? `; ${high} flow${high === 1 ? "" : "s"} ≥ 20% estimated loss` : ""}${rstNote ? `; ${rstNote}` : ""}) — no security detection rule was triggered by these network-health observations`)
+      const unmeasured = tcpFlowsAll.length - measuredTcp.length
+      obs.push(`Network health — retransmissions: ${lossyFlows.length} of ${measuredTcp.length} measured TCP flows (of ${tcpFlowsAll.length} TCP flows total; ${unmeasured} had no handshake and no observable health signal — no RTT, retransmission, out-of-order, zero-window or RST event — so loss cannot be measured on them) showed retransmissions. Worst flow: ${worstOrient} — Estimated retransmission ratio: ${worstEst.lossPct}% · Confidence: ${worstEst.confidence} · Sample: ${worstEst.dataSegments} data segment${worstEst.dataSegments === 1 ? "" : "s"} (of ${worstEst.totalPackets} packets in the flow; ${worstEst.retrans} retransmission${worstEst.retrans === 1 ? "" : "s"}). Interpretation: ${worstEst.dataSegments < 5 ? "insufficient evidence for an actual packet-loss measurement" : "an estimate from the observed data segments"}${high > 0 ? `. ${high} flow${high === 1 ? "" : "s"} ≥ 20% estimated loss` : ""}`)
+      const rstFlows = tcpFlowsAll.filter((f) => (f.rstCount ?? 0) > 0)
+      if (rstFlows.length > 0) {
+        let rejected = 0
+        let clientCancel = 0
+        let serverClose = 0
+        let unclassified = 0
+        for (const rf of rstFlows) {
+          const a = rstAttribution(rf, packets)
+          rejected += a.rejected
+          clientCancel += a.clientCancel
+          serverClose += a.serverClose
+          unclassified += a.unclassified
+        }
+        const rstRate = tcpFlowsAll.length > 0 ? rstFlows.length / tcpFlowsAll.length : 0
+        const attrs = [
+          ...(rejected > 0 ? [`${rejected} rejected connection${rejected === 1 ? "" : "s"} (RST in answer to a SYN before any SYN-ACK)`] : []),
+          ...(clientCancel > 0 ? [`${clientCancel} client-initiated cancel${clientCancel === 1 ? "" : "s"} (RST sent by the connection initiator)`] : []),
+          ...(serverClose > 0 ? [`${serverClose} server-side close${serverClose === 1 ? "" : "s"} (RST sent by the responder)`] : []),
+          ...(unclassified > 0 ? [`${unclassified} unclassified`] : []),
+        ]
+        // An elevated RST share is common in browser/streaming traffic
+        // (cancelled connections, short-lived flows, rejected connections,
+        // capture timing) — it must be stated as informational, never as a
+        // security finding, but a 30%+ reset share next to a clean verdict
+        // reads as unexamined (QA: never_end.pcapng — 15 of 40 TCP flows
+        // reset, "no detection rule triggered" only).
+        obs.push(`Network health — resets: ${rstFlows.length} of ${tcpFlowsAll.length} TCP flows reset by RST${rstRate >= 0.3 ? " (elevated rate — informational, not treated as a security finding)" : ""} — attribution: ${attrs.join(", ")}. RSTs commonly follow cancelled connections, short-lived flows, rejected connections and capture timing; they are not evidence of malicious activity on their own.`)
+      }
+      obs.push("No security detection rule was triggered by these network-health observations")
     }
     // Consecutive identical frames are the double-capture signature — flow
     // counts can't see them (every packet is counted once) so the report
@@ -756,6 +806,7 @@ export default function ReportsPage() {
   }
 
   const buildMarkdown = (): string => {
+    let markdownPortInferred = false
     const mdTable = (header: string[], rows: string[][]) => [
       `| ${header.join(" | ")} |`,
       `| ${header.map(() => "---").join(" | ")} |`,
@@ -764,7 +815,9 @@ export default function ReportsPage() {
   // Top service names seen for a talker's conversations (flow-derived).
     const svcStr = (ip: string, side: "src" | "dst") => {
       const s = side === "src" ? talkerFlows.src.get(ip) : talkerFlows.dst.get(ip)
-      return svcList(s)
+      const res = svcList(s, ip)
+      if (res.portInferred) markdownPortInferred = true
+      return res.text
     }
     const talkerRow = (ip: string, count: number, bytes: number, side: "src" | "dst") =>
       `| ${ip} | ${isNonUnicast(ip) ? "Multicast" : isPrivateIP(ip) || localOwned.has(ip) ? "Internal Host" : "External"} | ${count.toLocaleString()} | ${formatBytes(bytes)} | ${svcStr(ip, side)} |`
@@ -798,9 +851,9 @@ export default function ReportsPage() {
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)} (unique GeoIP-resolved countries across external endpoints, either direction)`,
-      `- Application-layer visibility: ${appVisibilityLabel} — this is separate from capture quality (frame completeness) and from the risk score (QA: big.pcapng read "Capture quality: GOOD" next to 97.7% encrypted traffic with no decodable application payloads).`,
+      `- Application-layer visibility: ${appVisibilityLabel} — a separate dimension from capture quality (frame completeness) and from the risk score.`,
       `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design. Sessions equal the conversation count: flows are already direction-agnostic (both directions merged into one flow), and each session is that conversation with its TCP state (ESTABLISHED / STATELESS / …) attached.`,
-      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}${quicFlowCount > 0 ? ` · QUIC: ${plural(quicFlowCount, "connection")} (${plural(quicHandshakePkts, "Initial handshake packet")} decoded — QUIC's TLS handshake lives in CRYPTO frames and is never a TCP TLS handshake)` : ""}`,
+      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TCP/TLS handshakes: ${tls.length}${quicFlowCount > 0 ? ` · QUIC connections: ${quicFlowCount} · QUIC Initial packets decoded: ${quicHandshakePkts} — QUIC's TLS handshake lives in CRYPTO frames (never a TCP TLS handshake), so QUIC TLS/CRYPTO handshake visibility is ${quicHandshakePkts > 0 ? `partial (${quicHandshakePkts} decoded)` : "unavailable"}` : ""}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} (credential submissions are the HTTP requests whose decoded body carried a username and/or password field — not every HTTP request) · ${plural(certificates.length, "unique certificate")} decoded (deduplicated by subject+serial across the capture)`,
       ...(report.notables.length ? [`- Notable destinations (neutral, not findings — these domains appeared in the capture's own TLS Server Name or HTTP Host fields, so the connection was made by a host inside the capture, not by PacketLens; presence alone is not a malicious indicator, and an absence of notable destinations is only a curated-list negative — it does not establish benignness or a clean reputation): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : [`- No notable destinations from the curated list — a curated-list negative only: it does not establish that the endpoints are benign or reputable.`]),
@@ -831,7 +884,8 @@ export default function ReportsPage() {
       "| IP | Host | Packets | Bytes | Services |",
       "| --- | --- | --- | --- | --- |",
       ...topDstIps.slice(0, 5).map(({ ip, count, bytes }) => talkerRow(ip, count, bytes, "dst")),
-      ...(noDstAddrCount > 0 ? [`_${noDstAddrCount.toLocaleString()} packet${noDstAddrCount === 1 ? "" : "s"} with no decodable destination address excluded from this table — not attributable to any host._`, ""] : [""]),
+      ...(noDstAddrCount > 0 ? [`_${noDstAddrCount.toLocaleString()} packet${noDstAddrCount === 1 ? "" : "s"} with no decodable destination address excluded from this table — not attributable to any host._`, ""] : []),
+      ...(markdownPortInferred ? [`_* Service classification inferred from port usage only — no packet payload was payload-verified for that service (payload-verified services are unmarked)._`, ""] : []),
     ]
     if (report.alerts.length) {
       lines.push("## Alerts", ...report.alerts.slice(0, 20).map((t) => `- [${sevLabel(t.severity)}] ${t.signature} (${t.srcIp} → ${t.dstIp})`), "")
@@ -951,7 +1005,7 @@ export default function ReportsPage() {
                   {undecodable && (
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
                   )}
-                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p>DNS: <strong>{plural(dnsQueries, "query packet")}</strong> + <strong>{plural(dns.length - dnsQueries, "response")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>{quicFlowCount > 0 ? <> — <strong>{plural(quicFlowCount, "QUIC connection")}</strong> (<strong>{plural(quicHandshakePkts, "Initial handshake packet")}</strong> decoded; QUIC's TLS handshake is carried in CRYPTO frames, separate from TCP TLS handshakes)</> : null}.</p>}
+                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p>DNS: <strong>{plural(dnsQueries, "query packet")}</strong> + <strong>{plural(dns.length - dnsQueries, "response")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TCP/TLS handshake")}</strong>{quicFlowCount > 0 ? <> — <strong>{plural(quicFlowCount, "QUIC connection")}</strong> (<strong>{plural(quicHandshakePkts, "QUIC Initial packet")}</strong> decoded; QUIC's TLS handshake is carried in CRYPTO frames, never a TCP TLS handshake, so QUIC TLS/CRYPTO handshake visibility is {quicHandshakePkts > 0 ? "partial" : "unavailable"})</> : null}.</p>}
                   {tls.length === 0 && (httpsPortPkts > 0 || quicFlowCount > 0) && (quicFlowCount > 0 && httpsPortPkts === 0
                     ? (quicHandshakePkts > 0
                       ? <p className="text-warning">QUIC traffic is present on UDP/443 — <strong>{plural(quicFlowCount, "connection")}</strong> with <strong>{plural(quicHandshakePkts, "payload-verified Initial handshake packet")}</strong> decoded; the TLS sessions inside QUIC are encrypted, and no ClientHello/ServerHello-style TLS metadata, SNI or certificates are extracted from its CRYPTO frames.</p>
@@ -963,7 +1017,7 @@ export default function ReportsPage() {
                   {alerts.length > 0 ? (
                     <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
-                    <p>No signature-based alerts. Risk score: <strong>{riskValue()}</strong>.</p>
+                    <p>No behavioral detection rules triggered. Risk score: <strong>{riskValue()}</strong>.</p>
                   )}
                   {alerts.length === 0 && observations.length > 0 && (
                     <p className="text-xs text-muted-foreground border-t border-border/30 pt-2">Observed normal activity: {observations.join(" · ")}.</p>
@@ -1703,8 +1757,8 @@ export default function ReportsPage() {
                   </div>
                   {alerts.length === 0 && advancedMetrics && (advancedMetrics.beaconDetected || advancedMetrics.dnsTunnelingSuspected || advancedMetrics.dataExfiltrationSuspected || advancedMetrics.torVpnProxyDetected || advancedMetrics.ja3Suspicious) && (
                     <p className="text-xs text-muted-foreground border border-warning/30 bg-warning/5 rounded p-2">
-                      No signature-based alerts fired, but the anomaly heuristics in the Risk Score section detected behavioral flags.
-                      Signature alerts and heuristic anomalies are computed independently; see sections 16-19 for the heuristic findings.
+                      No behavioral detection rules triggered, but the anomaly heuristics in the Risk Score section detected behavioral flags.
+                      Behavioral rules and heuristic anomalies are computed independently; see sections 16-19 for the heuristic findings.
                     </p>
                   )}
                   <div className="overflow-x-auto">
@@ -1828,7 +1882,7 @@ export default function ReportsPage() {
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{[conns > 0 ? `${conns} conns` : null, protos || null, detail && detail.size > 0 ? `services: ${svcList(detail)}` : null].filter(Boolean).join(" · ")}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{[conns > 0 ? `${conns} conns` : null, protos || null, detail && detail.size > 0 ? `services: ${svcList(detail, ip).text}` : null].filter(Boolean).join(" · ")}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
@@ -1854,7 +1908,7 @@ export default function ReportsPage() {
                           <div className="min-w-0">
                             <div className="font-mono truncate">{ip}</div>
                             <div className="text-[10px] text-muted-foreground">{hostLabel(ip)}</div>
-                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{[conns > 0 ? `${conns} conns` : null, protos || null, detail && detail.size > 0 ? `services: ${svcList(detail)}` : null].filter(Boolean).join(" · ")}</div>}
+                            {(detail || conns > 0) && <div className="text-[10px] text-muted-foreground">{[conns > 0 ? `${conns} conns` : null, protos || null, detail && detail.size > 0 ? `services: ${svcList(detail, ip).text}` : null].filter(Boolean).join(" · ")}</div>}
                           </div>
                           <div className="text-right text-muted-foreground whitespace-nowrap">
                             {count.toLocaleString()} pkts · {formatBytes(bytes)}
@@ -1865,6 +1919,7 @@ export default function ReportsPage() {
                       )
                     })}
                     {noDstAddrCount > 0 && <p className="text-[10px] text-muted-foreground pt-1">{noDstAddrCount.toLocaleString()} packet{noDstAddrCount === 1 ? "" : "s"} with no decodable destination address excluded from this table — not attributable to any host.</p>}
+                    {talkersShowPortInferred && <p className="text-[10px] text-muted-foreground pt-1">* Service classification inferred from port usage only — no packet payload was payload-verified for that service (payload-verified services are unmarked).</p>}
                   </CardContent>
                 </Card>
               </div>
@@ -1939,7 +1994,8 @@ export default function ReportsPage() {
                               <div className="flex justify-between"><span className="text-muted-foreground">Raw score</span><span className="font-medium">{Math.round(risk.rawScore * 10) / 10}</span></div>
                               <div className="flex justify-between"><span className="text-muted-foreground">Normalization formula</span><span className="font-medium whitespace-nowrap">100 × (1 − exp(−{risk.rawScore} / {RISK_CURVE_K})) ≈ {riskCurve !== null ? riskCurve.toFixed(1) : "—"} → {risk.normalizedScore}/100</span></div>
                               <div className="flex justify-between"><span className="text-muted-foreground">Burst bonus applied <span title="Only C2-beacon, exfil and DNS-tunnel rules receive the burst confidence bonus; a bare burst with nothing to boost shows No.">(C2/exfil/DNS rules only)</span></span><span className="font-medium">{risk.burstApplied ? "Yes" : "No"}</span></div>
-                              <div className="flex justify-between"><span className="text-muted-foreground">Normalized score</span><span className="text-foreground font-bold">{undecodable ? "N/A — insufficient data" : `${risk.normalizedScore}/100 ${risk.levelLabel}`}{!undecodable && verdictStatusHint && <span className="text-xs text-muted-foreground font-normal">{verdictStatusHint}</span>}</span></div>
+                              <div className="flex justify-between"><span className="text-muted-foreground">Normalized score</span><span className="text-foreground font-bold">{undecodable ? "N/A — insufficient data" : `${risk.normalizedScore}/100 ${risk.levelLabel === "SAFE" ? "— no configured detections" : risk.levelLabel}`}{!undecodable && verdictStatusHint && <span className="text-xs text-muted-foreground font-normal">{verdictStatusHint}</span>}</span></div>
+                              <div className="flex justify-between"><span className="text-muted-foreground">Assessment confidence</span><span className="font-medium">{undecodable ? "None — undecodable capture" : encSharePct >= 50 ? `Limited — ${Math.round(encSharePct)}% of packets on TCP/443 or UDP/443, treated as encrypted HTTPS/QUIC (port-inferred where payload verification was unavailable); content not decodable` : encSharePct >= 25 ? `Partial — ${Math.round(encSharePct)}% of packets on TCP/443 or UDP/443, treated as encrypted HTTPS/QUIC (port-inferred where payload verification was unavailable)` : "Full — most packets carried decodable application content"}</span></div>
                               <div className="border-t border-border/30 pt-2 mt-2">
                                 <div className="font-semibold mb-1 text-xs">Contributions (sorted by impact):</div>
                                 {risk.items.length === 0 ? (
@@ -2124,7 +2180,7 @@ export default function ReportsPage() {
                         </p>
                       )}
                       {report.iocs.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">No indicators detected</p>
+                        <p className="text-sm text-muted-foreground">No malicious indicators detected — the Notable Destinations section is curated context, not indicators.</p>
                       ) : (
                         <div className="overflow-x-auto">
                           <table className="w-full text-xs">

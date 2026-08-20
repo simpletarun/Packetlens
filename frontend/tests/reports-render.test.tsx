@@ -376,6 +376,79 @@ describe("Reports page render", () => {
     expect(lines[7]).toContain("192.168.1.20,42315,8.8.8.8,443,TCP,5,300,300,600")
     expect(lines[8]).toContain("8.8.8.8,443,192.168.1.20,42315,TCP,3,,,400")
   })
+
+  it("clean encrypted capture: behavioral-rules wording, no-malicious-indicators, 'no configured detections' card, TLS/QUIC separation, and structured network-health observations", () => {
+    const job: JobSummary = {
+      id: "key-test", filename: "enc.pcapng", fileSize: 1024,
+      status: "done", progress: 100, stage: "complete",
+      totalPackets: 6, totalFlows: 3, conversations: 3,
+      devices: 1, externalIps: 2, countries: 0, domains: 0,
+      protocols: ["TCP", "UDP"], alerts: 0, riskScore: 0,
+      captureDuration: 1, createdAt: "2024-01-01T00:00:00.000Z",
+      completedAt: "2024-01-01T00:00:01.000Z",
+    }
+    useAnalysisStore.getState().setAllData({
+      job,
+      packets: [
+        { num: 1, timestamp: "2024-01-01T00:00:00.100Z", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", length: 130, flags: "SYN", ttl: 64, info: "", appProtocol: "TLS" },
+        { num: 2, timestamp: "2024-01-01T00:00:00.200Z", srcIp: "8.8.8.8", dstIp: "192.168.1.20", srcPort: 443, dstPort: 42315, protocol: "TCP", length: 130, flags: "SYN-ACK", ttl: 64, info: "", appProtocol: "TLS" },
+        { num: 3, timestamp: "2024-01-01T00:00:00.300Z", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", length: 130, flags: "ACK", ttl: 64, info: "", appProtocol: "TLS" },
+        { num: 4, timestamp: "2024-01-01T00:00:00.400Z", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 45321, dstPort: 443, protocol: "UDP", length: 120, flags: "", ttl: 64, info: "", appProtocol: "QUIC" },
+        { num: 5, timestamp: "2024-01-01T00:00:00.500Z", srcIp: "192.168.1.20", dstIp: "1.1.1.1", srcPort: 40000, dstPort: 443, protocol: "TCP", length: 60, flags: "SYN", ttl: 64, info: "" },
+        { num: 6, timestamp: "2024-01-01T00:00:00.600Z", srcIp: "192.168.1.20", dstIp: "1.1.1.1", srcPort: 40000, dstPort: 443, protocol: "TCP", length: 60, flags: "RST", ttl: 64, info: "" },
+      ],
+      flows: [
+        { id: "f1", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 42315, dstPort: 443, protocol: "TCP", packets: 3, bytesTotal: 390, bytesSent: 260, bytesRecv: 130, duration: 1, startTime: "2024-01-01T00:00:00.100Z", endTime: "2024-01-01T00:00:00.300Z", retrans: 1, lossPct: 50, dataSegments: 2, rstCount: 0, appProtocol: "TLS", protocolSource: "PAYLOAD_CONFIRMED", tcpState: "ESTABLISHED" },
+        { id: "f2", srcIp: "192.168.1.20", dstIp: "8.8.8.8", srcPort: 45321, dstPort: 443, protocol: "UDP", packets: 1, bytesTotal: 120, bytesSent: 120, bytesRecv: 0, duration: 1, startTime: "2024-01-01T00:00:00.400Z", endTime: "2024-01-01T00:00:00.400Z", retrans: 0, appProtocol: "QUIC", protocolSource: "PORT_INFERRED" },
+        { id: "f3", srcIp: "192.168.1.20", dstIp: "1.1.1.1", srcPort: 40000, dstPort: 443, protocol: "TCP", packets: 2, bytesTotal: 120, bytesSent: 120, bytesRecv: 0, duration: 1, startTime: "2024-01-01T00:00:00.500Z", endTime: "2024-01-01T00:00:00.600Z", retrans: 0, rstCount: 1 },
+      ],
+      sessions: [], dns: [], http: [], tls: [], files: [],
+      credentials: [], certificates: [], devices: [], alerts: [],
+      timeline: [{ time: "00:00", packets: 6, bytes: 630, tcp: 5, udp: 1, dns: 0, tls: 0 }],
+      bandwidth: [{ time: "00:00", in: 400, out: 230 }],
+      advancedMetrics: {
+        rates: { quality: "VALID", durationSec: 1, avgPacketsSec: 6, avgBps: 630, peakBps: 630, peakBps100ms: 630, bucketCount: 1, avgExceedsPeak: false },
+        burst: null,
+        throughputAvg: 630, throughputPeak: 630, throughputPeak100ms: 630,
+        beaconDetected: false, dnsTunnelingSuspected: false, dataExfiltrationSuspected: false,
+        torVpnProxyDetected: false, portScanEnhanced: false, ja3Suspicious: false,
+        topTalkers: [], iocs: [], mitreMappings: [],
+      },
+      burst: null,
+      schemaVersion: ANALYSIS_SCHEMA_VERSION,
+      validator: {
+        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        captureQuality: "VALID",
+        durationSec: 1,
+        decode: { decoded: 6, total: 6, linkTypes: [1], decodeRatePct: 100 },
+        integrity: { status: "valid", truncatedPackets: 0, fileTruncated: false, malformedPackets: 0, unsupportedLinkTypes: [] },
+      },
+      decode: { decoded: 6, total: 6, linkTypes: [1] },
+      fileInfo: { sha256: "", sha1: "", md5: "" },
+    })
+    render(<ReportsPage />)
+    // #9: "signature-based" only when a signature DB exists — this engine is
+    // behavioral, so the report must say behavioral rules.
+    expect(screen.getByText(/No behavioral detection rules triggered/)).toBeTruthy()
+    // #5: absence of indicators must not read as blanket cleanliness.
+    expect(screen.getByText(/No malicious indicators detected/)).toBeTruthy()
+    // #8: the score card never labels 0/100 "SAFE".
+    expect(screen.getByText(/0\/100 — no configured detections/)).toBeTruthy()
+    expect(screen.queryByText(/0\/100 SAFE/)).toBeNull()
+    // #2: the assessment-confidence row states the port-association basis.
+    expect(screen.getByText(/Limited — \d+% of packets on TCP\/443 or UDP\/443/)).toBeTruthy()
+    // #3: QUIC visibility is separated from TCP/TLS handshakes.
+    expect(screen.getByText(/QUIC traffic is present on UDP\/443/)).toBeTruthy()
+    expect(screen.getAllByText(/port-inferred/).length).toBeGreaterThan(0)
+    // #6: the loss estimate carries ratio / confidence / sample / interpretation.
+    expect(screen.getByText(/Estimated retransmission ratio: 50%/)).toBeTruthy()
+    expect(screen.getByText(/Confidence: LOW/)).toBeTruthy()
+    expect(screen.getByText(/Sample: 2 data segments/)).toBeTruthy()
+    expect(screen.getByText(/Interpretation: insufficient evidence for an actual packet-loss measurement/)).toBeTruthy()
+    // #7: RST flows get an attribution split, not a bare count.
+    expect(screen.getByText(/Network health — resets: 1 of 2 TCP flows reset by RST \(elevated rate — informational, not treated as a security finding\) — attribution: 1 client-initiated cancel \(RST sent by the connection initiator\)/)).toBeTruthy()
+    expect(screen.getByText(/No security detection rule was triggered by these network-health observations/)).toBeTruthy()
+  })
 })
 
   it("a CRITICAL-severity SUSPECTED alert renders '0 confirmed · 1 suspected' — never '1 confirmed' (QA: temp.pcapng)", () => {

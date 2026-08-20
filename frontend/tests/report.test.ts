@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest"
 import { buildReportAnalysis, buildReportRisk, alertTrafficFor, binPackets, mitreSource, iocSource, SOURCE_LABELS, portServiceName, flowServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, dnsLookupCount, servicePortCounts, serviceEvidenceLabel, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, escHtml, mdInline, 
 packetEpochSec, bucketOverlapSec, buildBandwidth, analystConclusion, plural, flowTableRows, sessionTableRows, 
 duplicateFrameCountOf, statusLabel, findingSourceLabel, effectiveStatus, summarizeStatuses, statusCountsLabel, 
-reportDurationSec, dnsUniqueDomains, dnsNameOf, credentialEventCount, sharePctLabel } from "@/lib/report"
+reportDurationSec, dnsUniqueDomains, dnsNameOf, credentialEventCount, sharePctLabel, rstAttribution } from "@/lib/report"
 import { BUILD_STAMP } from "@/lib/build-stamp"
 import { buildRiskInputs, burstDetected, computeRisk, computeRiskBreakdown, riskLevel } from "@/lib/risk"
 import { tlsCipherSuiteName } from "@/lib/pcap"
@@ -914,6 +914,39 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
     expect(buildFlowsCsv(flows).split("\n")[7].split(",")[0]).toBe("198.51.100.7")
   })
 
+  it("rstAttribution: RST to a SYN before any SYN-ACK is a rejected connection, not a close", () => {
+    const f: Flow = { id: "f1", srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 80, protocol: "TCP", packets: 3, bytesTotal: 300, bytesSent: 200, bytesRecv: 100, duration: 1, startTime: "", endTime: "" }
+    const packets = [
+      { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 80, protocol: "TCP", flags: "SYN" },
+      { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 80, dstPort: 42224, protocol: "TCP", flags: "RST" },
+    ]
+    expect(rstAttribution(f, packets)).toEqual({ rejected: 1, clientCancel: 0, serverClose: 0, unclassified: 0 })
+  })
+
+  it("rstAttribution: mid-session RST from the initiator is a client cancel; from the responder a server close", () => {
+    const f: Flow = { id: "f1", srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", packets: 6, bytesTotal: 600, bytesSent: 400, bytesRecv: 200, duration: 1, startTime: "", endTime: "" }
+    const packets = [
+      { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "SYN" },
+      { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "SYN-ACK" },
+      { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "ACK" },
+      { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "RST" },
+    ]
+    expect(rstAttribution(f, packets)).toEqual({ rejected: 0, clientCancel: 1, serverClose: 0, unclassified: 0 })
+    const serverRst = [...packets, { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "RST" }]
+    expect(rstAttribution(f, serverRst)).toEqual({ rejected: 0, clientCancel: 1, serverClose: 1, unclassified: 0 })
+  })
+
+  it("rstAttribution: no SYN captured — first-packet source is the initiator, so its RST is a client cancel; the other leg's RST is a server close", () => {
+    const f: Flow = { id: "f1", srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", packets: 2, bytesTotal: 200, bytesSent: 100, bytesRecv: 100, duration: 1, startTime: "", endTime: "" }
+    const packets = [
+      { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "ACK" },
+      { srcIp: "198.51.100.7", dstIp: "10.0.0.5", srcPort: 443, dstPort: 42224, protocol: "TCP", flags: "RST" },
+    ]
+    expect(rstAttribution(f, packets)).toEqual({ rejected: 0, clientCancel: 1, serverClose: 0, unclassified: 0 })
+    const responderRst = [...packets, { srcIp: "10.0.0.5", dstIp: "198.51.100.7", srcPort: 42224, dstPort: 443, protocol: "TCP", flags: "RST" }]
+    expect(rstAttribution(f, responderRst)).toEqual({ rejected: 0, clientCancel: 1, serverClose: 1, unclassified: 0 })
+  })
+
   it("buildFlowsCsv: formula-prefixed cells are defused and embedded commas/quotes are quoted", () => {
     // GeoIP ASN strings are external data — an ASN like "=1+1" would execute
     // as an Excel formula when the exported CSV is opened (CSV injection).
@@ -1080,7 +1113,7 @@ it("pluralizes the alert count and names EVERY fired rule (QA: mic.pcapng hid th
   it("a mostly-encrypted capture with no alerts states the visibility limit — 0/100 never means content was verified (QA: big.pcapng 97.7% QUIC)", () => {
     const text = analystConclusion({ ...base, quality: "VALID", encryptedSharePct: 97.7 })
     expect(text).toContain("No configured detection rules triggered")
-    expect(text).toContain("98% of traffic is encrypted (QUIC/TLS)")
+    expect(text).toContain("98% of packets are associated with TCP/443 or UDP/443 and were treated as encrypted HTTPS/QUIC traffic")
     expect(text).toContain("content-level verification of the encrypted traffic was possible")
     expect(text).toContain("packet/flow statistics and unencrypted protocols only")
     // Below the threshold the note stays silent — a minority-encrypted
