@@ -370,10 +370,11 @@ describe("Reports page render", () => {
     // the comment lines); one data row per flow follows.
     expect(lines[0]).toMatch(/^# PacketLens v\d+\.\d+\.\d+ · (commit|src):.* · 2 flows$/)
     expect(lines[1]).toMatch(/^# Rows are initiator-first:/)
-    expect(lines[5]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,dataSegments,estLossPct")
-    expect(lines).toHaveLength(8)
-    expect(lines[6]).toContain("192.168.1.20,42315,8.8.8.8,443,TCP,5,300,300,600")
-    expect(lines[7]).toContain("8.8.8.8,443,192.168.1.20,42315,TCP,3,,,400")
+    expect(lines[5]).toMatch(/^# directionSemantics: initiator\/responder/)
+    expect(lines[6]).toBe("srcIp,srcPort,dstIp,dstPort,protocol,packets,bytesSent,bytesRecv,bytesTotal,startTime,endTime,durationSec,srcCountry,dstCountry,srcAsn,dstAsn,service,serviceEvidence,rttMs,retrans,dataSegments,estLossPct")
+    expect(lines).toHaveLength(9)
+    expect(lines[7]).toContain("192.168.1.20,42315,8.8.8.8,443,TCP,5,300,300,600")
+    expect(lines[8]).toContain("8.8.8.8,443,192.168.1.20,42315,TCP,3,,,400")
   })
 })
 

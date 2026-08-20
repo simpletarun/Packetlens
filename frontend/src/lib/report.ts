@@ -1187,7 +1187,7 @@ export function sharePctLabel(part: number, whole: number): string {
   return pct < 0.05 ? "<0.1%" : `${pct.toFixed(1)}%`
 }
 
-export function servicePortCounts(packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string }[]): ServicePortCount[] {
+export function servicePortCounts(packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; appPayloadConfirmed?: boolean }[]): ServicePortCount[] {
   // Per-conversation pass first: decide the service port ONCE per
   // conversation (deterministic per port pair), counting its packets and
   // payload-verified packets. The second pass aggregates conversations into
@@ -1205,7 +1205,12 @@ export function servicePortCounts(packets: { srcIp: string; dstIp: string; srcPo
     const e = convs.get(key) ?? { protocol: p.protocol, port, count: 0, confirmed: 0 }
     e.count += 1
     const evidence = evidenceAppProtocols(portServiceName(port, p.protocol))
-    if (evidence && p.appProtocol && evidence.has(p.appProtocol)) e.confirmed += 1
+    // Payload evidence REQUIRES the decoder's confirmation flag: the port
+    // fallback labels every UDP/443 packet "QUIC" without verifying it, so
+    // counting appProtocol alone read 56,345 mid-session QUIC packets as
+    // fully payload-confirmed next to an "inferred from port usage" note
+    // (QA: big.pcapng — 0 Initial handshake packets captured).
+    if (evidence && p.appProtocol && p.appPayloadConfirmed && evidence.has(p.appProtocol)) e.confirmed += 1
     convs.set(key, e)
   }
   const counts = new Map<string, ServicePortCount>()
@@ -1519,7 +1524,7 @@ export function talkerServicesOf(
 // "mixed" when only some did (audit: 26 of 622 UDP/3478 packets were
 // cookie-confirmed STUN), "port" when none did. Empty when no service label
 // applies (port-less protocols, unknown direction).
-function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string }[]): string {
+function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; srcPort?: number; dstPort?: number; protocol: string; appProtocol?: string; appPayloadConfirmed?: boolean }[]): string {
   if (f.directionUnknown) return ""
   const service = flowServiceName(f.srcPort, f.dstPort, f.protocol)
   if (!service || service === "N/A") return ""
@@ -1532,7 +1537,11 @@ function flowServiceEvidence(f: Flow, packets: { srcIp: string; dstIp: string; s
       (p.srcIp === f.srcIp && p.dstIp === f.dstIp && p.srcPort === f.srcPort && p.dstPort === f.dstPort) ||
       (p.srcIp === f.dstIp && p.dstIp === f.srcIp && p.srcPort === f.dstPort && p.dstPort === f.srcPort)
     if (!same) continue
-    if (p.appProtocol && evidence.has(p.appProtocol)) confirmed += 1
+    // Confirmed requires the decoder's flag — the port fallback sets
+    // appProtocol without ever verifying the payload (QA: big.pcapng's
+    // UDP/443 QUIC flow read "payload" while zero Initial handshake packets
+    // were captured; the report note said "inferred from port usage").
+    if (p.appPayloadConfirmed && p.appProtocol && evidence.has(p.appProtocol)) confirmed += 1
   }
   if (confirmed === 0) return "port"
   return confirmed >= f.packets ? "payload" : "mixed"
@@ -1722,6 +1731,7 @@ export function buildFlowsCsv(
     "# serviceEvidence: \"payload\" = every packet payload-verified; \"mixed\" = at least one packet payload-verified (partial verification still counts as confirmed); \"port\" = port-inferred only, never payload-verified.",
     "# estLossPct: retransmissions / dataSegments, both directions summed — an ESTIMATE from the observed sample, not a measured loss rate; dataSegments is the exact denominator (packets carrying TCP payload; control segments like SYN/ACK/FIN/RST carry no loss evidence, so packets > dataSegments is expected); the retrans column is not split by direction. rttMs: TCP handshake RTT (SYN→SYN-ACK) when captured.",
     "# srcCountry/dstCountry: FLOW-level — the GeoIP country of the row's endpoint, per conversation. NOT the same aggregation as the report's packet-direction Top Countries (which counts each packet by its destination), so the two never sum identically and are not directly comparable.",
+    "# directionSemantics: initiator/responder — the left endpoint (srcIp) is the conversation INITIATOR (the SYN sender for TCP, else the sender of the first observed packet; the canonical sorted order is kept when the capture began mid-session and the first packet is a reply). bytesSent/bytesRecv are initiator→responder / responder→initiator totals — 'sent' always means 'sent by the row's left endpoint'. Detection and the report's flows table use the same orientation.",
   ].join("\n")
   return "\uFEFF" + [comment, header, ...rows].join("\n")
 }
@@ -1759,6 +1769,10 @@ export function analystConclusion(opts: {
   alerts: { signature: string; status?: DetectionStatus; ruleId?: string; evidence?: string }[]
   score: number
   quality?: string
+  // % of packets encrypted (QUIC/TLS): a 0/100 on a capture whose traffic is
+  // mostly encrypted must never read as content-level verification (QA:
+  // big.pcapng — 97.7% QUIC, no Initial handshake packets, clean verdict).
+  encryptedSharePct?: number
 }): string {
   if (opts.undecodable) {
     return `Only ${opts.decodeRatePct}% of packets could be decoded — the capture uses unsupported encapsulation (${opts.encapName}), so lengths and timestamps parsed but no headers did. No verdict is possible on undecodable traffic; re-capture with Ethernet encapsulation (or an explicit DLT override) and re-analyze.`
@@ -1833,7 +1847,10 @@ export function analystConclusion(opts: {
   if (opts.score >= 40) {
     return "Suspicious or anomalous behavior was detected. Review the findings above and apply the recommended mitigations."
   }
-  return "No configured detection rules triggered on this capture; under those rules no findings were confirmed. Continue routine monitoring. The risk score reflects the configured detection rules and does not represent a probability of compromise."
+  const encNote = typeof opts.encryptedSharePct === "number" && opts.encryptedSharePct >= 50
+    ? ` Note: ${Math.round(opts.encryptedSharePct)}% of traffic is encrypted (QUIC/TLS) and its content was not decodable — the rules evaluated packet/flow statistics and unencrypted protocols only; no content-level verification of the encrypted traffic was possible.`
+    : ""
+  return `No configured detection rules triggered on this capture; under those rules no findings were confirmed. Continue routine monitoring. The risk score reflects the configured detection rules and does not represent a probability of compromise.${encNote}`
 }
 
 export function buildReportAnalysis(state: ReportState): ReportAnalysis {

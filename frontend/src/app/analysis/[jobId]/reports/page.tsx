@@ -466,6 +466,40 @@ export default function ReportsPage() {
   // and come back from the resolver, so they are packets, not queries.
   const dnsQueries = dns.filter((d) => !d.isResponse).length
 
+  // QUIC/encryption visibility: QUIC Initial packets are the only decryptable
+  // handshake window (they carry the ClientHello in a CRYPTO frame) — a
+  // mid-session capture can hold 56k QUIC packets with ZERO Initials, which
+  // must read as "encryption inferred, not decoded", never as payload
+  // evidence (QA: big.pcapng — CSV said "payload" next to 0 handshakes).
+  const { quicFlowCount, quicHandshakePkts, httpsPortPkts, encSharePct } = useMemo(() => {
+    let quicFlows = 0
+    for (const f of flows) if (f.appProtocol === "QUIC") quicFlows += 1
+    let handshake = 0
+    let enc = 0
+    let https = 0
+    for (const p of packets) {
+      if (p.appProtocol === "QUIC") {
+        if (p.appPayloadConfirmed) handshake += 1
+        enc += 1
+      } else if (p.appProtocol === "TLS" || p.appProtocol === "HTTPS") {
+        https += 1
+        enc += 1
+      }
+    }
+    return { quicFlowCount: quicFlows, quicHandshakePkts: handshake, httpsPortPkts: https, encSharePct: packets.length > 0 ? (enc / packets.length) * 100 : 0 }
+  }, [flows, packets])
+  // Application-layer visibility is a SEPARATE dimension from capture quality
+  // (frame completeness): a GOOD dedupe rate says nothing about whether
+  // packet CONTENT could be inspected (QA: big.pcapng "Capture quality: GOOD"
+  // next to 97.7% encrypted, zero decodable application payloads).
+  const appVisibilityLabel = useMemo(() => {
+    if (packets.length === 0) return "N/A — no packets"
+    const pct = encSharePct.toFixed(0)
+    if (encSharePct >= 50) return `LIMITED — ${pct}% of packets are encrypted (QUIC/TLS); payload inspection was not possible`
+    if (encSharePct >= 25) return `PARTIAL — ${pct}% of packets are encrypted (QUIC/TLS); content inspection applies to the decodable remainder`
+    return `HIGH — only ${pct}% of packets are encrypted (QUIC/TLS); most traffic carried decodable application content`
+  }, [packets.length, encSharePct])
+
   // Per-talker remote services derive from flows, which carry both directions
   // per conversation. Aliases fold into their owner so the detail line lines
   // up with the folded Top Talkers row. (Connection counts and protocol mixes
@@ -529,7 +563,34 @@ export default function ReportsPage() {
     // fabricate a STUN observation (QA: mamaji.pcapng reported "STUN traffic
     // detected" with zero STUN flows — the OR clause was the bug).
     if (packets.some((p) => p.appProtocol === "STUN")) obs.push("STUN traffic detected, consistent with NAT traversal/ICE activity — no WebRTC session was confirmed")
-    else if (packets.some((p) => p.appProtocol === "QUIC")) obs.push("QUIC traffic observed (UDP/443, encrypted transport) — no STUN or WebRTC activity present")
+    else if (packets.some((p) => p.appProtocol === "QUIC")) obs.push(quicHandshakePkts > 0
+      ? `QUIC traffic observed on UDP/443 (${plural(quicHandshakePkts, "payload-verified Initial handshake packet")}) — no STUN or WebRTC activity present; QUIC's TLS sessions remain encrypted`
+      : "QUIC traffic observed on UDP/443 (port-inferred — no QUIC Initial handshake packets captured; QUIC carries TLS inside its CRYPTO frames, so session content was not decoded) — no STUN or WebRTC activity present")
+    // Attribution honesty: a dominant external endpoint with no identity
+    // evidence must be called an attribution gap, never silently folded into
+    // a clean verdict (QA: big.pcapng — 185.165.242.20 carried 99.5% of
+    // external packets yet nothing in the capture names it).
+    const extByIp = new Map<string, number>()
+    for (const p of packets) {
+      const seen = new Set<string>()
+      for (const ip of [p.srcIp, p.dstIp]) {
+        if (!ip || ip === "\u2014" || seen.has(ip)) continue
+        seen.add(ip)
+        if (!isNonUnicast(ip) && !isPrivateIP(ip) && !localOwned.has(ip)) extByIp.set(ip, (extByIp.get(ip) ?? 0) + 1)
+      }
+    }
+    const extTotal = [...extByIp.values()].reduce((a, b) => a + b, 0)
+    const extTop = [...extByIp.entries()].sort((a, b) => b[1] - a[1])[0]
+    if (extTop && extTotal > 0 && extTop[1] >= 1000 && (extTop[1] / extTotal) * 100 >= 70) {
+      const identified = new Set<string>()
+      for (const d of dns) if (d.answer && d.answer !== "\u2014") identified.add(d.answer)
+      for (const t of tls) if (t.dstIp) identified.add(t.dstIp)
+      for (const c of certificates) for (const san of c.san) if (!isNonUnicast(san) && !isPrivateIP(san)) identified.add(san)
+      if (!identified.has(extTop[0])) {
+        const cc = geoMap.get(extTop[0])?.countryCode
+        obs.push(`External endpoint ${extTop[0]}${cc && cc !== "??" && cc !== "LOC" ? ` (${cc})` : ""} carries ${((extTop[1] / extTotal) * 100).toFixed(1)}% of external traffic (${extTop[1].toLocaleString()} packets) with no identity evidence — no DNS answer, TLS SNI or certificate names it, so its destination and purpose are unverified (an attribution gap, not a finding)`)
+      }
+    }
     // WhatsApp: STUN + XMPP (5222) + WhatsApp's chat/media domains together
     // are that app's signature (A3).
     const whatsappLike =
@@ -622,7 +683,7 @@ export default function ReportsPage() {
       obs.push(`${duplicateFrames} consecutive duplicate frame${duplicateFrames === 1 ? "" : "s"} removed before analysis (double-capture artifact, ${dupPct}% of ${rawCount.toLocaleString()} raw frames) — detections and the risk score are computed on the analyzed set (${(rawCount - duplicateFrames).toLocaleString()} analyzed)${dupPct >= 25 ? "; capture quality POOR — interpret packet-rate, loss, retransmission and timing statistics cautiously" : dupPct >= 5 ? "; capture quality DEGRADED — interpret packet-rate and timing statistics cautiously" : ""}`)
     }
     return obs
-  }, [packets, dns, http, tls, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job, credentials])
+  }, [packets, dns, http, tls, dnsQueries, undecodable, linkTypes, flows, duplicateFrames, job, credentials, geoMap, localOwned, certificates, quicHandshakePkts])
   const recs = useMemo(() => {
     type RecRow = { text: string; source: "CONFIRMED_ALERT" | "BEHAVIORAL_METRIC"; status?: DetectionStatus; priority?: "IMMEDIATE" | "INVESTIGATE" | "MONITOR" }
     const groups = { High: [] as RecRow[], Medium: [] as RecRow[], Low: [] as RecRow[] }
@@ -669,6 +730,10 @@ export default function ReportsPage() {
     // measurable time interval (single packet / zero duration) yields an
     // INSUFFICIENT EVIDENCE verdict — never "clean" (QA: 1-SYN capture).
     quality: advancedMetrics?.rates?.quality,
+    // A clean verdict on a mostly-encrypted capture must state the
+    // visibility limit — 0/100 never means content was verified (QA:
+    // big.pcapng 97.7% QUIC).
+    encryptedSharePct: encSharePct,
   })
 
   const handleExport = () => {
@@ -733,11 +798,12 @@ export default function ReportsPage() {
       "",
       "## Traffic",
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)} (unique GeoIP-resolved countries across external endpoints, either direction)`,
+      `- Application-layer visibility: ${appVisibilityLabel} — this is separate from capture quality (frame completeness) and from the risk score (QA: big.pcapng read "Capture quality: GOOD" next to 97.7% encrypted traffic with no decodable application payloads).`,
       `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design. Sessions equal the conversation count: flows are already direction-agnostic (both directions merged into one flow), and each session is that conversation with its TCP state (ESTABLISHED / STATELESS / …) attached.`,
-      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}`,
+      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TLS handshakes: ${tls.length}${quicFlowCount > 0 ? ` · QUIC: ${plural(quicFlowCount, "connection")} (${plural(quicHandshakePkts, "Initial handshake packet")} decoded — QUIC's TLS handshake lives in CRYPTO frames and is never a TCP TLS handshake)` : ""}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
       `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} (credential submissions are the HTTP requests whose decoded body carried a username and/or password field — not every HTTP request) · ${plural(certificates.length, "unique certificate")} decoded (deduplicated by subject+serial across the capture)`,
-      ...(report.notables.length ? [`- Notable destinations (neutral, not findings — these domains appeared in the capture's own TLS Server Name or HTTP Host fields, so the connection was made by a host inside the capture, not by PacketLens; presence alone is not a malicious indicator): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : []),
+      ...(report.notables.length ? [`- Notable destinations (neutral, not findings — these domains appeared in the capture's own TLS Server Name or HTTP Host fields, so the connection was made by a host inside the capture, not by PacketLens; presence alone is not a malicious indicator, and an absence of notable destinations is only a curated-list negative — it does not establish benignness or a clean reputation): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : [`- No notable destinations from the curated list — a curated-list negative only: it does not establish that the endpoints are benign or reputable.`]),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
       ...(undecodable ? [`## Data Quality`, `- **WARNING:** only ${(decodeRate * 100).toFixed(0)}% of packets decoded (${linkTypes.length > 0 ? dltName(linkTypes) : "encapsulation unknown"}). Lengths and timestamps were parsed; headers were not. Verdict is UNKNOWN — re-capture with a decodable link type or explicit DLT override.`, ""] : []),
@@ -800,7 +866,7 @@ export default function ReportsPage() {
     if (recLines.length === 0) recLines.push("- No security detections triggered — no corrective security recommendations. Network-health observations above (retransmissions, estimated loss, RTT, RST) are informational network diagnostics, NOT security findings, and do not change this recommendation.")
     lines.push("## Recommendations", ...recLines)
     lines.push("", "## Analyst Conclusion", verdictLine(levelLabel, scoreVal, undecodable, verdictStatusHint), `- ${conclusionText}`)
-    lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${exportTs} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"}`)
+    lines.push("", "## Appendix", `- Analysis completed: ${job.createdAt ? new Date(job.createdAt).toISOString().slice(0, 19).replace("T", " ") + " UTC" : "—"} · Export generated: ${exportTs} UTC · Mode: ${report.metadata.mode} · Schema: ${report.metadata.schemaVersion}`, `- Build: v${BUILD_INFO.version}${BUILD_INFO.isGit ? ` · Commit: ${BUILD_INFO.commit} (${BUILD_INFO.commitShort})` : ` · Source: build env (src:${BUILD_INFO.sourceHash || "unknown"})`} · Built: ${BUILD_INFO.builtAt}`, `- Analyzer: ${report.metadata.analyzerVersion || ANALYZER_VERSION} · Risk spec: ${report.metadata.riskSpecVersion || RISK_SPEC_VERSION} · Signature DB: ${report.metadata.ruleVersion || "Behavioral Detection Only"} · GeoIP (DB-IP City Lite): ${jobInfo?.geoDbVersion || "Lookup Unavailable"} · OUI: ${ouiStatus}`, `- Decoded: ${decode?.decoded.toLocaleString() ?? "—"} of ${(decode?.total ?? stats.totalPackets).toLocaleString()} packets${duplicateFrames > 0 ? ` · ${duplicateFrames.toLocaleString()} consecutive duplicate frames removed before analysis` : ""} · Encapsulation: ${linkTypes.length > 0 ? dltName(linkTypes) : "—"} · Application-layer visibility: ${appVisibilityLabel}`)
     return lines.join("\n")
   }
 
@@ -885,10 +951,14 @@ export default function ReportsPage() {
                   {undecodable && (
                     <p className="text-danger font-medium">Data quality: only {(decodeRate * 100).toFixed(0)}% of packets decoded ({linkTypes.length > 0 ? dltName(linkTypes) + " encapsulation" : "encapsulation unknown"}). No headers were parsed — check the capture link type or re-capture with an explicit DLT override; the verdict below is UNKNOWN.</p>
                   )}
-                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p>DNS: <strong>{plural(dnsQueries, "query packet")}</strong> + <strong>{plural(dns.length - dnsQueries, "response")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>.</p>}
-                  {tls.length === 0 && (packets.some((p) => p.appProtocol === "TLS" || p.appProtocol === "HTTPS") || packets.some((p) => p.appProtocol === "QUIC")) && (packets.some((p) => p.appProtocol === "QUIC" && p.appPayloadConfirmed)
-                    ? <p className="text-warning">QUIC traffic is present (payload-verified, UDP/443) — the TLS sessions inside QUIC are encrypted and no ClientHello/ServerHello packets were captured, so no TLS details, SNI or certificates are decoded.</p>
-                    : <p className="text-warning">TCP/443 HTTPS or QUIC traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>)}
+                  {(dnsQueries > 0 || http.length > 0 || tls.length > 0) && <p>DNS: <strong>{plural(dnsQueries, "query packet")}</strong> + <strong>{plural(dns.length - dnsQueries, "response")}</strong> ({plural(dnsLookupCount(dns), "distinct lookup")}), <strong>{plural(http.length, "HTTP request")}</strong>, <strong>{plural(tls.length, "TLS handshake")}</strong>{quicFlowCount > 0 ? <> — <strong>{plural(quicFlowCount, "QUIC connection")}</strong> (<strong>{plural(quicHandshakePkts, "Initial handshake packet")}</strong> decoded; QUIC's TLS handshake is carried in CRYPTO frames, separate from TCP TLS handshakes)</> : null}.</p>}
+                  {tls.length === 0 && (httpsPortPkts > 0 || quicFlowCount > 0) && (quicFlowCount > 0 && httpsPortPkts === 0
+                    ? (quicHandshakePkts > 0
+                      ? <p className="text-warning">QUIC traffic is present on UDP/443 — <strong>{plural(quicFlowCount, "connection")}</strong> with <strong>{plural(quicHandshakePkts, "payload-verified Initial handshake packet")}</strong> decoded; the TLS sessions inside QUIC are encrypted, and no ClientHello/ServerHello-style TLS metadata, SNI or certificates are extracted from its CRYPTO frames.</p>
+                      : <p className="text-warning">QUIC traffic is present on UDP/443 (<strong>{plural(quicFlowCount, "connection")}</strong>, port-inferred — no QUIC Initial handshake packets captured, so the encryption is inferred, not decoded; the capture likely began mid-session). QUIC carries TLS inside its CRYPTO frames, and no handshake, SNI or certificate data was extracted.</p>)
+                    : quicFlowCount > 0
+                      ? <p className="text-warning">QUIC traffic is present on UDP/443 (<strong>{plural(quicFlowCount, "connection")}</strong>, port-inferred — no QUIC Initial handshake packets captured) alongside TCP/443 HTTPS (port-inferred) — the encryption is inferred, not decoded: no QUIC Initial handshake or TLS ClientHello/ServerHello packets were captured, so no handshake, SNI or certificate data was extracted from either.</p>
+                      : <p className="text-warning">TCP/443 HTTPS traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>)}
                   {files.length > 0 && <p><strong>{plural(files.length, "HTTP payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong> ({credentials.length > 0 ? "HTTP requests whose decoded body carried a username and/or password field — not every HTTP request" : "none of the HTTP requests carried credential fields"}), <strong>{plural(certificates.length, "unique certificate")}</strong> decoded.</p>}
                   {alerts.length > 0 ? (
                     <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
@@ -909,6 +979,9 @@ export default function ReportsPage() {
                   <p>
                     Raw frames: <strong>{job.rawPacketCount.toLocaleString()}</strong> · Consecutive duplicate frames removed: <strong>{job.duplicateFrameCount?.toLocaleString() ?? 0}</strong> · Analyzed: <strong>{stats.totalPackets.toLocaleString()}</strong>
                     {dedupeGrade && <span className={`ml-2 font-medium ${dedupeGrade.color}`}>Capture quality: {dedupeGrade.label}</span>}
+                  </p>
+                  <p>
+                    Application-layer visibility: <strong>{appVisibilityLabel}</strong> — a separate dimension from capture quality (frame completeness): a clean dedupe rate does not mean packet content could be inspected.
                   </p>
                   <p>Every metric, detection and risk score is computed on the analyzed set — duplicate capture artifacts never inflate flows, SYN counts or rates.</p>
                 </div>
@@ -1321,7 +1394,7 @@ export default function ReportsPage() {
               <Card>
                 <CardContent className="pt-6">
                   {report.notables.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">No destinations matched the curated notable families (threat-intelligence services, disposable/temporary email providers, DNS-over-HTTPS resolvers, Tor/anonymization projects, user-hosted github.io content).</p>
+                    <p className="text-xs text-muted-foreground">No destinations matched the curated notable families (threat-intelligence services, disposable/temporary email providers, DNS-over-HTTPS resolvers, Tor/anonymization projects, user-hosted github.io content) — a curated-list negative only: it does not establish that the endpoints are benign or reputable, and it says nothing about destinations outside the list.</p>
                   ) : (
                     <div className="overflow-x-auto">
                       <table className="w-full text-xs">
@@ -2198,7 +2271,7 @@ export default function ReportsPage() {
                       {job.md5 && <p><strong>MD5:</strong> <span className="font-mono text-xs">{job.md5}</span></p>}
                       <p><strong>Packets:</strong> {stats.totalPackets.toLocaleString()} · <strong>Flows:</strong> {stats.totalFlows.toLocaleString()} · <strong>Sessions:</strong> {stats.sessions.toLocaleString()} · <strong>Local Devices:</strong> {stats.devices.toLocaleString()}</p>
                       <p><strong>Duration:</strong> {durLabel(durationSec)} · <strong>External IPs:</strong> {stats.externalIps} · <strong>Countries:</strong> {countriesLabel(stats.countries, stats.externalIps)}</p>
-                      <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"}{duplicateFrames > 0 ? <> · <strong>{duplicateFrames.toLocaleString()} consecutive duplicate frames</strong> removed before analysis</> : null} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"}</p>
+                      <p><strong>Decoded:</strong> {decode ? `${decode.decoded.toLocaleString()} of ${decode.total.toLocaleString()} packets (${(decodeRate * 100).toFixed(0)}%)` : "—"}{duplicateFrames > 0 ? <> · <strong>{duplicateFrames.toLocaleString()} consecutive duplicate frames</strong> removed before analysis</> : null} · <strong>Encapsulation:</strong> {linkTypes.length > 0 ? dltName(linkTypes) : "—"} · <strong>Application-layer visibility:</strong> {appVisibilityLabel}</p>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
                           <h4 className="font-semibold mb-2">Report Metadata</h4>
