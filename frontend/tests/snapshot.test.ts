@@ -197,9 +197,10 @@ describe("canonical Analysis JSON snapshot (schema contract)", () => {
     expect(r.metadata.captureQuality).toBe(a.validator.captureQuality)
     expect(r.metadata.ratesAvailable).toBe(a.validator.durationSec !== null)
     expect(r.risk!.normalizedScore).toBe(a.job.riskScore)
-    // The verdict level is the score band floored by the strongest finding —
-    // this capture has a confirmed High finding under a LOW score band.
-    expect(r.risk!.levelLabel).toBe(verdictLevel(riskLevel(a.job.riskScore), a.job.highestSeverity).label)
+    // The verdict level is the score band floored by the CONFIRMED finding
+    // severity — this capture has a confirmed High finding under a LOW band.
+    expect(r.risk!.levelLabel).toBe(verdictLevel(riskLevel(a.job.riskScore), r.risk!.confirmedSeverity).label)
     expect(r.risk!.highestSeverity).toBe(4)
+    expect(r.risk!.confirmedSeverity).toBe(4)
   })
 })

@@ -383,6 +383,34 @@ it("burst bonus is reported as applied only when an eligible rule actually benef
     expect(buildReportRisk([medAlert], metrics)?.levelLabel).toBe("MEDIUM")
   })
 
+  it("verdict floors by the CONFIRMED severity — a suspected CRITICAL rule never headlines above a confirmed HIGH finding", () => {
+    const base = (over: Partial<AlertEntry>): AlertEntry => ({
+      id: "t1", timestamp: new Date(T0 * 1000).toISOString(), signature: "x", category: "x",
+      severity: 4, confidence: 75, ruleId: "HTTP-CREDS-001", srcIp: "10.0.0.5", dstIp: "8.8.8.8",
+      srcPort: 0, dstPort: 0, protocol: "TCP", evidence: "x", ...over,
+    })
+    const metrics = { burst: null, beaconDetected: false } as unknown as AdvancedMetrics
+    const confirmedHigh = base({ id: "c1", signature: "Plaintext HTTP Credentials", ruleId: "HTTP-CREDS-001", status: "CONFIRMED" })
+    const suspectedCritical = base({ id: "s1", signature: "Suspected Large Outbound Transfer", ruleId: "DATA-EXFIL-001", severity: 5, status: "SUSPECTED" })
+    const r = buildReportRisk([confirmedHigh, suspectedCritical], metrics)
+    // The numeric score is untouched; the LEVEL is the confirmed severity —
+    // the suspected 5/5 must not push the verdict to CRITICAL (QA: log.pcapng
+    // read "CRITICAL — unconfirmed" while only the High was confirmed).
+    expect(r?.highestSeverity).toBe(5)
+    expect(r?.confirmedSeverity).toBe(4)
+    expect(r?.suspectedSeverity).toBe(5)
+    expect(r?.levelLabel).toBe("HIGH")
+    // All-suspected findings still floor by the strongest suspected severity.
+    const onlySuspected = buildReportRisk([suspectedCritical], metrics)
+    expect(onlySuspected?.confirmedSeverity).toBe(0)
+    expect(onlySuspected?.suspectedSeverity).toBe(5)
+    expect(onlySuspected?.levelLabel).toBe("CRITICAL")
+    // Legacy alerts without a status are CONFIRMED (strongest grouping).
+    const legacy = buildReportRisk([base({ id: "l1" })], metrics)
+    expect(legacy?.confirmedSeverity).toBe(4)
+    expect(legacy?.suspectedSeverity).toBe(0)
+  })
+
   it("rawScore stays UNROUNDED so the breakdown's curve row agrees with the normalized score (audit)", () => {
     // TLS-SUSPICIOUS-001 (sev 3 → 8, rule 25) at confidence 40 → 0.5×
     // multiplier → raw 11.5: a fractional raw must NOT be pre-rounded. The
@@ -1030,7 +1058,7 @@ it("buildFlowsCsv: BOM + split IP/port columns + sent+recv = total + empty cells
 
 it("verdictLine renders per-class text: SAFE becomes NO DETECTIONS; LOW/MEDIUM/HIGH/CRITICAL and UNKNOWN on undecodable", () => {
     expect(verdictLine("SAFE", 0, false)).toBe("- **Final verdict:** **NO DETECTIONS** \u2014 risk 0/100 \u2014 no configured detection rules triggered (absence of detection is not proof of a clean network)")
-    expect(verdictLine("LOW", 12, false)).toBe("- **Final verdict:** **LOW** \u2014 risk 12/100 \u2014 risk 12/100 is in the SAFE score band; the verdict level is the strongest finding's rule severity (1\u20135), not the score band")
+    expect(verdictLine("LOW", 12, false)).toBe("- **Final verdict:** **LOW** \u2014 risk 12/100 \u2014 risk 12/100 is in the SAFE score band; the verdict level is the highest CONFIRMED finding's rule severity (1\u20135), not the score band (unconfirmed rules with a higher severity are stated separately)")
     expect(verdictLine("MEDIUM", 55, false)).toBe("- **Final verdict:** **MEDIUM** \u2014 risk 55/100")
     expect(verdictLine("HIGH", 73, false)).toBe("- **Final verdict:** **HIGH** \u2014 risk 73/100")
     expect(verdictLine("CRITICAL", 86, false)).toBe("- **Final verdict:** **CRITICAL** \u2014 risk 86/100")

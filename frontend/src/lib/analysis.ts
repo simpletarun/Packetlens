@@ -2206,8 +2206,12 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   if (dnsTunnelingSuspected) {
     iocs.push({ type: "dns-tunneling", value: "Suspicious DNS patterns", description: dnsTunnelEvidence, severity: 3 })
   }
+  // The finding is directional byte-ratio behavior only — a suspected rule,
+  // never a claim of data exfiltration (QA: log.pcapng — 1 of 2,622 packets
+  // payload-verified (0.038%), so the value must read as a potential
+  // asymmetric transfer, not an established exfiltration event).
   if (dataExfiltrationSuspected) {
-    iocs.push({ type: "data-exfiltration", value: "Large outbound transfers", description: dataExfilDetail || "Significant data transfer to external IPs", severity: 4 })
+    iocs.push({ type: "data-exfiltration", value: "Potential asymmetric outbound transfer", description: dataExfilDetail || "Significant data transfer to external IPs", severity: 4 })
   }
   if (beaconDetected) {
     iocs.push({ type: "beaconing", value: "Periodic communication detected", description: beaconEvidence, severity: 3 })

@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils"
 import { riskLevel, riskColorClass, verdictLevel } from "@/lib/risk"
 import { formatBytes, isLanFlow } from "@/lib/map-data"
 import { packetProtocolCounts } from "@/lib/analysis"
-import { localOwnedAddresses, decodeRateOf } from "@/lib/report"
+import { localOwnedAddresses, decodeRateOf, confirmedSeverityOf } from "@/lib/report"
 import { resolveHomeLocation, type GeoLocation } from "@/lib/geo"
 import { ProtoDonut } from "@/components/analysis/map-chrome"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -44,12 +44,16 @@ export default function VisualizationsPage() {
   // while the report says UNKNOWN (QA).
   const undecodable = useMemo(() => decodeRateOf(decode, packets) < 0.05, [decode, packets])
 
-  // Verdict level = score band floored by the strongest finding severity,
-  // identical to the report's buildReportRisk — a HIGH-severity alert at a
-  // 39/100 LOW score must read HIGH here too (QA).
+  // Verdict level = score band floored by the highest CONFIRMED finding
+  // severity (falling back to the strongest overall severity when nothing is
+  // confirmed), identical to the report's buildReportRisk — a HIGH-severity
+  // alert at a 39/100 LOW score must read HIGH here too, while a SUSPECTED
+  // critical rule never headlines above a confirmed High finding (QA:
+  // log.pcapng verdict overstated the confirmed incident).
   const riskLevelObj = useMemo(() => {
     const highest = alerts.reduce((m, a) => Math.max(m, a.severity), 0)
-    return verdictLevel(riskLevel(stats.riskScore), highest)
+    const confirmed = confirmedSeverityOf(alerts)
+    return verdictLevel(riskLevel(stats.riskScore), confirmed > 0 ? confirmed : highest)
   }, [stats.riskScore, alerts])
 
   // Home = the analyst's own location, known only from an online self-lookup

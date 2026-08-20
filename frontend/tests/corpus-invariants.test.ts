@@ -370,7 +370,14 @@ async function audit(file: string, display: string) {
       expect.soft([0.5, 1, 1.5].includes(i.confidenceMult), `${display}: risk mult ${i.ruleId}`).toBe(true)
       expect.soft(Math.abs(i.contribution - (i.severityWeight + i.ruleWeight) * i.confidenceMult) <= 0.11, `${display}: risk contribution ${i.ruleId}`).toBe(true)
     }
-    expect.soft(verdictLevel(riskLevel(br.normalizedScore), br.highestSeverity ?? 0).label, `${display}: risk level`).toBe(br.levelLabel)
+    // Level = band floored by the highest CONFIRMED severity (fallback: the
+    // strongest overall severity) — the same rule buildReportRisk applies, so
+    // a SUSPECTED critical never headlines above a confirmed High (QA:
+    // log.pcapng / my.pcapng verdicts overstated the confirmed incident).
+    const floorSev = (br.confirmedSeverity ?? 0) > 0 ? br.confirmedSeverity : br.highestSeverity ?? 0
+    expect.soft(verdictLevel(riskLevel(br.normalizedScore), floorSev).label, `${display}: risk level`).toBe(br.levelLabel)
+    expect.soft(br.suspectedSeverity ?? 0, `${display}: suspected severity`).toBeLessThanOrEqual(br.highestSeverity ?? 0)
+    expect.soft(br.confirmedSeverity ?? 0, `${display}: confirmed severity`).toBeLessThanOrEqual(br.highestSeverity ?? 0)
     expect.soft(!!br.burstApplied, `${display}: burstApplied`).toBe(boost && br.items.some((i) => BURST_RULES.has(i.ruleId)))
   }
 

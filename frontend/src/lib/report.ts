@@ -218,6 +218,21 @@ export function effectiveStatus(a: { status?: DetectionStatus }): DetectionStatu
   return a.status ?? "CONFIRMED"
 }
 
+// Highest severity among CONFIRMED findings (0 when none) — the confirmed
+// severity drives the verdict level, so a SUSPECTED critical rule can never
+// headline as a confirmed critical incident next to a confirmed High finding
+// (QA: log.pcapng verdict read "CRITICAL — unconfirmed" while the only
+// confirmed finding was High).
+export function confirmedSeverityOf(alerts: { severity: number; status?: DetectionStatus }[]): number {
+  return alerts.filter((a) => effectiveStatus(a) === "CONFIRMED").reduce((m, a) => Math.max(m, a.severity), 0)
+}
+
+// Highest severity among unconfirmed (SUSPECTED/LIKELY) findings (0 when
+// none) — surfaced separately whenever it exceeds the confirmed severity.
+export function suspectedSeverityOf(alerts: { severity: number; status?: DetectionStatus }[]): number {
+  return alerts.filter((a) => effectiveStatus(a) !== "CONFIRMED").reduce((m, a) => Math.max(m, a.severity), 0)
+}
+
 // The one label used by every report section (IOCs, MITRE, recommendations,
 // markdown): the detection's own status when known, the legacy source label
 // otherwise — never "Confirmed" for a SUSPECTED finding.
@@ -476,6 +491,12 @@ export interface ReportRisk {
   /** Max finding severity (0-5) among the alerts, shown next to the score so
    *  numeric normalization never hides a HIGH/Critical finding. */
   highestSeverity: number
+  /** Max severity among CONFIRMED findings (0 when none) — drives the
+   *  verdict level so a suspected rule can never headline as confirmed. */
+  confirmedSeverity: number
+  /** Max severity among unconfirmed (SUSPECTED/LIKELY) findings (0 when
+   *  none) — stated separately when it exceeds the confirmed severity. */
+  suspectedSeverity: number
 }
 
 interface IocFinding {
@@ -611,10 +632,18 @@ export function buildReportRisk(alerts: AlertEntry[], advancedMetrics: AdvancedM
   // HIGH-severity alert with a 39/100 LOW score must never read as a
   // downgrade of the finding itself.
   const highestSeverity = alerts.reduce((m, a) => Math.max(m, a.severity), 0)
+  // Confirmed findings drive the verdict level: a SUSPECTED CRITICAL rule
+  // must never headline as "CRITICAL" next to a confirmed HIGH finding —
+  // the level is floored by the highest CONFIRMED severity, and the
+  // suspected severity is reported separately (QA: log.pcapng — suspected
+  // DATA-EXFIL-001 at 5/5 vs confirmed HTTP-CREDS-001 at 4/4 read as
+  // "CRITICAL — unconfirmed" and overstated the confirmed incident).
+  const confirmedSeverity = confirmedSeverityOf(alerts)
+  const suspectedSeverity = suspectedSeverityOf(alerts)
   // Verdict level = score band, floored by the finding severity (severity
   // floor): the numeric score stays honest, but a capture with a confirmed
   // High finding is never presented as LOW.
-  const level = verdictLevel(riskLevel(b.normalizedScore), highestSeverity)
+  const level = verdictLevel(riskLevel(b.normalizedScore), confirmedSeverity > 0 ? confirmedSeverity : highestSeverity)
   return {
     // Unrounded raw: the breakdown's curve row substitutes THIS value, so
     // rounding it here would make the displayed formula disagree with the
@@ -628,6 +657,8 @@ export function buildReportRisk(alerts: AlertEntry[], advancedMetrics: AdvancedM
     items: b.items,
     burstApplied,
     highestSeverity,
+    confirmedSeverity,
+    suspectedSeverity,
   }
 }
 
@@ -1359,15 +1390,18 @@ export function verdictLine(levelLabel: string, scoreVal: number, undecodable: b
   // from reading as a confirmed incident (QA: open.pcapng "53/100 CRITICAL"
   // with "No findings were confirmed").
   const displayLabel = levelLabel === "SAFE" ? "NO DETECTIONS" : levelLabel
-  // When the verdict level is the strongest finding's SEVERITY, not the score
-  // band, the line must never read "53/100 CRITICAL" as if 53 itself were the
-  // critical band (QA: my.pcapng "73/100 CRITICAL — unconfirmed" and
-  // open.pcapng "53/100 CRITICAL" conflated score, severity and confidence).
+  // When the verdict level is a finding's SEVERITY, not the score band, the
+  // line must never read "53/100 CRITICAL" as if 53 itself were the critical
+  // band (QA: my.pcapng "73/100 CRITICAL — unconfirmed" and open.pcapng
+  // "53/100 CRITICAL" conflated score, severity and confidence). Since the
+  // level is floored by the highest CONFIRMED severity (a suspected critical
+  // rule never headlines as a confirmed incident — QA: log.pcapng), the note
+  // says CONFIRMED and points at the separately-stated unconfirmed rules.
   // The band note fires exactly when they differ: SAFE/LOW/MEDIUM/HIGH/CRITICAL
   // scores that sit in their own band carry no note.
   const band = undecodable ? null : riskLevel(scoreVal).label
   const floorNote = !undecodable && levelLabel !== "SAFE" && band !== null && band !== levelLabel
-    ? ` — risk ${scoreVal}/100 is in the ${band} score band; the verdict level is the strongest finding's rule severity (1–5), not the score band`
+    ? ` — risk ${scoreVal}/100 is in the ${band} score band; the verdict level is the highest CONFIRMED finding's rule severity (1–5), not the score band (unconfirmed rules with a higher severity are stated separately)`
     : ""
   return `- **Final verdict:** **${displayLabel}** — ${undecodable ? "risk not computable (insufficient data)" : `risk ${scoreVal}/100`}${levelLabel === "SAFE" ? " — no configured detection rules triggered (absence of detection is not proof of a clean network)" : ""}${statusHint}${floorNote}`
 }

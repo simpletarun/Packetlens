@@ -9,7 +9,7 @@ import { isPrivateIP, formatBytes } from "@/lib/map-data"
 import { vendorLabel, displayMac, isUnicastMac } from "@/lib/oui"
 import { riskLevel, riskColorClass, verdictLevel, RISK_CURVE_K } from "@/lib/risk"
 import { analysisProblems } from "@/lib/analysis"
-import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, flowServiceEvidence, flowServiceName, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, sharePctLabel, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, rstAttribution, credentialEventCount, type DetectionStatus } from "@/lib/report"
+import { buildReportAnalysis, analystConclusion, portServiceName, talkerServicesOf, bandwidthStats, iocTypeLabel, shortAlertName, RISK_SPEC_VERSION, dnsLookupCount, dnsUniqueDomains, dnsNameOf, servicePortCounts, serviceEvidenceLabel, flowServiceEvidence, flowServiceName, osFromUserAgent, dltName, buildFlowsCsv, verdictLine, ownerOfDevices, localOwnedAddresses, endpointRowsOf, tcpHealthRttCaption, duplicateFrameCountOf, countryCountsByDst, sharePctLabel, escHtml as esc, mdInline as inline, binWidthSec, decodeRateOf, markdownToHtml, plural, flowTableRows, sessionTableRows, statusLabel, effectiveStatus, findingSourceLabel, summarizeStatuses, statusCountsLabel, reportDurationSec, flowInitiatorFlip, rstAttribution, confirmedSeverityOf, suspectedSeverityOf, credentialEventCount, type DetectionStatus } from "@/lib/report"
 import { ANALYZER_VERSION, isNonUnicast, estimatedTcpLoss } from "@/lib/analysis"
 import { formatDuration } from "@/lib/stats"
 import { BUILD_INFO, BUILD_STAMP } from "@/lib/build-stamp"
@@ -370,12 +370,24 @@ export default function ReportsPage() {
   // explicitly (QA: open.pcapng "53/100 CRITICAL" with "No findings were
   // confirmed" read as a confirmed critical incident).
   const highestSev = risk?.highestSeverity ?? job?.highestSeverity ?? 0
-  const topUnconfirmedAlert = highestSev > 0
-    ? alerts.find((a) => a.severity === highestSev && effectiveStatus(a) !== "CONFIRMED")
+  // CONFIRMED findings drive the verdict: a SUSPECTED critical rule must
+  // never headline as "CRITICAL" next to a confirmed HIGH finding — the
+  // verdict level is floored by the highest CONFIRMED severity, and the
+  // suspected severity is reported separately (QA: log.pcapng — suspected
+  // DATA-EXFIL-001 (5/5) vs confirmed HTTP-CREDS-001 (4/5) read as
+  // "CRITICAL — unconfirmed" and overstated the confirmed incident).
+  const confirmedSeverity = confirmedSeverityOf(alerts)
+  const suspectedSeverity = suspectedSeverityOf(alerts)
+  const topSuspectedAlert = suspectedSeverity > 0
+    ? alerts.find((a) => a.severity === suspectedSeverity && effectiveStatus(a) !== "CONFIRMED")
     : undefined
-  const verdictStatusHint = topUnconfirmedAlert
-    ? ` — unconfirmed (strongest finding: ${statusLabel(topUnconfirmedAlert.status ?? "SUSPECTED")})`
-    : ""
+  const verdictStatusHint = confirmedSeverity > 0
+    ? suspectedSeverity > confirmedSeverity
+      ? ` — unconfirmed ${sevLabel(suspectedSeverity)}-severity rule ${statusLabel(topSuspectedAlert?.status ?? "SUSPECTED")}; verdict reflects the highest CONFIRMED finding (${sevLabel(confirmedSeverity)})`
+      : ""
+    : highestSev > 0
+      ? ` — unconfirmed (strongest finding: ${statusLabel(topSuspectedAlert?.status ?? "SUSPECTED")})`
+      : ""
 
   // Capture window from the actual packet timestamps (min/max — pcap files can
   // hold out-of-order packets), normalized from ISO or epoch-second shapes.
@@ -766,10 +778,16 @@ export default function ReportsPage() {
   const scoreVal = risk ? risk.normalizedScore : jobScore
   // Fallback path (no advanced metrics): same severity floor the report
   // builder applies — the verdict never reads lower than the strongest
-  // finding, even when the score band alone would say SAFE/LOW.
-  const fallbackVerdict = verdictLevel(riskLevel(job.riskScore), job.highestSeverity ?? 0)
+  // CONFIRMED finding (unconfirmed rules with a higher severity are stated
+  // separately), even when the score band alone would say SAFE/LOW.
+  const fallbackVerdict = verdictLevel(riskLevel(job.riskScore), confirmedSeverity > 0 ? confirmedSeverity : job.highestSeverity ?? 0)
   const levelLabel = undecodable ? "UNKNOWN" : (risk ? risk.levelLabel : fallbackVerdict.label)
   const levelColor = undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(fallbackVerdict))
+  // A floor is actually applied when the verdict level differs from the raw
+  // score band — the explanation must fire then, whether or not the floor
+  // came with an unconfirmed-higher-severity hint (QA: log.pcapng — the
+  // confirmed-High floor under a HIGH band carried no "unconfirmed" hint).
+  const verdictFloored = !undecodable && levelLabel !== "SAFE" && levelLabel !== riskLevel(scoreVal).label
   const conclusionText = analystConclusion({
     undecodable,
     decodeRatePct: Math.round(decodeRate * 100),
@@ -838,7 +856,9 @@ export default function ReportsPage() {
         // scale is distinct from the 0–100 risk score, and an unconfirmed
         // finding is labeled as such (QA: open.pcapng "5/5 Critical" next to
         // "53/100" read as contradictory / confirmed).
-        ["Highest finding severity (1–5)", highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5)${verdictStatusHint ? " · unconfirmed" : ""}` : "None"],
+        ["Highest finding severity (1–5)", confirmedSeverity > 0
+          ? `${sevLabel(confirmedSeverity)} (${confirmedSeverity}/5) confirmed${suspectedSeverity > confirmedSeverity ? ` — unconfirmed ${sevLabel(suspectedSeverity)} (${suspectedSeverity}/5) rule suspected` : ""}`
+          : highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5) · unconfirmed` : "None"],
       ]),
       "",
       `## Capture Information`,
@@ -891,12 +911,25 @@ export default function ReportsPage() {
       lines.push("## Alerts", ...report.alerts.slice(0, 20).map((t) => `- [${sevLabel(t.severity)}] ${t.signature} (${t.srcIp} → ${t.dstIp})`), "")
     }
     if (report.iocs.length) {
-      lines.push("## Indicators & Affected Assets", ...report.iocs.slice(0, 20).map((i) => `- [${sevLabel(i.severity)}] ${i.type === "credential-theft" ? `Affected host: ${i.value}` : i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
-      if (report.iocs.some((i) => i.type === "credential-theft")) {
+      // The section separates CONFIRMED exposures from behavioral anomalies
+      // so a suspected byte-ratio rule can never be confused with a
+      // confirmed IOC (QA: log.pcapng "Large outbound transfers" sat next to
+      // the confirmed credential exposure under one "Indicators" heading).
+      const behavioralTypes = ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"]
+      const exposures = report.iocs.filter((i) => i.type === "credential-theft")
+      const behavioral = report.iocs.filter((i) => behavioralTypes.includes(i.type))
+      const indicators = report.iocs.filter((i) => i.type !== "credential-theft" && !behavioralTypes.includes(i.type))
+      lines.push("## Findings & Affected Assets")
+      if (exposures.length) {
+        lines.push("### Confirmed exposures", ...exposures.map((i) => `- [${sevLabel(i.severity)}] ${i.type === "credential-theft" ? `Affected host: ${i.value}` : i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
         lines.push("_The Plaintext Credential Exposure row lists the affected host (the machine that transmitted the credentials) and its destination — an affected host is the victim of the exposure, not an indicator of a known-malicious artifact. The capture proves the transmission, not theft, interception, or a malicious destination._", "")
       }
-      if (report.iocs.some((i) => ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"].includes(i.type))) {
+      if (behavioral.length) {
+        lines.push("### Behavioral anomalies", ...behavioral.map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
         lines.push("_Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are findings about observed traffic patterns, not indicators of a known-malicious artifact: the value describes the behavior itself, and the endpoints are not established as malicious._", "")
+      }
+      if (indicators.length) {
+        lines.push("### Indicators / IOCs", ...indicators.map((i) => `- [${sevLabel(i.severity)}] ${i.value} — ${i.description} (${findingSourceLabel(i.source, i.status)})`), "")
       }
     }
     if (calls.length) {
@@ -1060,7 +1093,9 @@ export default function ReportsPage() {
                   // Severity is surfaced ALONGSIDE the score — numeric
                   // normalization must never hide the strongest finding
                   // (a 39/100 LOW score with a HIGH finding reads as HIGH present).
-                  { label: "Highest Finding", value: highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5)${verdictStatusHint ? " · unconfirmed" : ""}` : "None", icon: ShieldAlert, color: highestSev >= 4 ? "text-danger" : "text-muted-foreground" },
+                  { label: "Highest Finding", value: confirmedSeverity > 0
+                    ? `${sevLabel(confirmedSeverity)} (${confirmedSeverity}/5) confirmed${suspectedSeverity > confirmedSeverity ? ` — unconfirmed ${sevLabel(suspectedSeverity)} (${suspectedSeverity}/5) rule suspected` : ""}`
+                    : highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5) · unconfirmed` : "None", icon: ShieldAlert, color: (confirmedSeverity > 0 ? confirmedSeverity : highestSev) >= 4 ? "text-danger" : "text-muted-foreground" },
                   // Explicit measurement window (QA: long.pcapng peak labels).
                   { label: bwInterval ? `Peak ${bwIntervalLabel} rate` : "Peak rate (whole capture)", value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
                   { label: "Avg Packet Size", value: avgPacketBytes + " B", icon: Package, color: "text-muted-foreground" },
@@ -2154,58 +2189,62 @@ export default function ReportsPage() {
              )}
 
              <section>
-                <SectionTitle icon={AlertTriangle} title="19. Indicators & Affected Assets" />
+                <SectionTitle icon={AlertTriangle} title="19. Findings & Affected Assets" />
                   <Card>
                     <CardContent className="pt-6">
-                      {report.iocs.length > 0 && report.iocs.length !== alerts.length && (
-                        <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-3">
-                          Indicator rows may exceed confirmed alerts: behavioral indicators (DNS tunneling, beaconing, exfiltration) are
-                          derived from advanced metrics, while confirmed alerts come from signature rules. Each row is labeled
-                          with its source below.
-                        </p>
-                      )}
-                      {report.iocs.some((i) => i.type === "credential-theft") && (
-                        <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-3">
-                          The Plaintext Credential Exposure row lists the <strong>affected host</strong> (the machine
-                          that transmitted the credentials) and its destination — an affected host is the <strong>victim
-                          of the exposure</strong>, not an indicator of a known-malicious artifact. The capture proves
-                          the transmission, not theft, interception, or a malicious destination.
-                        </p>
-                      )}
-                      {report.iocs.some((i) => ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"].includes(i.type)) && (
-                        <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-3">
-                          Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are
-                          <strong> findings about observed traffic patterns, not indicators of a known-malicious artifact</strong>:
-                          the value describes the behavior itself, and the endpoints are not established as malicious.
-                        </p>
-                      )}
                       {report.iocs.length === 0 ? (
                         <p className="text-sm text-muted-foreground">No malicious indicators detected — the Notable Destinations section is curated context, not indicators.</p>
                       ) : (
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-xs">
-                            <thead>
-                              <tr className="border-b text-muted-foreground">
-                                <th className="text-left py-2 pr-2">Type</th>
-                                <th className="text-left py-2 pr-2">Value</th>
-                                <th className="text-left py-2 pr-2">Description</th>
-                                <th className="text-left py-2 pr-2">Severity</th>
-                                <th className="text-left py-2">Source</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {report.iocs.map((ioc, i) => (
-                                <tr key={i} className="border-b border-border/30">
-                                  <td className="py-1.5 pr-2 text-muted-foreground">{iocTypeLabel(ioc.type)}</td>
-                                  <td className="py-1.5 pr-2 font-mono">{ioc.type === "credential-theft" ? `Affected host: ${ioc.value}` : ioc.value}</td>
-                                  <td className="py-1.5 pr-2 text-muted-foreground">{ioc.description}</td>
-                                  <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{sevLabel(ioc.severity)}</Badge></td>
-                                  <td className="py-1.5">{sourceBadge(ioc.source, ioc.status)}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
+                        <>
+                          {(() => {
+                            // Confirmed exposures vs behavioral anomalies are
+                            // split so a suspected byte-ratio rule can never
+                            // be confused with a confirmed IOC (QA: log.pcapng
+                            // "Large outbound transfers" sat next to the
+                            // confirmed credential exposure under one heading).
+                            const behavioralTypes = ["data-exfiltration", "beaconing", "dns-tunneling", "tor-vpn-proxy", "ja3", "port-scan", "syn-flood"]
+                            const exposures = report.iocs.filter((i) => i.type === "credential-theft")
+                            const behavioral = report.iocs.filter((i) => behavioralTypes.includes(i.type))
+                            const indicators = report.iocs.filter((i) => i.type !== "credential-theft" && !behavioralTypes.includes(i.type))
+                            const groups = [
+                              { key: "exposures", label: "Confirmed exposures", rows: exposures, note: report.iocs.some((i) => i.type === "credential-theft") ? <>The Plaintext Credential Exposure row lists the <strong>affected host</strong> (the machine that transmitted the credentials) and its destination — an affected host is the <strong>victim of the exposure</strong>, not an indicator of a known-malicious artifact. The capture proves the transmission, not theft, interception, or a malicious destination.</> : null },
+                              { key: "behavioral", label: "Behavioral anomalies", rows: behavioral, note: behavioral.length ? <>Behavioral entries (e.g. Suspected Large Outbound Transfer, Beaconing, DNS Tunneling) are <strong>findings about observed traffic patterns, not indicators of a known-malicious artifact</strong>: the value describes the behavior itself, and the endpoints are not established as malicious.</> : null },
+                              { key: "indicators", label: "Indicators / IOCs", rows: indicators, note: null },
+                            ].filter((g) => g.rows.length > 0)
+                            return groups.map((g) => (
+                              <div key={g.key} className={g.key === "exposures" ? "" : "mt-4"}>
+                                <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">{g.label}</h4>
+                                {g.note && (
+                                  <p className="text-xs text-muted-foreground border border-border/30 rounded p-2 mb-2">{g.note}</p>
+                                )}
+                                <div className="overflow-x-auto">
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr className="border-b text-muted-foreground">
+                                        <th className="text-left py-2 pr-2">Type</th>
+                                        <th className="text-left py-2 pr-2">Value</th>
+                                        <th className="text-left py-2 pr-2">Description</th>
+                                        <th className="text-left py-2 pr-2">Severity</th>
+                                        <th className="text-left py-2">Source</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {g.rows.map((ioc, i) => (
+                                        <tr key={i} className="border-b border-border/30">
+                                          <td className="py-1.5 pr-2 text-muted-foreground">{iocTypeLabel(ioc.type)}</td>
+                                          <td className="py-1.5 pr-2 font-mono">{ioc.type === "credential-theft" ? `Affected host: ${ioc.value}` : ioc.value}</td>
+                                          <td className="py-1.5 pr-2 text-muted-foreground">{ioc.description}</td>
+                                          <td className="py-1.5 pr-2"><Badge variant={ioc.severity >= 4 ? "destructive" : ioc.severity >= 3 ? "warning" : "default"} className="text-[10px]">{sevLabel(ioc.severity)}</Badge></td>
+                                          <td className="py-1.5">{sourceBadge(ioc.source, ioc.status)}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            ))
+                          })()}
+                        </>
                       )}
                     </CardContent>
                   </Card>
@@ -2370,7 +2409,7 @@ export default function ReportsPage() {
                         <span className="text-xs text-muted-foreground">Final verdict · Risk score {riskValue()}</span>
                       </div>
                       <p className="text-sm text-muted-foreground">{conclusionText}</p>
-                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "NO DETECTIONS means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only${verdictStatusHint ? " — the level is floored by the strongest finding's rule severity (1–5), which is NOT the same scale as the 0–100 risk score" : ""}`} — it is not proof that the capture is universally safe or clean.</p>
+                      <p className="text-xs text-muted-foreground">{levelLabel === "SAFE" ? "NO DETECTIONS means no configured detection rule triggered" : `The ${levelLabel} verdict reflects the configured detection rules only${verdictFloored ? " — the level is floored by the highest CONFIRMED finding's rule severity (1–5), which is NOT the same scale as the 0–100 risk score; unconfirmed rules with a higher severity are stated separately" : ""}`} — it is not proof that the capture is universally safe or clean.</p>
                     </CardContent>
                   </Card>
                 </section>
