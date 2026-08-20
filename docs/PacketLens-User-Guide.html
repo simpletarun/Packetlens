@@ -39,7 +39,7 @@
   <div class="sub">PCAP Network Analysis Report Tool — User Guide</div>
   <hr>
   <div class="meta">
-    Version 3.2.0 &middot; Report schema 1.0 &middot; Risk specification 1.3<br>
+    Version 3.4.1 &middot; Analyzer 3.4.0 &middot; Report schema 1.0 &middot; Risk specification 1.3<br>
     Web application (self-hosted Next.js server)
   </div>
 </div>
@@ -52,7 +52,7 @@
     <li>Analyzing a Capture</li>
     <li>The Analysis Report</li>
     <li>Exporting Results (PDF / HTML / CSV)</li>
-    <li>Interactive Tools (Graph, World Map)</li>
+    <li>Interactive Tools (Graph, World Map, Visualizations)</li>
     <li>Detection &amp; Risk Model</li>
     <li>GeoIP &amp; Vendor Attribution</li>
     <li>Settings</li>
@@ -67,11 +67,11 @@
   <p>PacketLens is a network security analysis tool that turns a raw packet capture
   (PCAP / PCAPNG) into a professional, exportable security report. Upload a capture
   file — or open the built-in demo dataset — and PacketLens parses the traffic on
-  the server, then produces a 22-section report covering traffic summary, packets,
-  flows, sessions, DNS, HTTP, TLS, VoIP calls, extracted files, credentials,
-  certificates, endpoints, timeline, top talkers, alerts, indicators of compromise
-  (IOCs), MITRE ATT&amp;CK mappings, a numerical risk score, and prioritized
-  recommendations.</p>
+  the server, then produces a 23-section report covering traffic summary, packets,
+  flows, sessions, DNS, HTTP, TLS, notable destinations, extracted payloads, VoIP
+  calls, credential submissions, certificates, endpoints, timeline, top talkers,
+  threats and alerts, a numerical risk score, findings, MITRE ATT&amp;CK mappings,
+  prioritized recommendations, an appendix, and an analyst conclusion.</p>
   <p>PacketLens is a single web application: one Next.js server that serves the
   interface, accepts uploads, runs the analysis, and serves the results back to
   your browser. There is no separate desktop app and no separate analysis engine
@@ -101,6 +101,8 @@
   <ul>
     <li><strong>Upload a file</strong> — PCAP and PCAPNG formats, up to 500 MB. Uploads are rate-limited (5 per minute per address) and rejected from other origins. While analysis runs, a progress screen shows the decode rate and current stage.</li>
     <li><strong>Demo dataset</strong> — a realistic capture with benign + malicious traffic, pre-loaded with analysis, so every feature can be explored without a capture file. Demo analyses are labelled as such in the report.</li>
+    <li><strong>Duplicate frames</strong> — consecutive duplicate frames (capture artifacts) are removed before analysis. Every metric, detection and risk score is computed on the analyzed set, so duplicate frames never inflate flows, SYN counts or rates. The report states raw frames, removed duplicates, and analyzed counts alongside a capture-quality grade.</li>
+    <li><strong>App-layer visibility</strong> — shown as a separate dimension from capture quality: a clean dedupe rate does not mean packet content could be inspected. Mostly-encrypted captures state their visibility limit explicitly; a 0% payload-visibility capture never reads as content-verified.</li>
     <li><strong>Encapsulation</strong> — Ethernet is fully supported. Unsupported link types (e.g. raw IP) still produce packet lengths and timestamps; the report clearly states the decode rate and withholds a verdict when too little traffic was decodable (it reads UNKNOWN / INSUFFICIENT DATA rather than a false "clean" score). An explicit link-layer override can be set before uploading for captures whose headers were not auto-detected.</li>
     <li><strong>History</strong> — completed analyses are stored on the server in <code>~/.packetlens/jobs.json</code>; the 20 most recent are kept, with the oldest evicted automatically. A bookmark to the job URL reloads the full analysis.</li>
   </ul>
@@ -109,7 +111,7 @@
 
 <section>
   <h2>4. The Analysis Report</h2>
-  <p>Every analysis produces one canonical report with 22 numbered sections:</p>
+  <p>Every analysis produces one canonical report with 23 numbered sections:</p>
   <div class="col2">
     <ol style="font-size: 9.5pt;">
       <li>Executive Summary</li>
@@ -120,16 +122,17 @@
       <li>DNS Analysis</li>
       <li>HTTP Analysis</li>
       <li>TLS Analysis</li>
-      <li>Extracted Files</li>
+      <li>Notable Destinations</li>
+      <li>Extracted HTTP Payloads</li>
       <li>VoIP / SIP Calls</li>
-      <li>Credentials</li>
+      <li>Credential Submissions</li>
       <li>Certificates</li>
       <li>Endpoints</li>
       <li>Threats &amp; Alerts</li>
       <li>Timeline</li>
       <li>Top Talkers</li>
-      <li>Risk Score</li>
-      <li>Indicators of Compromise (IOCs)</li>
+      <li>Risk Score (incl. Traffic Burst)</li>
+      <li>Findings &amp; Observed Sources</li>
       <li>MITRE ATT&amp;CK Mapping</li>
       <li>Recommendations</li>
       <li>Appendix</li>
@@ -137,13 +140,27 @@
     </ol>
   </div>
   <p>Sections cover packet counts, flows, sessions, local devices, DNS lookups
-  (deduplicated through the LAN resolver), plaintext HTTP requests, TLS handshakes
-  and certificate chains, files reconstructed from HTTP traffic, per-destination
+  (deduplicated through the LAN resolver), plaintext HTTP requests (requests and
+  headers decoded, message bodies/payloads extracted), TLS handshakes and
+  certificate chains, files reconstructed from HTTP traffic, per-destination
   country distribution via the installed GeoIP database, credentials spotted in
-  cleartext auth traffic (masked by default, revealable per entry), VoIP calls with
-  RTP statistics, TCP health (handshake RTT, retransmissions, out-of-order,
-  zero-window, RST, loss), and a per-interval activity timeline.</p>
-  <p>A <strong>Beginner / Expert</strong> toggle adjusts how much detail the report shows.</p>
+  cleartext auth traffic (masked by default, revealable per entry), VoIP calls
+  with RTP statistics, TCP health (handshake RTT, retransmissions, out-of-order,
+  zero-window, RST, loss computed against data-segment denominators), and a
+  per-interval activity timeline.</p>
+  <p><strong>Findings &amp; Observed Sources</strong> (section 19) separates three
+  classes so they can never be confused: <em>Confirmed exposures</em> (e.g. a
+  plaintext credential submission — the affected host is the victim of the
+  exposure, not a malicious artifact), <em>Behavioral anomalies</em> (suspected
+  traffic-pattern findings such as large outbound transfers or beaconing, each
+  prefixed "Observed source: src → dst" — observed behavior, never an established
+  incident), and <em>Indicators / IOCs</em>.</p>
+  <p>The summary cards show the <strong>Risk Score</strong> (0–100), the
+  <strong>Risk band</strong> (the score's own numeric band, e.g. MEDIUM) and the
+  <strong>Highest Finding</strong> severity (1–5) side by side, so a report is
+  never read as Critical just because a suspected rule carries a high severity
+  while its band is lower. A <strong>Beginner / Expert</strong> toggle adjusts how
+  much detail the report shows.</p>
 </section>
 
 <section>
@@ -151,7 +168,7 @@
   <p>From the report page, three export formats are available:</p>
   <table>
     <tr><th style="width:90pt">Format</th><th>What you get</th><th>Best for</th></tr>
-    <tr><td><strong>PDF</strong></td><td>The full report via your browser's print dialog: cover page with file metadata and a demo/live marker, all 22 sections, print-optimized tables that avoid page-break splitting.</td><td>Sharing with stakeholders, evidence files.</td></tr>
+    <tr><td><strong>PDF</strong></td><td>The full report via your browser's print dialog: cover page with file metadata and a demo/live marker, all 23 sections, print-optimized tables that avoid page-break splitting.</td><td>Sharing with stakeholders, evidence files.</td></tr>
     <tr><td><strong>HTML</strong></td><td>A standalone, self-contained HTML file with the full summary, tables, and a deep link back to the live report in PacketLens. Works offline, styled for reading.</td><td>Email attachments, archiving, viewing in any browser.</td></tr>
     <tr><td><strong>CSV</strong></td><td>One row per network flow: IPs and ports as separate columns (IPv6-safe), sent/recv bytes, timing, duration, geo country/ASN per endpoint, service name, RTT, retransmissions, loss. UTF-8 BOM included so Excel/Sheets decode vendor names correctly.</td><td>SIEM ingestion, pandas/Excel pivot analysis.</td></tr>
   </table>
@@ -163,16 +180,18 @@
   <p>A cytoscape-based graph of the capture's communication: local devices and remote endpoints as nodes, conversations as edges. Click a node to see its traffic, drag to rearrange, zoom, and filter. Useful for spotting star-pattern C2 or broadcast storms at a glance. Layout and display preferences persist in your browser.</p>
   <h3>6.2 World Map</h3>
   <p>A geographic view plotting every remote endpoint by country with arcs representing traffic flows, animated to show conversation volume, and alert markers for flagged hosts. Pins are sized by traffic volume; nearby endpoints cluster into city-level bubbles. Works without the GeoIP database — it simply degrades to "no location data" notes. Without a home location the map anchors arcs at a synthetic point; set Home in Settings for exact lines.</p>
+  <h3>6.3 Visualizations</h3>
+  <p>A dedicated dashboard of traffic charts: protocol distribution, bandwidth over time, top talkers, packet rates and timeline heatmaps. The verdict shown on the visualizations page follows the same confirmed-findings rule as the report (a suspected critical rule is never presented as a confirmed Critical).</p>
 </section>
 
 <section>
   <h2>7. Detection &amp; Risk Model</h2>
   <ul>
-    <li><strong>Signature rules</strong> — port scanning, SYN floods, DNS tunneling, credential leaks, malware downloads, C2 beaconing, data exfiltration, suspicious TLS, and cleartext HTTP credentials. Each alert carries severity, confidence, source/destination, and evidence.</li>
-    <li><strong>Behavioral metrics</strong> — beaconing periodicity, DNS tunneling volume, data exfiltration egress, port-scan breadth, JA3 TLS fingerprint anomalies, and traffic bursts. These feed risk contributions and, when proven, also fire as real signature alerts.</li>
-    <li><strong>Risk score</strong> — a single 0–100 score computed from a transparent formula (100 × (1 − e^(−raw/80))): each alert contributes (severity weight + rule weight) × a confidence multiplier, with burst detection able to boost eligible rules. The report shows the full breakdown per rule, and always states the spec version used.</li>
-    <li><strong>IOCs &amp; MITRE</strong> — every finding is classified (IP, domain, URL, certificate…) and mapped to MITRE ATT&amp;CK techniques (T1046, T1048, T1071, T1552, etc.) with the source labeled as confirmed alert or behavioral indicator.</li>
-    <li><strong>Honest verdicts</strong> — if a capture's encapsulation prevented header decoding, the verdict reads UNKNOWN / INSUFFICIENT DATA instead of a false "clean" score.</li>
+    <li><strong>Signature rules</strong> — port scanning, SYN floods, DNS tunneling, credential leaks, malware downloads, C2 beaconing, data exfiltration, suspicious TLS, and cleartext HTTP credentials. Each alert carries severity, confidence, source/destination, status (confirmed or suspected), and evidence naming the exact triggering conversation.</li>
+    <li><strong>Exfiltration honesty</strong> — the byte-ratio exfil rule (DATA-EXFIL-001) is directional behavior only: its evidence states "payload visibility: X of Y packets inspected — exfiltration content: NOT CONFIRMED", names the upload type (encrypted cloud/media uploads are called out as legitimate patterns), and evaluates thresholds on unique TCP payload bytes so retransmissions never inflate the ratio. NAT-traversal and discovery protocols (STUN/TURN, ports 3478/3479/5349/19302/5004/5005, DNS, DHCP, NTP, mDNS, LLMNR, SSDP, SIP, multicast/broadcast) never fire the rule. Severity is a ladder: Medium by default, High when the flow's protocol is payload-verified, Critical only when a confirmed credential exposure corroborates the same capture.</li>
+    <li><strong>Honest verdicts</strong> — the verdict level floors only on CONFIRMED findings; with no confirmed findings there is no floor, so a suspected Critical rule is stated separately and never headlines the report as Critical. Captures whose encapsulation prevented header decoding read UNKNOWN / INSUFFICIENT DATA instead of a false "clean" score, and single-packet captures without a measurable time interval also conclude insufficient evidence.</li>
+    <li><strong>Risk score</strong> — a single 0–100 score computed from a transparent formula (100 × (1 − e^(−raw/80))): each alert contributes (severity weight + rule weight) × a confidence multiplier, with burst detection able to boost eligible rules. The report shows the full breakdown per rule and always states the spec version used.</li>
+    <li><strong>IOCs &amp; MITRE</strong> — every finding is classified (IP, domain, URL, certificate…) and mapped to MITRE ATT&amp;CK techniques (T1046, T1071, T1041, T1552, etc.) with the source labeled as confirmed alert or behavioral indicator. Threshold-level findings and exposure-style findings are deliberately unmapped unless the evidence demonstrates the technique was executed.</li>
   </ul>
 </section>
 
@@ -231,7 +250,7 @@
     <tr><td>Network (server)</td><td>Outbound HTTPS for the optional one-time GeoIP database download and the opt-in ipwho.is lookups</td></tr>
   </table>
   <p>&nbsp;</p>
-  <p style="font-size:9pt;color:#6b7280">PacketLens 3.2.0 &middot; Report schema 1.0 &middot; Risk spec 1.3 &middot; Detection engine: signature rules + behavioral metrics &middot; Open-data GeoIP: DB-IP City Lite (CC BY 4.0)</p>
+  <p style="font-size:9pt;color:#6b7280">PacketLens 3.4.1 &middot; Analyzer 3.4.0 &middot; Report schema 1.0 &middot; Risk spec 1.3 &middot; Detection engine: signature rules + behavioral metrics &middot; Open-data GeoIP: DB-IP City Lite (CC BY 4.0)</p>
 </section>
 
 </body>
