@@ -7,7 +7,7 @@
     <a href="#faq"><img src="https://img.shields.io/badge/privacy-100%25%20local-lightgrey" alt="100% local"></a>
   </p>
   <p align="center">
-    <img src="docs/hero.png" alt="PacketLens hero banner" width="100%">
+    <img src="docs/banner.png" alt="PacketLens hero banner" width="100%">
   </p>
 </p>
 
