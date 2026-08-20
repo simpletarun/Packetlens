@@ -400,11 +400,16 @@ it("burst bonus is reported as applied only when an eligible rule actually benef
     expect(r?.confirmedSeverity).toBe(4)
     expect(r?.suspectedSeverity).toBe(5)
     expect(r?.levelLabel).toBe("HIGH")
-    // All-suspected findings still floor by the strongest suspected severity.
+    // With NO confirmed findings there is NO floor at all: the verdict is the
+    // score band, never the suspected severity (QA: time.pcapng — 1 suspected
+    // Critical, 0 confirmed read as "CRITICAL — unconfirmed" and contradicted
+    // the report's own "highest CONFIRMED finding" rule and "No findings were
+    // confirmed").
     const onlySuspected = buildReportRisk([suspectedCritical], metrics)
     expect(onlySuspected?.confirmedSeverity).toBe(0)
     expect(onlySuspected?.suspectedSeverity).toBe(5)
-    expect(onlySuspected?.levelLabel).toBe("CRITICAL")
+    expect(onlySuspected?.levelLabel).toBe(riskLevel(onlySuspected!.normalizedScore).label)
+    expect(onlySuspected?.levelLabel).not.toBe("CRITICAL")
     // Legacy alerts without a status are CONFIRMED (strongest grouping).
     const legacy = buildReportRisk([base({ id: "l1" })], metrics)
     expect(legacy?.confirmedSeverity).toBe(4)

@@ -45,15 +45,14 @@ export default function VisualizationsPage() {
   const undecodable = useMemo(() => decodeRateOf(decode, packets) < 0.05, [decode, packets])
 
   // Verdict level = score band floored by the highest CONFIRMED finding
-  // severity (falling back to the strongest overall severity when nothing is
-  // confirmed), identical to the report's buildReportRisk — a HIGH-severity
+  // severity — identical to the report's buildReportRisk — a HIGH-severity
   // alert at a 39/100 LOW score must read HIGH here too, while a SUSPECTED
-  // critical rule never headlines above a confirmed High finding (QA:
-  // log.pcapng verdict overstated the confirmed incident).
+  // critical rule never headlines above a confirmed High finding, and a
+  // capture with no confirmed findings is never lifted above its score band
+  // (QA: log.pcapng / time.pcapng verdicts overstated the confirmed state).
   const riskLevelObj = useMemo(() => {
-    const highest = alerts.reduce((m, a) => Math.max(m, a.severity), 0)
     const confirmed = confirmedSeverityOf(alerts)
-    return verdictLevel(riskLevel(stats.riskScore), confirmed > 0 ? confirmed : highest)
+    return verdictLevel(riskLevel(stats.riskScore), confirmed)
   }, [stats.riskScore, alerts])
 
   // Home = the analyst's own location, known only from an online self-lookup

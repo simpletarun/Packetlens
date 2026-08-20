@@ -370,12 +370,13 @@ export default function ReportsPage() {
   // explicitly (QA: open.pcapng "53/100 CRITICAL" with "No findings were
   // confirmed" read as a confirmed critical incident).
   const highestSev = risk?.highestSeverity ?? job?.highestSeverity ?? 0
-  // CONFIRMED findings drive the verdict: a SUSPECTED critical rule must
-  // never headline as "CRITICAL" next to a confirmed HIGH finding — the
-  // verdict level is floored by the highest CONFIRMED severity, and the
-  // suspected severity is reported separately (QA: log.pcapng — suspected
-  // DATA-EXFIL-001 (5/5) vs confirmed HTTP-CREDS-001 (4/5) read as
-  // "CRITICAL — unconfirmed" and overstated the confirmed incident).
+  // CONFIRMED findings drive the verdict: the level is floored by the highest
+  // CONFIRMED severity — a SUSPECTED critical rule never headlines as
+  // "CRITICAL" (QA: log.pcapng — suspected 5/5 vs confirmed 4/5), and with
+  // NO confirmed findings there is NO floor at all, so the verdict is the
+  // score band with the suspected rule stated separately (QA: time.pcapng —
+  // 1 suspected Critical, 0 confirmed read as "CRITICAL — unconfirmed",
+  // contradicting the report's own "highest CONFIRMED finding" rule).
   const confirmedSeverity = confirmedSeverityOf(alerts)
   const suspectedSeverity = suspectedSeverityOf(alerts)
   const topSuspectedAlert = suspectedSeverity > 0
@@ -386,7 +387,7 @@ export default function ReportsPage() {
       ? ` — unconfirmed ${sevLabel(suspectedSeverity)}-severity rule ${statusLabel(topSuspectedAlert?.status ?? "SUSPECTED")}; verdict reflects the highest CONFIRMED finding (${sevLabel(confirmedSeverity)})`
       : ""
     : highestSev > 0
-      ? ` — unconfirmed (strongest finding: ${statusLabel(topSuspectedAlert?.status ?? "SUSPECTED")})`
+      ? ` — no confirmed findings; strongest finding is a suspected ${sevLabel(highestSev)}-severity rule (${statusLabel(topSuspectedAlert?.status ?? "SUSPECTED")})`
       : ""
 
   // Capture window from the actual packet timestamps (min/max — pcap files can
@@ -778,9 +779,10 @@ export default function ReportsPage() {
   const scoreVal = risk ? risk.normalizedScore : jobScore
   // Fallback path (no advanced metrics): same severity floor the report
   // builder applies — the verdict never reads lower than the strongest
-  // CONFIRMED finding (unconfirmed rules with a higher severity are stated
-  // separately), even when the score band alone would say SAFE/LOW.
-  const fallbackVerdict = verdictLevel(riskLevel(job.riskScore), confirmedSeverity > 0 ? confirmedSeverity : job.highestSeverity ?? 0)
+  // CONFIRMED finding, and with no confirmed findings there is no floor
+  // (unconfirmed rules with a higher severity are stated separately), even
+  // when the score band alone would say SAFE/LOW.
+  const fallbackVerdict = verdictLevel(riskLevel(job.riskScore), confirmedSeverity)
   const levelLabel = undecodable ? "UNKNOWN" : (risk ? risk.levelLabel : fallbackVerdict.label)
   const levelColor = undecodable ? "text-muted-foreground" : (risk ? riskColorClass({ label: risk.levelLabel, color: risk.levelColor }) : riskColorClass(fallbackVerdict))
   // A floor is actually applied when the verdict level differs from the raw
@@ -858,7 +860,7 @@ export default function ReportsPage() {
         // "53/100" read as contradictory / confirmed).
         ["Highest finding severity (1–5)", confirmedSeverity > 0
           ? `${sevLabel(confirmedSeverity)} (${confirmedSeverity}/5) confirmed${suspectedSeverity > confirmedSeverity ? ` — unconfirmed ${sevLabel(suspectedSeverity)} (${suspectedSeverity}/5) rule suspected` : ""}`
-          : highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5) · unconfirmed` : "None"],
+          : highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5) · suspected — no confirmed findings` : "None"],
       ]),
       "",
       `## Capture Information`,
@@ -873,9 +875,9 @@ export default function ReportsPage() {
       `- External IPs: ${stats.externalIps} · Countries: ${countriesLabel(stats.countries, stats.externalIps)} (unique GeoIP-resolved countries across external endpoints, either direction)`,
       `- Application-layer visibility: ${appVisibilityLabel} — a separate dimension from capture quality (frame completeness) and from the risk score.`,
       `- Source/destination IP counts are packet-direction counts (each endpoint counted once per side it appeared on). Flow and CSV rows are initiator-first: the Initiator column identifies the endpoint that initiated the conversation — so summing distinct CSV endpoints still yields different numbers by design. Sessions equal the conversation count: flows are already direction-agnostic (both directions merged into one flow), and each session is that conversation with its TCP state (ESTABLISHED / STATELESS / …) attached.`,
-      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests: ${http.length} · TCP/TLS handshakes: ${tls.length}${quicFlowCount > 0 ? ` · QUIC connections: ${quicFlowCount} · QUIC Initial packets decoded: ${quicHandshakePkts} — QUIC's TLS handshake lives in CRYPTO frames (never a TCP TLS handshake), so QUIC TLS/CRYPTO handshake visibility is ${quicHandshakePkts > 0 ? `partial (${quicHandshakePkts} decoded)` : "unavailable"}` : ""}`,
+      `- DNS: ${dnsQueries} query packets + ${dns.length - dnsQueries} responses (${plural(dnsLookupCount(dns), "distinct lookup")}) · HTTP requests/headers decoded: ${http.length} · TCP/TLS handshakes: ${tls.length}${quicFlowCount > 0 ? ` · QUIC connections: ${quicFlowCount} · QUIC Initial packets decoded: ${quicHandshakePkts} — QUIC's TLS handshake lives in CRYPTO frames (never a TCP TLS handshake), so QUIC TLS/CRYPTO handshake visibility is ${quicHandshakePkts > 0 ? `partial (${quicHandshakePkts} decoded)` : "unavailable"}` : ""}`,
       ...(dnsQueries === 0 && (http.length > 0 || tls.length > 0) ? [`- **Note:** 0 DNS queries captured — the capture likely began mid-session; hostname↔IP correlation and PTR resolution are unavailable.`] : []),
-      `- ${plural(files.length, "HTTP payload")} extracted · ${plural(credentials.length, "credential submission")} (credential submissions are the HTTP requests whose decoded body carried a username and/or password field — not every HTTP request) · ${plural(certificates.length, "unique certificate")} decoded (deduplicated by subject+serial across the capture)`,
+      `- ${plural(files.length, "HTTP message body/payload")} extracted — request/header lines are decoded from every HTTP packet, while message bodies are extracted only when the payload was captured (35 requests can legitimately yield 0 extracted bodies) · ${plural(credentials.length, "credential submission")} (credential submissions are the HTTP requests whose decoded body carried a username and/or password field — not every HTTP request) · ${plural(certificates.length, "unique certificate")} decoded (deduplicated by subject+serial across the capture)`,
       ...(report.notables.length ? [`- Notable destinations (neutral, not findings — these domains appeared in the capture's own TLS Server Name or HTTP Host fields, so the connection was made by a host inside the capture, not by PacketLens; presence alone is not a malicious indicator, and an absence of notable destinations is only a curated-list negative — it does not establish benignness or a clean reputation): ${report.notables.map((n) => `${n.domain} (${n.category})`).join(", ")}`] : [`- No notable destinations from the curated list — a curated-list negative only: it does not establish that the endpoints are benign or reputable.`]),
       ...(calls.length ? [`- VoIP calls: ${calls.length}`, ""] : []),
       "",
@@ -1046,7 +1048,9 @@ export default function ReportsPage() {
                     : quicFlowCount > 0
                       ? <p className="text-warning">QUIC traffic is present on UDP/443 (<strong>{plural(quicFlowCount, "connection")}</strong>, port-inferred — no QUIC Initial handshake packets captured) alongside TCP/443 HTTPS (port-inferred) — the encryption is inferred, not decoded: no QUIC Initial handshake or TLS ClientHello/ServerHello packets were captured, so no handshake, SNI or certificate data was extracted from either.</p>
                       : <p className="text-warning">TCP/443 HTTPS traffic is present (inferred from port usage) — encryption is inferred, not decoded: no TLS ClientHello/ServerHello packets were captured (the capture likely started after session establishment).</p>)}
-                  {files.length > 0 && <p><strong>{plural(files.length, "HTTP payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong> ({credentials.length > 0 ? "HTTP requests whose decoded body carried a username and/or password field — not every HTTP request" : "none of the HTTP requests carried credential fields"}), <strong>{plural(certificates.length, "unique certificate")}</strong> decoded.</p>}
+                  {files.length > 0
+                    ? <p><strong>{plural(files.length, "HTTP message body/payload")}</strong> extracted ({formatBytes(files.reduce((s, f) => s + f.size, 0))}), <strong>{plural(credentials.length, "credential submission")}</strong> ({credentials.length > 0 ? "HTTP requests whose decoded body carried a username and/or password field — not every HTTP request" : "none of the HTTP requests carried credential fields"}), <strong>{plural(certificates.length, "unique certificate")}</strong> decoded.</p>
+                    : <p>No HTTP message bodies/payloads extracted — request/header lines are decoded from every HTTP packet, and bodies are extracted only when the payload was captured ({http.length > 0 ? `${http.length} HTTP request/header line${http.length === 1 ? "" : "s"} decoded` : "no HTTP requests captured"}).</p>}
                   {alerts.length > 0 ? (
                     <p><span className="text-danger font-medium">{plural(alerts.length, "alert")}</span> — Severity: {severityCounts(alerts)} · Status: {statusCountsLabel(summarizeStatuses(alerts))}. Risk score: <strong>{riskValue()}</strong>.</p>
                   ) : (
@@ -1095,7 +1099,7 @@ export default function ReportsPage() {
                   // (a 39/100 LOW score with a HIGH finding reads as HIGH present).
                   { label: "Highest Finding", value: confirmedSeverity > 0
                     ? `${sevLabel(confirmedSeverity)} (${confirmedSeverity}/5) confirmed${suspectedSeverity > confirmedSeverity ? ` — unconfirmed ${sevLabel(suspectedSeverity)} (${suspectedSeverity}/5) rule suspected` : ""}`
-                    : highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5) · unconfirmed` : "None", icon: ShieldAlert, color: (confirmedSeverity > 0 ? confirmedSeverity : highestSev) >= 4 ? "text-danger" : "text-muted-foreground" },
+                    : highestSev > 0 ? `${sevLabel(highestSev)} (${highestSev}/5) · suspected — no confirmed findings` : "None", icon: ShieldAlert, color: (confirmedSeverity > 0 ? confirmedSeverity : highestSev) >= 4 ? "text-danger" : "text-muted-foreground" },
                   // Explicit measurement window (QA: long.pcapng peak labels).
                   { label: bwInterval ? `Peak ${bwIntervalLabel} rate` : "Peak rate (whole capture)", value: rateLabel(peakBandwidth), icon: BarChart3, color: "text-chart-2" },
                   { label: "Avg Packet Size", value: avgPacketBytes + " B", icon: Package, color: "text-muted-foreground" },

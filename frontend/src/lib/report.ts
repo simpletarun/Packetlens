@@ -632,18 +632,21 @@ export function buildReportRisk(alerts: AlertEntry[], advancedMetrics: AdvancedM
   // HIGH-severity alert with a 39/100 LOW score must never read as a
   // downgrade of the finding itself.
   const highestSeverity = alerts.reduce((m, a) => Math.max(m, a.severity), 0)
-  // Confirmed findings drive the verdict level: a SUSPECTED CRITICAL rule
-  // must never headline as "CRITICAL" next to a confirmed HIGH finding —
-  // the level is floored by the highest CONFIRMED severity, and the
-  // suspected severity is reported separately (QA: log.pcapng — suspected
-  // DATA-EXFIL-001 at 5/5 vs confirmed HTTP-CREDS-001 at 4/4 read as
-  // "CRITICAL — unconfirmed" and overstated the confirmed incident).
+  // Confirmed findings drive the verdict level. The floor comes ONLY from the
+  // highest CONFIRMED severity — a SUSPECTED critical rule must never
+  // headline as "CRITICAL" next to a confirmed HIGH finding (QA: log.pcapng),
+  // and with NO confirmed findings at all there is NO floor at all: the
+  // verdict is the score band, and the suspected critical rule is stated
+  // separately (QA: time.pcapng — 1 suspected Critical, 0 confirmed read as
+  // "CRITICAL — unconfirmed", which contradicted the report's own
+  // "highest CONFIRMED finding" rule and its "No findings were confirmed").
   const confirmedSeverity = confirmedSeverityOf(alerts)
   const suspectedSeverity = suspectedSeverityOf(alerts)
-  // Verdict level = score band, floored by the finding severity (severity
-  // floor): the numeric score stays honest, but a capture with a confirmed
-  // High finding is never presented as LOW.
-  const level = verdictLevel(riskLevel(b.normalizedScore), confirmedSeverity > 0 ? confirmedSeverity : highestSeverity)
+  // Verdict level = score band, floored by the confirmed-finding severity
+  // (severity floor): the numeric score stays honest, a capture with a
+  // confirmed High finding is never presented as LOW, and a capture with no
+  // confirmed findings is never presented above its score band.
+  const level = verdictLevel(riskLevel(b.normalizedScore), confirmedSeverity)
   return {
     // Unrounded raw: the breakdown's curve row substitutes THIS value, so
     // rounding it here would make the displayed formula disagree with the
