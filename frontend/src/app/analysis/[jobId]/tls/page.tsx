@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useMemo, useEffect } from "react"
+import { useState, useMemo } from "react"
 import { Sidebar } from "@/components/layout/sidebar"
 import { Header } from "@/components/layout/header"
 import { useAnalysisStore } from "@/stores/analysis"
@@ -41,13 +41,21 @@ export default function TlsPage() {
     }
     return snis.size
   }, [tls])
-  // Resolve against the FILTERED list and drop the stale selection once the
-  // row leaves the filter — the details panel must not stick to a handshake
+  // Resolve against the FILTERED list and drop the stale selection at the
+  // point of filtering — the details panel must not stick to a handshake
   // no longer in the table (same fix as the packets page, QA).
   const selectedCert = selected ? filtered.find((t) => t.id === selected) ?? null : null
-  useEffect(() => {
-    if (selected !== null && !filtered.some((t) => t.id === selected)) setSelected(null)
-  }, [filtered, selected])
+  const handleSearch = (value: string) => {
+    setSearch(value)
+    if (selected === null) return
+    const q = value.toLowerCase()
+    const el = tls.find((t) => t.id === selected)
+    const matches = el !== undefined && (!q ||
+      el.sni.toLowerCase().includes(q) ||
+      el.srcIp.toLowerCase().includes(q) ||
+      el.version.toLowerCase().includes(q))
+    if (!matches) setSelected(null)
+  }
 
   return (
     <div className="flex h-screen">
@@ -68,7 +76,7 @@ export default function TlsPage() {
           <div className="px-4 pb-4">
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input placeholder="Filter by SNI, IP, or version..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" maxLength={200} />
+              <Input placeholder="Filter by SNI, IP, or version..." value={search} onChange={(e) => handleSearch(e.target.value)} className="pl-10" maxLength={200} />
             </div>
           </div>
           <div className="px-4 pb-4"><DecodeBanner /></div>

@@ -414,16 +414,6 @@ export interface AnalysisValidator {
   }
 }
 
-function hexToAscii(hex: string, max = 2048): string {
-  const len = Math.min(hex.length, max * 2)
-  let out = ''
-  for (let i = 0; i < len; i += 2) {
-    const c = parseInt(hex.substring(i, i + 2), 16)
-    if (c >= 32 && c < 127) out += String.fromCharCode(c)
-  }
-  return out
-}
-
 function pktToAnalysis(p: ParsedPacket, seqBase: number | undefined): AnalysisPacket {
   const flags = p.tcpFlags || '\u2014'
   let info: string
@@ -1890,7 +1880,6 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
 
   const throughputAvg = rates.avgBps
   const throughputPeak = rates.peakBps
-  const throughputPeak100ms = rates.peakBps100ms
 
   // Per-second throughput buckets — real peak, not the fabricated avg*3.
   // Direction is tracked separately so a download spike can be told apart
@@ -2528,7 +2517,7 @@ export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {})
       if (g) g.push(c)
       else groups.set(key, [c])
     }
-    for (const [key, creds] of groups) {
+    for (const creds of groups.values()) {
       const c = creds[0]
       const isHttp = c.service.toUpperCase().startsWith('HTTP')
       threats.push({

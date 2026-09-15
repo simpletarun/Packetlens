@@ -414,7 +414,7 @@ const base = {
           // initial fit at ~0.4×) keeps every node's metadata readable instead of
           // fading to 1px unreadable dots (the "no metadata when zoomed out" bug:
           // the old zoom-mode hid labels entirely below 1.5×).
-          "min-zoomed-font-size": 5, width: displayPrefs.nodeSize, height: displayPrefs.nodeSize, opacity: displayPrefs.nodeOpacity / 100, "transition-property": "background-color, border-color, border-width, line-color, target-arrow-color, shadow-blur, shadow-color", "transition-duration": 250, "transition-timing-function": "ease-out" } },
+          "min-zoomed-font-size": 5, width: displayPrefs.nodeSize, height: displayPrefs.nodeSize, opacity: displayPrefs.nodeOpacity / 100, "transition-property": "background-color, border-color, border-width, line-color, target-arrow-color", "transition-duration": 250, "transition-timing-function": "ease-out" } },
         ...Object.entries(NODE_SHAPES).map(([type, s]) => {
           const color = BASE_COLORS[type] || "#6b7280"
           return {

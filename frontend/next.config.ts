@@ -74,9 +74,6 @@ const nextConfig: NextConfig = {
       .digest("hex")
       .slice(0, 12),
   },
-  turbopack: {
-    root: path.resolve(__dirname),
-  },
   async headers() {
     if (isTauri) return []
     return [
