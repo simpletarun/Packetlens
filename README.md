@@ -2,7 +2,7 @@
   <h1 align="center">PacketLens</h1>
   <p align="center"><b>Free, 100% local PCAP analyzer. Drop a PCAP. Get a full security report — entirely on your machine.</b></p>
   <p align="center">
-    <a href="https://github.com/simpletarun/Packetlens/releases/tag/v3.3.0"><img src="https://img.shields.io/badge/release-v3.3.0-blue" alt="Release v3.3.0"></a>
+    <a href="https://github.com/simpletarun/Packetlens/releases/tag/v3.4.2"><img src="https://img.shields.io/badge/release-v3.4.2-blue" alt="Release v3.4.2"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
     <a href="#faq"><img src="https://img.shields.io/badge/privacy-100%25%20local-lightgrey" alt="100% local"></a>
   </p>
@@ -84,7 +84,7 @@ No. A single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`,
 ## 📚 Docs & status
 
 - [User Guide](docs/PacketLens-User-Guide.html) (HTML + PDF) · [Privacy Policy](frontend/src/app/privacy/page.tsx) · [Workboard](docs/TODO.md)
-- Analyzer **3.4.0** · report schema **1.2.0** · risk spec **1.3** · [Release v3.3.0](https://github.com/simpletarun/Packetlens/releases/tag/v3.3.0)
+- Analyzer **3.4.0** · report schema **1.2.0** · risk spec **1.3** · [Release v3.4.2](https://github.com/simpletarun/Packetlens/releases/tag/v3.4.2)
 
 ---
 
