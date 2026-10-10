@@ -32,7 +32,7 @@ PacketLens is a **free, 100% local PCAP analyzer** for network forensics and sec
 ```bash
 cd frontend
 npm install
-npm run dev          # → http://localhost:3456
+npm run dev
 ```
 
 **Production:** `npm run build && npm start`
