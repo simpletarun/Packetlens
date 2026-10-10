@@ -84,7 +84,7 @@ No. A single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`,
 ## 📚 Docs & status
 
 - [User Guide](docs/PacketLens-User-Guide.html) (HTML + PDF) · [Privacy Policy](frontend/src/app/privacy/page.tsx) · [Workboard](docs/TODO.md)
-- Analyzer **3.2.0** · report schema **1.0** · risk spec **1.3** · [Release v3.3.0](https://github.com/simpletarun/Packetlens/releases/tag/v3.3.0)
+- Analyzer **3.4.0** · report schema **1.2.0** · risk spec **1.3** · [Release v3.3.0](https://github.com/simpletarun/Packetlens/releases/tag/v3.3.0)
 
 ---
 
