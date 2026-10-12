@@ -37,7 +37,7 @@ npm run dev
 
 **Production:** `npm run build && npm start`
 
-> **No capture file?** Open `/analysis/mock-demo` to explore the built-in demo dataset.
+> **No capture file?** Open `Packetlens-main\frontend\tests\fixtures\corpus` to explore the built-in demo dataset.
 > **Windows?** Double-click `start-dev.bat` at the repo root.
 
 ---
