@@ -74,11 +74,6 @@ Only once: `npm install` and the one-time GeoIP database download. After that, e
 Not exactly. Wireshark is for deep packet inspection; PacketLens is for <i>report generation</i> — drop a capture, get a structured security report and risk score.
 </details>
 
-<details>
-<summary><b>Does it need Docker or a database?</b></summary>
-No. A single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`, last 20 jobs).
-</details>
-
 ---
 
 ## 📚 Docs & status
