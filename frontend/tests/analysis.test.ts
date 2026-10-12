@@ -335,7 +335,6 @@ describe("alert deduplication — one event, one alert, counts kept as evidence"
 })
 
 describe("timestamp robustness — long captures, multi-day timeline", () => {
-  const DAY = 86400
   const pkt = (i: number, ts: number) =>
     makePacket({ num: i + 1, timestamp: ts, length: 100, tcpFlags: "ACK" })
 
@@ -1060,6 +1059,23 @@ describe("Analysis engine", () => {
     expect(flow!.rstCount).toBe(1)
     expect(flow!.rttMs).toBe(2000)
     expect(flow!.lossPct).toBe(25) // 1 retrans / 4 data segments
+  })
+
+  it("keeps the TCP seq high-water mark so a low-seq segment never hides a later out-of-order one", () => {
+    // After an out-of-order segment (200, below high-water 300) an unconditional
+    // lastSeq=200 would make the next segment (250) look in-order. Both 200 and
+    // 250 are below the true high-water (300), so both are out-of-order.
+    const p = (num: number, seq: number) =>
+      makePacket({ num, protocol: "TCP", srcIp: "192.168.1.5", dstIp: "8.8.8.8", srcPort: 5000, dstPort: 443, timestamp: 1000000 + num, tcpFlags: "ACK", tcpSeq: seq, tcpPayloadLen: 100, tcpWin: 65535 })
+    const packets: ParsedPacket[] = [p(1, 100), p(2, 300), p(3, 200), p(4, 250)]
+    const result: PCAPResult = {
+      packets,
+      stats: { totalPackets: packets.length, totalBytes: packets.reduce((s, x) => s + x.length, 0), duration: 4, startTime: 1000001, endTime: 1000004, protocols: { TCP: packets.length } },
+    }
+    const flow = analyzePcap(result).flows.find((f) => f.protocol === "TCP")
+    expect(flow).toBeDefined()
+    expect(flow!.retrans).toBe(0)
+    expect(flow!.ooo).toBe(2)
   })
 
   it("estimatedTcpLoss is the single canonical loss estimator across every report surface", () => {

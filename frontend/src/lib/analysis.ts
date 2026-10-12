@@ -615,7 +615,10 @@ function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
       uniquePayloadBytes[d] += plen
       if (lastSeq[d] >= 0 && p.tcpSeq < lastSeq[d]) ooo++
     }
-    lastSeq[d] = p.tcpSeq
+    // High-water mark only: a retransmit or out-of-order segment carries a
+    // LOWER seq, so an unconditional assignment would drop lastSeq and hide
+    // the next genuinely out-of-order segment (oOO undercounted).
+    if (p.tcpSeq > lastSeq[d]) lastSeq[d] = p.tcpSeq
   }
   const lossPct = dataSegments === 0 ? null : Math.round((retrans / dataSegments) * 1000) / 10
   return {
@@ -1484,7 +1487,7 @@ function isPrivateIp(ip?: string): boolean {
   const ip0 = ip.trim()
   if (ip0.includes(':')) {
     const v = ip0.toLowerCase()
-    return v.startsWith('::1') || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe80') || v.startsWith('ff')
+    return v.startsWith('::1') || v.startsWith('fc') || v.startsWith('fd') || /^fe[89ab]/.test(v) || v.startsWith('ff')
   }
   const m = ip0.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
   if (!m) return false
@@ -1829,9 +1832,9 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   const duration = rates.durationSec ?? 0
   // Bucket base for the burst scan: the earliest timestamp (same convention
   // as captureRates, so peakBps and the burst scan measure the same seconds).
-  let firstTs = 0
+  let firstTs = Number.POSITIVE_INFINITY
   for (const p of raw) {
-    if (firstTs === 0 || p.timestamp < firstTs) firstTs = p.timestamp
+    if (p.timestamp < firstTs) firstTs = p.timestamp
   }
 
   let totalBytesOut = 0
@@ -2263,7 +2266,7 @@ function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threa
   // Evidence time = the LAST oversized-SNI packet; a single such packet names
   // the exact endpoints on the alert header.
   const ja3DetectedAtSec = ja3SuspiciousPackets.length > 0
-    ? Math.max(...ja3SuspiciousPackets.map(p => p.timestamp))
+    ? ja3SuspiciousPackets.reduce((m, p) => (p.timestamp > m ? p.timestamp : m), Number.NEGATIVE_INFINITY)
     : undefined
   const ja3Endpoints = ja3SuspiciousPackets.length === 1
     ? { srcIp: ja3SuspiciousPackets[0].srcIp || 'multiple', dstIp: ja3SuspiciousPackets[0].dstIp || 'external' }

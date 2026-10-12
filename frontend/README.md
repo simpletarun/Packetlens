@@ -33,8 +33,10 @@ Requires [Node.js 20+](https://nodejs.org/en/download).
 ```bash
 cd frontend
 npm install
-npm run dev        # http://localhost:3456
+npm run dev
 ```
+
+The dev server runs at **http://localhost:3456**.
 
 Production:
 

@@ -247,3 +247,18 @@ describe("parsePcap robustness", () => {
     expect(r.packets[1].tlsSni).toBeUndefined()
   })
 })
+
+describe("classic PCAP timestamp resolution", () => {
+  it("parses a nanosecond-magic capture and scales ts_frac by 1e-9 (not 1e-6)", async () => {
+    const buf = tcpPcap(new Uint8Array([1, 2, 3]))
+    buf.writeUInt32LE(0xa1b23c4d, 0) // nanosecond magic (LE)
+    buf.writeUInt32LE(1000000, 24) // ts_sec
+    buf.writeUInt32LE(500_000_000, 28) // ts_frac: 0.5 s in nanoseconds
+    const r = await parsePcap(buf)
+    expect(r.packets.length).toBe(1)
+    // 0.5 s must come from 500000000 ns, not 500000000 µs (=500 s).
+    expect(buf.readUInt32LE(0)).toBe(0xa1b23c4d)
+    expect(r.packets[0].timestamp).toBe(1000000.5)
+  })
+})
+

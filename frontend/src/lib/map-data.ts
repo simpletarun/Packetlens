@@ -218,7 +218,7 @@ export function isPrivateIP(ip: string): boolean {
     // Full-form placeholders 0:0:0:0:0:0:0:0 / 0:0:0:0:0:0:0:1 are :: / ::1 emitted
     // uncompressed — missing them sent the unspecified address to GeoIP (QA B-58).
     return v === "::" || v === "::1" || v === "0:0:0:0:0:0:0:0" || v === "0:0:0:0:0:0:0:1" || v.startsWith("::ffff:") ||
-      v.startsWith("fc") || v.startsWith("fd") || v.startsWith("fe80") || v.startsWith("ff")
+      v.startsWith("fc") || v.startsWith("fd") || /^fe[89ab]/.test(v) || v.startsWith("ff")
   }
   const first = Number(t.split(".")[0])
   // ponytail: also non-routable IPv4 — multicast 224/4 (mDNS 224.0.0.251, SSDP

@@ -250,7 +250,9 @@ function parseEthPayload(ethType: number, dv: DataView, off: number, len: number
 export async function parsePcap(buffer: Buffer, linkTypeOverride?: number): Promise<PCAPResult> {
   if (buffer.length < 4) return newResult()
   const magic = buffer.readUInt32LE(0)
-  if (magic === 0xa1b2c3d4 || magic === 0xd4c3b2a1) return parsePCAP(buffer, linkTypeOverride)
+  // 0xa1b2c3d4/0xd4c3b2a1 = microsecond PCAP; 0xa1b23c4d/0x4d3cb2a1 = the
+  // nanosecond variant (Wireshark ns-resolution save). Both byte orders.
+  if (magic === 0xa1b2c3d4 || magic === 0xd4c3b2a1 || magic === 0xa1b23c4d || magic === 0x4d3cb2a1) return parsePCAP(buffer, linkTypeOverride)
   if (buffer[0] === 0x0a && buffer[1] === 0x0d && buffer[2] === 0x0d && buffer[3] === 0x0a) return parsePCAPNG(buffer, linkTypeOverride)
   return newResult()
 }
@@ -259,7 +261,8 @@ function parsePCAP(buf: Buffer, linkTypeOverride?: number): PCAPResult {
   if (buf.length < 24) return newResult()
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
   const magic = dv.getUint32(0, true)
-  const le = magic === 0xa1b2c3d4
+  const nanosecond = magic === 0xa1b23c4d || magic === 0x4d3cb2a1
+  const le = magic === 0xa1b2c3d4 || magic === 0xa1b23c4d
   const u32 = (o: number) => dv.getUint32(o, le)
 
   const linkType = linkTypeOverride ?? u32(20)
@@ -280,7 +283,7 @@ function parsePCAP(buf: Buffer, linkTypeOverride?: number): PCAPResult {
     const dataLen = Math.min(inclLen, avail)
 
     const pdv = new DataView(buf.buffer, buf.byteOffset + off, dataLen)
-    const pkt: ParsedPacket = { num: ++num, timestamp: tsSec + tsUsec / 1_000_000, length: dataLen, origLength: origLen, payload: '' }
+    const pkt: ParsedPacket = { num: ++num, timestamp: tsSec + tsUsec / (nanosecond ? 1_000_000_000 : 1_000_000), length: dataLen, origLength: origLen, payload: '' }
 
     if (dataLen < origLen) r.stats.truncatedPackets = (r.stats.truncatedPackets ?? 0) + 1
     const ll = parseLinkLayer(linkType, pdv, dataLen, pkt)

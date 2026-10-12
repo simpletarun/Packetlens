@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest"
 import { analyzePcap, analysisProblems, assertValidAnalysisResult } from "@/lib/analysis"
 import type { AnalysisResult } from "@/lib/analysis"
-import type { PCAPResult, ParsedPacket } from "@/lib/pcap"
+import type { ParsedPacket } from "@/lib/pcap"
 
 // ── Conservation invariants (byte/packet conservation) ─────────────────────
 // The pipeline is: PCAP → engine → canonical result → FULL VALIDATION → only

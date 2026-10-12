@@ -35,9 +35,11 @@ npm install
 npm run dev
 ```
 
+Then open **http://localhost:3456**.
+
 **Production:** `npm run build && npm start`
 
-> **No capture file?** Open `Packetlens-main\frontend\tests\fixtures\corpus` to explore the built-in demo dataset.
+> **No capture file?** Open `/analysis/mock-demo` to explore the built-in demo dataset.
 > **Windows?** Double-click `start-dev.bat` at the repo root.
 
 ---
@@ -72,6 +74,11 @@ Only once: `npm install` and the one-time GeoIP database download. After that, e
 <details>
 <summary><b>Is this a Wireshark replacement?</b></summary>
 Not exactly. Wireshark is for deep packet inspection; PacketLens is for <i>report generation</i> — drop a capture, get a structured security report and risk score.
+</details>
+
+<details>
+<summary><b>Does it need Docker or a database?</b></summary>
+No. A single Node.js process; history is a JSON file (`~/.packetlens/jobs.json`, last 20 jobs).
 </details>
 
 ---

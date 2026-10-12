@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs"
+import { readFileSync, readdirSync, existsSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
@@ -6,7 +6,7 @@ import { parsePcap } from "@/lib/pcap"
 import { analyzePcap, SYN_FLOOD_MIN_PEAK_RATE, estimatedTcpLoss, isNonUnicast } from "@/lib/analysis"
 import { buildReportAnalysis, dnsLookupCount, analystConclusion } from "@/lib/report"
 import { isPrivateIP } from "@/lib/map-data"
-import { computeRisk, buildRiskInputs, burstConfidenceBoost, computeRiskBreakdown, riskLevel, verdictLevel } from "@/lib/risk"
+import { computeRisk, buildRiskInputs, burstConfidenceBoost, riskLevel, verdictLevel } from "@/lib/risk"
 import type { JobSummary } from "@/stores/analysis"
 
 const testsDir = dirname(fileURLToPath(import.meta.url))
@@ -62,7 +62,7 @@ async function audit(file: string, display: string) {
   let parsed
   try {
     parsed = await parsePcap(readFileSync(file))
-  } catch (e) {
+  } catch {
     return expect.soft(`parse ${display}`).toContain("no throw")
   }
   const pkts = parsed.packets
@@ -485,7 +485,7 @@ describe("corpus invariants — every capture must be internally consistent", ()
     }
   })
 
-  it("call.pcapng: golden regression — every user-QA'd number is pinned, loss uses data segments", async () => {
+  it.skipIf(!existsSync(join(externalDir, "call.pcapng")))("call.pcapng: golden regression — every user-QA'd number is pinned, loss uses data segments", async () => {
     // The 5-bug review round: the user's arithmetic proved the loss % was
     // retrans/dataSegments while the caption said "of 19 packets". Every
     // number below was independently verified against the engine; any engine

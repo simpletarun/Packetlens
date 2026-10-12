@@ -29,6 +29,14 @@ describe("sameOrigin (CSRF guard)", () => {
   it("rejects malformed Origin values", () => {
     expect(sameOrigin(req("not a url"))).toBe(false)
   })
+
+  it("rejects a DNS-rebinding domain that matches the Host header", () => {
+    expect(sameOrigin(req("http://evil.example:3456", "evil.example:3456"))).toBe(false)
+  })
+
+  it("allows a private-LAN IP whose Origin matches Host", () => {
+    expect(sameOrigin(req("http://192.168.1.5:3456", "192.168.1.5:3456"))).toBe(true)
+  })
 })
 
 describe("sanitizeFilename", () => {
