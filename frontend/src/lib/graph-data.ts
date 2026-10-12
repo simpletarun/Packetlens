@@ -224,7 +224,7 @@ export function buildGraphElements(input: GraphElementsInput): { nodes: ElementD
   for (const c of credentials) { const cid = `cred:${c.username}@${c.service || c.protocol}`; if (c.srcIp) addEdge(`ip:${c.srcIp}`, cid, "used", "relation") }
   for (const label of certLabels) addEdge("pcap", `cert:${label}`, "has", "struct")
   for (const d of localDevices) addEdge("pcap", `dev:${d.ip}`, "has", "struct")
-  alerts.forEach((a, i) => addEdge("pcap", `alert:${i}`, "triggered", "struct"))
+  alerts.forEach((_, i) => addEdge("pcap", `alert:${i}`, "triggered", "struct"))
   // Same-host links (B-50): the IP node (traffic) and the Device node
   // (identity) are the same endpoint — a dashed identity edge pairs them.
   for (const d of localDevices) addEdge(`ip:${d.ip}`, `dev:${d.ip}`, "same host", "identity", 0, "identity")

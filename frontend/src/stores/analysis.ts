@@ -130,8 +130,8 @@ interface CallEntry {
   id: string; callId: string; from: string; to: string
   viaIp: string; startTime: string; endTime: string | null
   durationSec: number | null; userAgent: string; status: string
-  rtpPayloadType: number | null; rtpSsrc: number | null
-  rtpPackets: number; rtpBytes: number
+  rtpPayloadType: number | null
+  rtpPackets: number
 }
 
 interface CertificateEntry {
@@ -202,7 +202,7 @@ export interface AdvancedMetrics {
 // User preferences, persisted in localStorage (the privacy policy promises
 // this: "Application preferences … stored on your device only"). The in-memory
 // copy survives resetAnalysis so a new upload doesn't flip choices back.
-export interface AnalysisSettings {
+interface AnalysisSettings {
   // v3.2 (NFR-3): online IP lookups (ipwho.is fallback) are OFF by default;
   // enabled explicitly in Settings. Offline MMDB lookups never touch this.
   onlineGeo: boolean

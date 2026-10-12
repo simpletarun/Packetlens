@@ -69,13 +69,6 @@ const eslintConfig = defineConfig([
       "react-hooks/incompatible-library": "off",
     },
   },
-  {
-    // Plain-CommonJS tooling (.cjs) legitimately uses require().
-    files: ["scripts/*.cjs"],
-    rules: {
-      "@typescript-eslint/no-require-imports": "off",
-    },
-  },
   globalIgnores([".next/**", "out/**", "build/**", "next-env.d.ts", "coverage/**"]),
 ]);
 

@@ -11,7 +11,7 @@ const variants = {
   outline: "text-foreground",
 } as const
 
-export interface BadgeProps extends HTMLAttributes<HTMLDivElement> {
+interface BadgeProps extends HTMLAttributes<HTMLDivElement> {
   variant?: keyof typeof variants
 }
 

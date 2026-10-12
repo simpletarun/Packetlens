@@ -20,7 +20,7 @@ const { Reader } = require("mmdb-lib")
 // Some are deliberately loose — 1.1.1.1 is AU in DB-IP's data but US in
 // MaxMind's, 93.184.216.34 is GB here, US in MaxMind — the check catches
 // gross breaks (wrong continent/vintage), not DB-IP's own known quirks.
-export const ANCHORS = [
+const ANCHORS = [
   { ip: "8.8.8.8", ok: ["US"], label: "Google DNS" },
   { ip: "9.9.9.9", ok: ["US"], label: "Quad9" },
   { ip: "208.67.222.222", ok: ["US"], label: "OpenDNS" },
@@ -29,7 +29,7 @@ export const ANCHORS = [
 ]
 
 // Reported-IP spot checks (informational; their "true" country is debated).
-export const SPOT_CHECKS = ["101.2.27.162", "178.104.82.79"]
+const SPOT_CHECKS = ["101.2.27.162", "178.104.82.79"]
 
 const geoDir = () => join(homedir(), ".packetlens", "geo")
 

@@ -153,9 +153,7 @@ interface AnalysisCall {
   userAgent: string
   status: string
   rtpPayloadType: number | null
-  rtpSsrc: number | null
   rtpPackets: number
-  rtpBytes: number
 }
 
 export interface AnalysisCredential {
@@ -1035,9 +1033,7 @@ function deriveVoip(packets: ParsedPacket[]): AnalysisCall[] {
       userAgent: d.userAgent || '\u2014',
       status: d.status ? `SIP ${d.status}` : 'SIP',
       rtpPayloadType: matched?.payloadType ?? null,
-      rtpSsrc: null,
       rtpPackets: matched?.packets ?? 0,
-      rtpBytes: matched?.bytes ?? 0,
     })
   }
   return calls
