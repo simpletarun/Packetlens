@@ -77,13 +77,6 @@ Not exactly. Wireshark is for deep packet inspection; PacketLens is for <i>repor
 </details>
 
 
-## 📚 Docs & status
-
-- [User Guide](docs/PacketLens-User-Guide.html) (HTML + PDF) · [Privacy Policy](frontend/src/app/privacy/page.tsx) · [Workboard](docs/TODO.md)
-- Analyzer **3.4.0** · report schema **1.2.0** · risk spec **1.3** · [Release v3.4.2](https://github.com/simpletarun/Packetlens/releases/tag/v3.4.2)
-
----
-
 ## License
 
 [MIT](LICENSE) © 2026 Tarun
