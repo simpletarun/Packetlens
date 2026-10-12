@@ -41,10 +41,17 @@
         "@types/three": "^0.185.4",
         "@vitest/coverage-v8": "^5.0.3",
         "eslint": "^9",
-        "eslint-config-next": "16.4.0",
+        "eslint-import-resolver-node": "^0.3.10",
+        "eslint-import-resolver-typescript": "^3.10.1",
+        "eslint-plugin-import": "^2.32.0",
+        "eslint-plugin-jsx-a11y": "^6.10.2",
+        "eslint-plugin-react": "^7.37.5",
+        "eslint-plugin-react-hooks": "^7.1.1",
+        "globals": "^16.4.0",
         "jsdom": "^30.0.1",
         "tailwindcss": "^4",
         "typescript": "5.9.3",
+        "typescript-eslint": "^8.65.0",
         "vitest": "^5.0.3"
     }
 }
