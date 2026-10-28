@@ -1,0 +1,81 @@
+{
+  "cases": [
+    {
+      "name": "mixed_severities_no_burst",
+      "burst": false,
+      "expected": 84,
+      "alerts": [
+        { "ruleId": "TEST-000", "severity": 5, "confidence": 70, "srcIp": "1.1.1.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 5, "confidence": 70, "srcIp": "1.1.1.1", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 4, "confidence": 70, "srcIp": "1.1.2.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 4, "confidence": 70, "srcIp": "1.1.2.1", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 4, "confidence": 70, "srcIp": "1.1.2.2", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 70, "srcIp": "1.1.3.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 70, "srcIp": "1.1.3.1", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 70, "srcIp": "1.1.3.2", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 70, "srcIp": "1.1.3.3", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 70, "srcIp": "1.1.3.4", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 2, "confidence": 70, "srcIp": "1.1.4.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 2, "confidence": 70, "srcIp": "1.1.4.1", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 2, "confidence": 70, "srcIp": "1.1.4.2", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 2, "confidence": 70, "srcIp": "1.1.4.3", "dstIp": "10.0.0.9" }
+      ]
+    },
+    {
+      "name": "rule_weights_with_burst",
+      "burst": true,
+      "expected": 93,
+      "alerts": [
+        { "ruleId": "DATA-EXFIL-001", "severity": 5, "confidence": 70, "srcIp": "10.0.0.5", "dstIp": "203.0.113.9" },
+        { "ruleId": "C2-BEACON-001", "severity": 5, "confidence": 65, "srcIp": "10.0.0.6", "dstIp": "203.0.113.10" },
+        { "ruleId": "DNS-TUNNEL-001", "severity": 4, "confidence": 80, "srcIp": "10.0.0.7", "dstIp": "8.8.8.8" }
+      ]
+    },
+    {
+      "name": "burst_bonus_no_bonus_rules",
+      "burst": true,
+      "expected": 61,
+      "alerts": [
+        { "ruleId": "DNS-TUNNEL-001", "severity": 4, "confidence": 80, "srcIp": "10.0.0.5", "dstIp": "8.8.8.8" },
+        { "ruleId": "PORT-SCAN-001", "severity": 3, "confidence": 70, "srcIp": "10.0.0.6", "dstIp": "8.8.8.8" }
+      ]
+    },
+    {
+      "name": "dedup_identical_incident",
+      "burst": false,
+      "expected": 68,
+      "alerts": [
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.0", "dstIp": "10.0.0.9" }
+      ]
+    },
+    {
+      "name": "confidence_band_scaling",
+      "burst": false,
+      "expected": 26,
+      "alerts": [
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 30, "srcIp": "1.1.1.1", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 70, "srcIp": "1.1.1.2", "dstIp": "10.0.0.9" },
+        { "ruleId": "TEST-000", "severity": 3, "confidence": 85, "srcIp": "1.1.1.3", "dstIp": "10.0.0.9" }
+      ]
+    },
+    {
+      "name": "saturation_many_alerts",
+      "burst": false,
+      "expected": 100,
+      "alerts": [
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.0", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.1", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.2", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.3", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.4", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.5", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.6", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.7", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.8", "dstIp": "10.0.0.9" },
+        { "ruleId": "MALWARE-DL-001", "severity": 5, "confidence": 95, "srcIp": "9.9.0.9", "dstIp": "10.0.0.9" }
+      ]
+    }
+  ]
+}

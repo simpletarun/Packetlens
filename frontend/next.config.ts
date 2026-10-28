@@ -1,0 +1,96 @@
+import type { NextConfig } from "next";
+import path from "path"
+import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
+import { execSync } from "node:child_process"
+
+// Desktop (Tauri) builds consume a static export — `output: "export"` disallows
+// API routes, so the build script masks src/app/api and sets TAURI_BUILD=1.
+const isTauri = process.env.TAURI_BUILD === "1"
+
+// The exact Git commit this bundle was built from — every report stamps it
+// (PDF cover, appendix, markdown, flows CSV) so an artifact can always be
+// traced to the code that produced it (QA: reports used to show only a
+// content hash of the analyzer sources, which cannot be mapped to a commit).
+// Resolution order: an explicit GIT_COMMIT build-env override (CI, packaged
+// builds where git may not exist) → `git rev-parse HEAD` at config load.
+// Falls back to the source hash when neither is available (CI artifact
+// without history, source tarball) — the stamp then says src: instead of
+// commit: so it never lies about being a Git build.
+let gitCommit = process.env.GIT_COMMIT?.trim() || ""
+if (!gitCommit) {
+  try {
+    gitCommit = execSync("git rev-parse HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
+  } catch {
+    gitCommit = ""
+  }
+}
+
+const csp = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-eval' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob: https://*.basemaps.cartocdn.com https://tile.openstreetmap.org https://server.arcgisonline.com",
+  "font-src 'self'",
+  "connect-src 'self' ws: http://localhost:8080 https://*.basemaps.cartocdn.com https://tile.openstreetmap.org https://server.arcgisonline.com https://ipwho.is geoip://localhost",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "manifest-src 'self'",
+  "worker-src 'self' blob:",
+  "media-src 'self'",
+].join("; ")
+
+const nextConfig: NextConfig = {
+  output: isTauri ? "export" : "standalone",
+  trailingSlash: isTauri,
+  images: isTauri ? { unoptimized: true } : undefined,
+  poweredByHeader: false,
+  reactStrictMode: true,
+  allowedDevOrigins: ["192.168.56.1", "localhost", "127.0.0.1"],
+  // The dev-tools "N" bubble is position:fixed in dev builds — it repeats
+  // once per full-page screenshot band and reads as a duplicated widget.
+  devIndicators: false,
+  // Baked in at build time so every report can prove which build produced it
+  // (PDFs printed from stale servers show the old build timestamp). The src
+  // hash covers the analyzer/report sources, so the fingerprint changes when
+  // analysis code changes — never two builds claiming the same stamp.
+  env: {
+    NEXT_PUBLIC_BUILD_TIME: new Date().toISOString(),
+    NEXT_PUBLIC_BUILD_COMMIT: gitCommit,
+    NEXT_PUBLIC_BUILD_SRC_HASH: createHash("sha1")
+      .update(
+        ["src/lib/analysis.ts", "src/lib/report.ts", "src/lib/risk.ts", "src/lib/stats.ts", "src/lib/pcap.ts", "src/lib/geo.ts"]
+          .map((f) => {
+            try {
+              return readFileSync(path.resolve(__dirname, f), "utf8")
+            } catch {
+              return ""
+            }
+          })
+          .join("\n")
+      )
+      .digest("hex")
+      .slice(0, 12),
+  },
+  async headers() {
+    if (isTauri) return []
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          { key: "Content-Security-Policy", value: csp },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "X-XSS-Protection", value: "1; mode=block" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+          { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
+        ],
+      },
+    ]
+  },
+};
+
+export default nextConfig;

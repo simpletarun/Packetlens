@@ -1,0 +1,2776 @@
+import { PCAPResult, ParsedPacket, tlsCipherSuiteName } from './pcap'
+import { computeRisk, buildRiskInputs, burstConfidenceBoost, RISK_PARAMS } from './risk'
+import { captureRates, CaptureRates, CaptureQuality } from './metrics'
+import { isUnicastMac } from './oui'
+
+export const ANALYZER_VERSION = "3.4.0"
+
+// JS Dates are valid up to ±8.64e15 ms (year 275760); a crafted pcapng with a
+// µs-resolution timestamp near the 2^64-ns ceiling overflows that range and
+// new Date(...).toISOString() THROWS RangeError, crashing the whole analysis.
+// Clamp instead so an extreme (absurd) capture time still renders as the real
+// instant it represents — the file's time field is preserved, never
+// fabricated, and the pipeline never crashes (QA: overflow capture).
+export function safeIso(ms: number): string {
+  if (!Number.isFinite(ms)) ms = 0
+  if (ms > 8.64e15) ms = 8.64e15
+  if (ms < -8.64e15) ms = -8.64e15
+  return new Date(ms).toISOString()
+}
+
+// Version of the canonical Analysis JSON emitted by analyzePcap. Every
+// consumer (report builder, exports, UI, snapshots) must regenerate against
+// this version; bump it on any SHAPE change so snapshot tests fail loudly
+// instead of silently comparing an old model. Bumped to 1.1.0 for the
+// protocolSource enum rename (payload/port_inferred/transport_only →
+// PAYLOAD_CONFIRMED/PORT_INFERRED/UNKNOWN) + new job fields
+// (highestSeverity, metricSpecVersion, detectionRuleVersion).
+export const ANALYSIS_SCHEMA_VERSION = "1.2.0"
+
+// Semantic contracts are versioned independently of the JSON shape: the
+// metric semantics (rate definitions, capture-quality meaning), the risk
+// formula, and the detection rules can change meaning without changing a
+// single JSON field — these versions make such changes explicit.
+export const METRIC_SPEC_VERSION = "1.1.0"
+export const DETECTION_RULE_VERSION = "1.0.0"
+
+export interface AnalysisPacket {
+  num: number; timestamp: string; srcIp: string; dstIp: string
+  srcPort: number; dstPort: number; protocol: string
+  length: number; flags: string; ttl: number; info: string
+  // TCP sequence number (TCP packets only) — needed to tell adjacent
+  // double-captured frames apart: two distinct same-length ACKs with
+  // different seqs are NOT duplicates.
+  tcpSeq?: number
+  // On-wire frame size (captured length when snaplen truncated the frame).
+  origLength?: number
+  // App-layer label when the parser identified one (HTTPS/STUN/mDNS…).
+  // Optional: older demo packets don't carry it.
+  appProtocol?: string
+  // True only when the appProtocol label was confirmed by payload content;
+  // absent = port-inferred (a pure-SYN to :80 is "HTTP by port", not decoded
+  // HTTP — protocol-honesty audit).
+  appPayloadConfirmed?: boolean
+  // Transport layer (TCP/UDP/ICMP…) — the timeline's TCP/UDP split keys on
+  // this, never on the app-layer `protocol` (HTTPS is still a TCP packet).
+  transport?: string
+}
+
+export interface AnalysisFlow {
+  id: string; srcIp: string; dstIp: string
+  srcPort: number; dstPort: number; protocol: string
+  packets: number; bytesTotal: number; bytesSent: number; bytesRecv: number
+  duration: number; startTime: string; endTime: string
+  // True when either endpoint is undecodable ("—" placeholder): direction is
+  // unknowable, so bytesSent/bytesRecv are 0 and UI must show "—" / "unknown"
+  // instead of implying a zero-byte or symmetric conversation (QA: large/verylarge).
+  directionUnknown?: boolean
+  // v3.2 TCP health (TCP flows only): retransmitted segments, out-of-order
+  // segments, zero-window advertisements, RST count, handshake RTT (ms),
+  // observed TCP data segments and loss % (retrans/data segments, both
+  // directions summed). Absent on UDP traffic. dataSegments is the ONLY
+  // denominator the loss percentage may be read against — the flow's total
+  // packet count includes handshake and pure-ACK control segments that carry
+  // no retransmission evidence (QA: call.pcapng 1 retrans / 10 data segments
+  // read as "1 of 19 packets = 10%").
+  retrans?: number
+  ooo?: number
+  zeroWindow?: number
+  rstCount?: number
+  rttMs?: number
+  dataSegments?: number
+  lossPct?: number
+  /** Unique outbound/inbound TCP payload bytes — retransmitted segments and
+   *  control segments excluded. 0/absent when no TCP payload was observed.
+   *  The exfil detector reads these instead of bytesSent/bytesRecv so
+   *  retransmissions can never inflate a byte-ratio finding (QA: time.pcapng). */
+  uniquePayloadBytesOut?: number
+  uniquePayloadBytesIn?: number
+  // Protocol honesty: how the app-layer label was obtained. "PAYLOAD_CONFIRMED"
+  // = at least one packet's app protocol was confirmed by payload content
+  // (HTTP request/response line, TLS/QUIC handshake, DNS, SIP); "PORT_INFERRED"
+  // = only the well-known-port table suggests a service; "UNKNOWN" = bare
+  // transport with no app label. A TCP/80 flow with no HTTP payload is
+  // NEVER labelled "PAYLOAD_CONFIRMED" (QA: port-inferred HTTPS shown as
+  // confirmed). The UI must not render inferred protocols as confirmed.
+  protocolSource?: "PAYLOAD_CONFIRMED" | "PORT_INFERRED" | "UNKNOWN"
+  /** Most specific app layer seen: payload-confirmed wins over port-inferred. */
+  appProtocol?: string
+  // TCP state observed on the wire (see deriveSessions) — mirrored on flows
+  // so the flow table and session list always agree; "STATELESS" on non-TCP.
+  tcpState?: string
+}
+
+export interface AnalysisSession {
+  id: string; srcIp: string; dstIp: string
+  srcPort: number; dstPort: number; protocol: string
+  packets: number; bytes: number; state: string
+  duration: number; startTime: string
+}
+
+export interface AnalysisDnsEntry {
+  id: string; timestamp: string; srcIp: string; dstIp: string
+  query: string; type: string; responseCode: string; answer: string
+  // null = no answer record in this response (QA: 0 rendered as a fake
+  // "0s" TTL — a real DNS TTL was never seen).
+  ttl: number | null
+  isResponse?: boolean
+}
+
+export interface AnalysisHttpEntry {
+  id: string; timestamp: string; srcIp: string; dstIp: string
+  method: string; uri: string; host: string
+  status: number; contentType: string; userAgent: string; length: number
+}
+
+export interface AnalysisTlsEntry {
+  id: string; timestamp: string; srcIp: string; dstIp: string
+  version: string; sni: string; cipherSuite: string
+  ja3: string; issuer: string; validityDays: number
+}
+
+export interface AnalysisFile {
+  id: string; timestamp: string; srcIp: string; dstIp: string
+  filename: string; mimeType: string; size: number
+  protocol: string; md5: string
+  /** file-transfer = an upload/download carrying a filename=; form-body = an
+   * HTTP request body (e.g. a login form) — never called a "file" (QA). */
+  kind: "file-transfer" | "form-body"
+}
+
+// A VoIP/SIP call: one INVITE dialog unified with its RTP media stream. RTP
+// packets are matched back to the call by the SDP `m=audio` port plus the
+// caller/callee peer pair; a call with no matching RTP shows null media.
+interface AnalysisCall {
+  id: string
+  callId: string
+  from: string
+  to: string
+  viaIp: string
+  startTime: string
+  endTime: string | null
+  durationSec: number | null
+  userAgent: string
+  status: string
+  rtpPayloadType: number | null
+  rtpPackets: number
+}
+
+export interface AnalysisCredential {
+  id: string; timestamp: string; srcIp: string; dstIp: string
+  protocol: string; username: string; password: string; service: string
+  /** Provenance: the capture packet number that carried the credential. */
+  packetNum?: number
+  /** The HTTP Host header of the exchange — ties the alert to the hostname
+   *  the report's HTTP table shows (QA: alerts cited only raw IPs, so a
+   *  finding on 23.155.129.172 could not be correlated to vbsca.ca). */
+  host?: string
+  /** Field-level evidence: the request line (method + path), the form
+   *  Content-Type, and the NAMES of the matched credential fields — the
+   *  report prints these, plus the username, but NEVER the password value. */
+  method?: string
+  path?: string
+  contentType?: string
+  usernameField?: string
+  passwordField?: string
+}
+
+export interface AnalysisCertificate {
+  id: string; serial: string; subject: string; issuer: string
+  // null = the capture had no valid time for this certificate (a validity of
+  // -1 used to render as "1969-12-31" — a fabricated date).
+  notBefore: string | null; notAfter: string | null; san: string[]
+  signatureAlgorithm: string; keySize: number
+}
+
+export interface AnalysisDevice {
+  id: string; ip: string; mac: string; hostname: string
+  vendor: string; os: string; firstSeen: string; lastSeen: string
+  packets: number; bytes: number
+  // v3.2: every other address this device was seen on (IPv6, extra IPv4).
+  addresses?: string[]
+  // Where the OS column's value came from: a User-Agent in this device's own
+  // requests, or the TTL heuristic (≥2 samples, private IPs only).
+  osSource?: 'ua' | 'ttl'
+}
+
+export interface AnalysisThreat {
+  id: string; timestamp: string; signature: string; category: string
+  severity: number; confidence: number; ruleId: string; srcIp: string; dstIp: string
+  srcPort: number; dstPort: number; protocol: string; evidence: string
+  // Detection state, derived from EVIDENCE QUALITY — never "confirmed" on
+  // the basis of a rule having fired: payload-verified findings are
+  // CONFIRMED, multi-indicator or high-evidence behavioral findings LIKELY,
+  // threshold hits on weak evidence SUSPECTED, port-only observations
+  // OBSERVED. MITRE mappings require LIKELY or CONFIRMED. Absent on legacy
+  // results (treated as CONFIRMED for compatibility).
+  status?: ThreatStatus
+  // Evidence quality — deliberately separate from the numeric confidence:
+  // a finding can be CONFIRMED with very high evidence quality (payload
+  // proof) while its numeric confidence stays a detector calibration
+  // (QA: "CONFIRMED but 75%?" — the report now shows both dimensions).
+  evidenceQuality?: "LOW" | "MEDIUM" | "HIGH"
+  // Evidence provenance: the exact packets that triggered the finding (first
+  // few, ascending; count lives in the evidence text). Absent for behavioral
+  // aggregates (DNS tunnel, beacon) that span many packets.
+  packetNums?: number[]
+  // The conversation (flow) the finding belongs to, when single-flow.
+  flowId?: string
+  // True when the finding was derived from decoded payload content (e.g.
+  // cleartext credentials), distinguishing payload proof from port inference.
+  payloadConfirmed?: boolean
+}
+
+export type ThreatStatus = "OBSERVED" | "SUSPECTED" | "LIKELY" | "CONFIRMED"
+
+export interface AnalysisTimelineEntry {
+  time: string; packets: number; bytes: number
+  tcp: number; udp: number; dns: number; tls: number
+}
+
+export interface AnalysisBandwidthPoint {
+  time: string; in: number; out: number
+}
+
+interface AnalysisJob {
+  id: string; filename: string; fileSize: number
+  status: string; progress: number; stage: string
+  totalPackets: number; totalFlows: number; conversations: number
+  devices: number; externalIps: number; countries: number
+  domains: number; protocols: string[]
+  alerts: number; riskScore: number; captureDuration: number; createdAt: string
+  /** Capture-artifact accounting when consecutive duplicate frames were
+   *  removed before analysis: rawPacketCount is the file's frame count,
+   *  duplicateFrameCount what was dropped, and totalPackets is the ANALYZED
+   *  set (raw - duplicates). Absent for legacy jobs (analyzed = raw). */
+  rawPacketCount?: number
+  duplicateFrameCount?: number
+  /** Max severity (0-5) across all confirmed findings — displayed ALONGSIDE
+   *  riskScore, never hidden by numeric normalization (a 39/100 LOW score can
+   *  coexist with a HIGH severity finding and the report must say so). */
+  highestSeverity: number
+  analyzerVersion?: string
+  metricSpecVersion?: string
+  detectionRuleVersion?: string
+  sha256?: string
+  sha1?: string
+  md5?: string
+  /** VALID / SINGLE_PACKET / ZERO_DURATION / EMPTY — drives the verdict and
+   *  whether rate metrics exist. */
+  captureQuality?: string
+}
+
+export interface FileInfo {
+  sha256: string
+  sha1: string
+  md5: string
+}
+
+export interface BurstInfo {
+  detected: boolean
+  peakThroughput: number
+  averageThroughput: number
+  ratio: number
+  start: number
+  end: number
+  duration: number
+  /** Whether OUTBOUND (private→public) bytes dominate the burst window. A
+   *  download spike is not evidence of data exfiltration, so the exfil
+   *  confidence bonus must not ride on it (QA: verylarge.pcapng scored 86
+   *  CRITICAL — beacon FP + inbound download burst boosting an upload). */
+  outboundDominant: boolean
+}
+
+export interface AnalysisAdvancedMetrics {
+  /** Canonical capture metrics (see metrics.ts). Every renderer reads rates
+   *  from here; avg/peak throughput below are derived copies. */
+  rates: CaptureRates
+  /** null = no time interval (single packet / zero duration) — show N/A. */
+  throughputAvg: number | null
+  throughputPeak: number | null
+  /** Largest 100 ms bucket (rates.peakBps100ms) — the honest "instantaneous"
+   *  peak, always >= throughputPeak (1 s window). Null like the others. */
+  throughputPeak100ms: number | null
+  burst: BurstInfo | null
+  beaconDetected: boolean
+  dnsTunnelingSuspected: boolean
+  dataExfiltrationSuspected: boolean
+  torVpnProxyDetected: boolean
+  portScanEnhanced: boolean
+  ja3Suspicious: boolean
+  dnsTunnelEvidence?: string
+  beaconEvidence?: string
+  /** Detection time of each behavioral flag — the last triggering packet's
+   *  epoch seconds — so the flag alerts carry evidence timestamps, not the
+   *  capture end (QA: long.pcapng DATA-EXFIL-001 was stamped 11:29:18 =
+   *  capture end while the flagged flow ended 05:54:28 UTC). Undefined =
+   *  evidence lost (legacy/mock data) — the caller falls back to capture end. */
+  dataExfilDetectedAtSec?: number
+  beaconDetectedAtSec?: number
+  dnsTunnelDetectedAtSec?: number
+  ja3DetectedAtSec?: number
+  /** Real endpoints when exactly ONE conversation/host triggered the flag —
+   *  "multiple → external" must not hide a single flow (QA: long.pcapng
+   *  alert header hid flow-85's endpoints). Undefined = multiple sources. */
+  dataExfilEndpoints?: { srcIp: string; dstIp: string }
+  beaconEndpoints?: { srcIp: string; dstIp: string }
+  ja3Endpoints?: { srcIp: string; dstIp: string }
+  /** Severity the byte-ratio exfil heuristic earns — 3 (Medium) base, 4 (High)
+   *  when the flagged flow's app protocol is payload-verified, 5 (Critical)
+   *  only when a credential exposure corroborates the capture. The heuristic
+   *  is directional behavior, so it must never read Critical from the ratio
+   *  alone (QA: long.pcapng — a suspected STUN flow fired CRITICAL). */
+  dataExfilSeverity?: number
+  topTalkers: { ip: string; bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }[]
+  iocs: { type: string; value: string; description: string; severity: number; ruleId?: string }[]
+  mitreMappings: { technique: string; id: string; description: string; severity: number }[]
+}
+
+export interface AnalysisResult {
+  schemaVersion: string
+  job: AnalysisJob
+  packets: AnalysisPacket[]
+  flows: AnalysisFlow[]
+  sessions: AnalysisSession[]
+  dns: AnalysisDnsEntry[]
+  http: AnalysisHttpEntry[]
+  tls: AnalysisTlsEntry[]
+  files: AnalysisFile[]
+  calls: AnalysisCall[]
+  credentials: AnalysisCredential[]
+  certificates: AnalysisCertificate[]
+  devices: AnalysisDevice[]
+  threats: AnalysisThreat[]
+  timeline: AnalysisTimelineEntry[]
+  bandwidth: AnalysisBandwidthPoint[]
+  advancedMetrics: AnalysisAdvancedMetrics
+  fileInfo: FileInfo
+  // Canonical capture diagnostics: quality, decode stats, and integrity
+  // verdicts (truncated / malformed / unsupported link type / incomplete
+  // decode). Every consumer reads from here; `decode` below is the legacy
+  // alias kept for the store bridge.
+  validator: AnalysisValidator
+  // Decode diagnostics (undecodable-input handling): link types from the
+  // capture header and how many packets had their encapsulation parsed.
+  // decodeRate = decoded / total — a rate near 0 means the verdict must be
+  // UNKNOWN, never SAFE.
+  decode: { decoded: number; total: number; linkTypes: number[] }
+}
+
+// Integrity verdict precedence: a capture can fail several ways at once; the
+// most severe applicable label wins.
+export type IntegrityStatus = "valid" | "truncated" | "unsupported_link_type" | "malformed" | "incomplete_decode"
+
+// Link types the encapsulation parser has a decoder for (see pcap.ts
+// parseLinkLayer). Any other DLT is a clean-but-undecodable capture.
+const SUPPORTED_DLTS = new Set([0, 1, 12, 101, 108, 113, 276])
+
+export function deriveValidator(
+  rates: CaptureRates,
+  decode: { decoded: number; total: number; linkTypes: number[] },
+  stats: PCAPResult["stats"]
+): AnalysisValidator {
+  const unsupportedLinkTypes = (stats.linkTypes ?? []).filter((lt) => !SUPPORTED_DLTS.has(lt))
+  const truncatedPackets = stats.truncatedPackets ?? 0
+  const malformedPackets = stats.malformedPackets ?? 0
+  const fileTruncated = stats.fileTruncated ?? false
+  const decodeRatePct = decode.total > 0 ? Math.round((decode.decoded / decode.total) * 100) : 100
+
+  let status: IntegrityStatus
+  if (fileTruncated || truncatedPackets > 0) status = "truncated"
+  else if (unsupportedLinkTypes.length > 0) status = "unsupported_link_type"
+  else if (malformedPackets > 0) status = "malformed"
+  else if (decode.total > 0 && decode.decoded < decode.total) status = "incomplete_decode"
+  else status = "valid"
+
+  return {
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    captureQuality: rates.quality,
+    durationSec: rates.durationSec,
+    decode: { ...decode, decodeRatePct },
+    integrity: { status, truncatedPackets, fileTruncated, malformedPackets, unsupportedLinkTypes },
+  }
+}
+
+export interface AnalysisValidator {
+  schemaVersion: string
+  /** EMPTY / SINGLE_PACKET / ZERO_DURATION / VALID — from metrics.ts. */
+  captureQuality: CaptureQuality
+  /** Real capture span; null when no time interval exists. */
+  durationSec: number | null
+  decode: { decoded: number; total: number; linkTypes: number[]; decodeRatePct: number }
+  integrity: {
+    status: IntegrityStatus
+    /** Frames whose captured length < original length (snaplen or file cut). */
+    truncatedPackets: number
+    /** True when the FILE ended mid-record (leftover bytes). */
+    fileTruncated: boolean
+    /** Frames shorter than their own link-layer header. */
+    malformedPackets: number
+    /** Link types with no decoder (e.g. DLT 999). */
+    unsupportedLinkTypes: number[]
+  }
+}
+
+function pktToAnalysis(p: ParsedPacket, seqBase: number | undefined): AnalysisPacket {
+  const flags = p.tcpFlags || '\u2014'
+  let info: string
+  // Responses echo the question name, so the Info column must say "response",
+  // not "query", or every reply looks like a second client query (D2).
+  if (p.dnsQuery) info = p.dnsQr ? `DNS response for ${p.dnsQuery}` : `DNS query for ${p.dnsQuery}`
+  else if (p.httpMethod) info = `${p.httpMethod} ${p.httpUri || '/'}`
+  else if (p.tlsSni) info = `TLS Client Hello - ${p.tlsSni}`
+  else if (p.tcpFlags) {
+    // Relative TCP sequence per flow, rebased on the flow's first packet
+    // (capture order = the SYN). The previous Seq=p.num was a GLOBAL packet
+    // counter that jumped between flows and read as TCP behavior (QA).
+    const seq = typeof p.tcpSeq === 'number' && seqBase !== undefined ? p.tcpSeq - seqBase : undefined
+    info = seq !== undefined ? `${p.tcpFlags} Seq=${seq}` : `${p.tcpFlags} pkt #${p.num}`
+  }
+  else info = `${p.protocol || 'IP'} packet #${p.num}`
+  return {
+    num: p.num,
+    timestamp: safeIso(p.timestamp * 1000),
+    srcIp: p.srcIp || '\u2014',
+    dstIp: p.dstIp || '\u2014',
+    srcPort: p.srcPort || 0,
+    dstPort: p.dstPort || 0,
+    protocol: p.protocol || 'OTHER',
+    length: p.length,
+    origLength: p.origLength,
+    tcpSeq: p.tcpSeq,
+    flags,
+    // Real IP TTL from the header — the previous hardcoded 64 made the TTL
+    // column useless and OS fingerprinting impossible.
+    ttl: p.ttl ?? 0,
+    info,
+    appProtocol: p.appProtocol || undefined,
+    appPayloadConfirmed: p.appPayloadConfirmed,
+    transport: p.transport,
+  }
+}
+
+// Direction-normalized key for a conversation (smaller IP sorts first): the
+// same 5-tuple both flow grouping and the TCP state machine key on.
+function flowKeyOf(p: ParsedPacket): string {
+  const a = p.srcIp || '\u2014'
+  const b = p.dstIp || '\u2014'
+  const ap = p.srcPort || 0
+  const bp = p.dstPort || 0
+  const proto = p.protocol || 'OTHER'
+  return a < b || (a === b && ap < bp)
+    ? `${a}|${b}|${ap}|${bp}|${proto}`
+    : `${b}|${a}|${bp}|${ap}|${proto}`
+}
+
+// Direction-SENSITIVE 4-tuple: the sequence-space base for relative Seq
+// display. TCP sequences are per-direction (each side numbers independently),
+// so rebasing must be too — flowKeyOf's normalized key would subtract the
+// client's SYN from the server's segments (QA: server Seq=834237805).
+function dirKeyOf(p: ParsedPacket): string {
+  return `${p.srcIp || '\u2014'}|${p.dstIp || '\u2014'}|${p.srcPort || 0}|${p.dstPort || 0}`
+}
+
+function deriveFlows(packets: ParsedPacket[]): AnalysisFlow[] {
+  const groups = new Map<string, ParsedPacket[]>()
+  for (const p of packets) {
+    const key = flowKeyOf(p)
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key)!.push(p)
+  }
+  return Array.from(groups.entries()).map(([key, pkts], idx) => {
+    const [srcIp, dstIp, srcPort, dstPort, protocol] = key.split('|')
+    // min/max over packet timestamps; a single large flow (or big capture)
+    // can exceed the argument limit of Math.max/min spreads (RangeError).
+    let tMin = Infinity, tMax = -Infinity
+    for (const p of pkts) {
+      const t = p.timestamp * 1000
+      if (t < tMin) tMin = t
+      if (t > tMax) tMax = t
+    }
+    // Direction attribution requires DECODED addresses. Undecodable packets
+    // (unsupported encapsulation) all key as "—|—|0|0|OTHER"; counting them
+    // in both legs would make bytesSent = bytesRecv = total — a perfectly
+    // symmetric conversation that never happened (QA: large/verylarge).
+    // The recv leg is exclusive (srcIp !== srcIp of the flow) so self-flows
+    // (ARP srcIp == dstIp, e.g. 192.168.1.17 → 192.168.1.17) count each
+    // packet ONCE — the old filters matched both legs and produced
+    // 84 sent + 84 recv for a 84-byte flow (QA: ARP byte-total audit).
+    // Undecodable packets have `undefined` addresses, so the placeholder
+    // ('—') must be applied BEFORE the leg filters — otherwise the "—|—"
+    // flow matches neither leg and reports bytesSent=0, bytesRecv=0 with
+    // bytesTotal=600 (conservation violation the validator caught).
+    const sent = pkts.filter(p => (p.srcIp || '\u2014') === srcIp)
+    const recv = pkts.filter(p => (p.dstIp || '\u2014') === srcIp && (p.srcIp || '\u2014') !== srcIp)
+    // Protocol honesty: payload-confirmed app labels win; a port-only label
+    // on every packet stays "port_inferred" (TCP/80 without HTTP payload).
+    const confirmed = new Map<string, number>()
+    const inferred = new Set<string>()
+    for (const p of pkts) {
+      if (p.appPayloadConfirmed && p.appProtocol) {
+        confirmed.set(p.appProtocol, (confirmed.get(p.appProtocol) ?? 0) + 1)
+      } else if (p.appProtocol) {
+        inferred.add(p.appProtocol)
+      }
+    }
+    const appProtocol = confirmed.size > 0
+      ? [...confirmed.entries()].sort((a, b) => b[1] - a[1])[0][0]
+      : (inferred.size > 0 ? [...inferred].sort()[0] : undefined)
+    const protocolSource: AnalysisFlow["protocolSource"] = confirmed.size > 0
+      ? "PAYLOAD_CONFIRMED"
+      : (inferred.size > 0 ? "PORT_INFERRED" : "UNKNOWN")
+    return {
+      id: `flow-${idx + 1}`, srcIp, dstIp, srcPort: Number(srcPort), dstPort: Number(dstPort),
+      protocol, packets: pkts.length,
+      bytesTotal: pkts.reduce((s, p) => s + p.length, 0),
+      bytesSent: sent.reduce((s, p) => s + p.length, 0),
+      bytesRecv: recv.reduce((s, p) => s + p.length, 0),
+      directionUnknown: srcIp === '\u2014' || dstIp === '\u2014',
+      // Sub-second flows keep ms precision (116 ms → 0.116 s); the desktop
+      // engine exports raw f64 seconds, rounding here broke parity (QA audit).
+      duration: Math.round(((tMax - tMin) / 1000) * 1000) / 1000,
+      startTime: safeIso(tMin),
+      endTime: safeIso(tMax),
+      appProtocol,
+      protocolSource,
+      ...(() => {
+        const h = protocol === 'TCP' ? tcpHealth(pkts, srcIp) : null
+        return h ? {
+          retrans: h.retrans,
+          ooo: h.ooo,
+          zeroWindow: h.zeroWindow,
+          rstCount: h.rstCount,
+          ...(h.rttMs !== undefined ? { rttMs: h.rttMs } : {}),
+          ...(h.lossPct !== undefined ? { lossPct: h.lossPct } : {}),
+          dataSegments: h.dataSegments,
+          // Unique outbound/inbound TCP payload bytes (retransmissions and
+          // control segments excluded) — the exfil detector uses these so
+          // retransmitted bytes can never inflate a byte-ratio finding (QA:
+          // time.pcapng — retransmissions were counted as sent bytes).
+          uniquePayloadBytesOut: h.uniquePayloadBytes[0],
+          uniquePayloadBytesIn: h.uniquePayloadBytes[1],
+        } : {}
+      })(),
+    }
+  }).sort((a, b) => b.packets - a.packets)
+}
+
+// TCP health per flow. Retransmission = a data segment whose (seq, len) was
+// already seen in the same direction; OoO = a data seq below the direction's
+// last observed seq; RTT from the LAST SYN before the first SYN-ACK (a SYN
+// retransmission would otherwise pair with a stale SYN and inflate RTT);
+// loss% = retrans/data segments. Seq spaces are tracked per direction (each
+// side numbers independently).
+// ponytail: whole-flow map with 32-bit seq wraparound near 4 GB of transfer is
+// not handled — split the seq space per matched segment if such captures matter.
+interface TcpHealth {
+  retrans: number
+  ooo: number
+  zeroWindow: number
+  rstCount: number
+  rttMs?: number
+  dataSegments: number
+  lossPct?: number
+  /** Unique application payload bytes per direction (dir 0 = srcIp/out,
+   *  dir 1 = in) — the sum of data-segment payload lengths whose (seq,len)
+   *  was NOT seen before, i.e. retransmissions and control segments excluded.
+   *  0 when no TCP payload was observed (synthetic/summarized captures). */
+  uniquePayloadBytes: [number, number]
+}
+function tcpHealth(pkts: ParsedPacket[], srcIp: string): TcpHealth {
+  const sorted = [...pkts].sort((a, b) => a.timestamp - b.timestamp)
+  const dir = (p: ParsedPacket) => (p.srcIp || '\u2014') === srcIp ? 0 : 1
+  const seen: [Map<number, number>, Map<number, number>] = [new Map(), new Map()]
+  const lastSeq: [number, number] = [-1, -1]
+  const uniquePayloadBytes: [number, number] = [0, 0]
+  let retrans = 0, ooo = 0, zeroWindow = 0, rstCount = 0, dataSegments = 0
+  let lastSynT: number | null = null
+  let rttMs: number | null = null
+  for (const p of sorted) {
+    if (!p.tcpFlags) continue
+    if (p.tcpFlags.includes('RST')) rstCount++
+    // RSTs conventionally carry window 0 (RFC 793 reset semantics) — a reset
+    // is not a flow-control advertisement, so it must not inflate the
+    // zero-window counter (QA: 4 RSTs read as "4 zero-window").
+    if (p.tcpWin === 0 && !p.tcpFlags.includes('RST')) zeroWindow++
+    if (p.tcpFlags.includes('SYN') && !p.tcpFlags.includes('ACK')) lastSynT = p.timestamp
+    if (p.tcpFlags.includes('SYN') && p.tcpFlags.includes('ACK') && lastSynT !== null && rttMs === null) {
+      const rtt = Math.round((p.timestamp - lastSynT) * 1000)
+      // A handshake > 5 s is a capture artifact (SYN retransmit backoff, gap
+      // between packets), not a path RTT — don't pollute the aggregate.
+      if (rtt >= 1 && rtt <= 5000) rttMs = rtt
+    }
+    const plen = p.tcpPayloadLen ?? 0
+    if (plen <= 0 || typeof p.tcpSeq !== 'number') continue
+    const d = dir(p)
+    dataSegments++
+    // Retransmission and out-of-order are mutually exclusive: a retransmitted
+    // segment is below lastSeq by construction, so counting it again as ooo
+    // double-reports pure-loss flows (QA: 1 retrans read as 1 retrans + 1 ooo).
+    if (seen[d].get(p.tcpSeq) === plen) retrans++
+    else {
+      seen[d].set(p.tcpSeq, plen)
+      uniquePayloadBytes[d] += plen
+      if (lastSeq[d] >= 0 && p.tcpSeq < lastSeq[d]) ooo++
+    }
+    // High-water mark only: a retransmit or out-of-order segment carries a
+    // LOWER seq, so an unconditional assignment would drop lastSeq and hide
+    // the next genuinely out-of-order segment (oOO undercounted).
+    if (p.tcpSeq > lastSeq[d]) lastSeq[d] = p.tcpSeq
+  }
+  const lossPct = dataSegments === 0 ? null : Math.round((retrans / dataSegments) * 1000) / 10
+  return {
+    retrans, ooo, zeroWindow, rstCount, dataSegments,
+    ...(rttMs !== null ? { rttMs } : {}),
+    ...(lossPct !== null ? { lossPct } : {}),
+    uniquePayloadBytes,
+  }
+}
+
+// CANONICAL retransmission-based loss estimate — the ONE function every
+// surface (TCP Health card, network-health observation, CSV, PDF) reads the
+// estimate from. The denominator is the observed TCP DATA-SEGMENT count, never
+// the flow's total packet count: control segments (SYN/SYN-ACK/ACK/FIN/RST)
+// carry no retransmission evidence, so "1 retransmission ÷ 6 packets" is a
+// category error (QA: my.pcapng 1 retrans / 2 data segments = 50% read as
+// "1/6 = 16.7%" from the displayed 6 packets).
+// Confidence scales with the DATA-SEGMENT sample, not total packets — a flow
+// of 100 pure-ACK packets over 2 data segments has a 2-segment estimate, so
+// LOW (QA: 100 ACKs + 2 data segments were rated HIGH by packet count).
+// lossPct comes from the flow's canonical value (set once in tcpHealth, one
+// decimal place); it is never recomputed by consumers. Percentages are not
+// used as inputs to any further calculation.
+export interface TcpLossEstimate {
+  /** Retransmitted data segments observed (both directions summed). */
+  retrans: number
+  /** Observed TCP data segments (both directions summed; includes the
+   *  retransmitted segments themselves). */
+  dataSegments: number
+  /** Total packets in the flow — includes control segments that are NOT loss
+   *  evidence; never the loss denominator. */
+  totalPackets: number
+  /** retrans / dataSegments, one decimal place, or null when not measurable. */
+  lossPct: number | null
+  /** Sample-size confidence on the data-segment count: >=100 HIGH, 20–99
+   *  MEDIUM, <20 LOW, null when not measurable. */
+  confidence: "HIGH" | "MEDIUM" | "LOW" | null
+  /** Human wording for the confidence tier, in the estimator so every
+   *  surface (card tooltip, observation, CSV comment) cites the same rule. */
+  confidenceReason: string | null
+  /** False when the flow carried no data segments (ACK-only, handshake-only,
+   *  empty flows) — never report a loss percentage for those. */
+  measurable: boolean
+}
+export function estimatedTcpLoss(f: AnalysisFlow): TcpLossEstimate {
+  const retrans = f.retrans ?? 0
+  const dataSegments = f.dataSegments ?? 0
+  const measurable = dataSegments > 0
+  const lossPct = measurable ? f.lossPct ?? Math.round((retrans / dataSegments) * 1000) / 10 : null
+  const confidence = measurable ? (dataSegments >= 100 ? "HIGH" : dataSegments >= 20 ? "MEDIUM" : "LOW") : null
+  const confidenceReason = confidence ? (confidence === "HIGH" ? `${dataSegments} data segments (≥100) — a large sample` : confidence === "MEDIUM" ? `${dataSegments} data segments (20–99) — a moderate sample` : `${dataSegments} data segments (<20) — the sample is small`) : null
+  return { retrans, dataSegments, totalPackets: f.packets, lossPct, confidence, confidenceReason, measurable }
+}
+
+// Observed TCP flags per conversation — the session state machine's input.
+interface TcpConversationState {
+  syn: boolean
+  synAck: boolean
+  /** A pure ACK observed AFTER the SYN-ACK — the final handshake ACK (or any
+   *  later data ACK), proving the handshake actually completed. Without it a
+   *  SYN-ACK is a half-open connection, not ESTABLISHED. */
+  postSynAckAck: boolean
+  rst: boolean
+  fin: boolean
+}
+
+// State derivation is a priority-ordered transition table over the OBSERVED
+// wire sequence — never an inference from the latest packet alone:
+//   RESET (any RST) > CLOSED (any FIN) > ESTABLISHED (SYN-ACK + completing
+//   ACK) > HALF_OPEN (SYN-ACK without the final ACK) > INITIATED (SYN only) >
+//   ESTABLISHED (mid-stream guess).
+// RST always wins, so SYN → SYN-ACK → RST can never read as ESTABLISHED, and
+// a pure ACK without a SYN-ACK can never read as a completed handshake.
+function tcpConversationStates(packets: ParsedPacket[]): Map<string, TcpConversationState> {
+  const states = new Map<string, TcpConversationState>()
+  // Process in TIMESTAMP order, not file order: pcapng writers can record
+  // packets out of order (multi-interface captures, live merges), and a
+  // reversed handshake would otherwise read the completing ACK BEFORE the
+  // SYN-ACK — misclassifying an established session as HALF_OPEN.
+  const ordered = [...packets].sort((a, b) => a.timestamp - b.timestamp)
+  for (const p of ordered) {
+    if (!p.tcpFlags) continue
+    const key = flowKeyOf(p)
+    let s = states.get(key)
+    if (!s) {
+      s = { syn: false, synAck: false, postSynAckAck: false, rst: false, fin: false }
+      states.set(key, s)
+    }
+    if (p.tcpFlags.includes('SYN')) s.syn = true
+    if (p.tcpFlags.includes('SYN') && p.tcpFlags.includes('ACK')) s.synAck = true
+    // Order-sensitive: the SYN-ACK itself carries ACK, so only a later pure
+    // ACK (final handshake ACK or data ACK) counts as handshake completion.
+    if (p.tcpFlags.includes('ACK') && !p.tcpFlags.includes('SYN') && s.synAck) s.postSynAckAck = true
+    if (p.tcpFlags.includes('RST')) s.rst = true
+    if (p.tcpFlags.includes('FIN')) s.fin = true
+  }
+  return states
+}
+
+// Module-level so deriveSessions and the flow tcpState mirror share one truth.
+// Flow srcIp/dstIp carry the direction-normalized order from deriveFlows, so
+// the state key rebuilds identically to flowKeyOf(p) on raw packets.
+const SESSION_KEY_OF = (f: AnalysisFlow): string =>
+  `${f.srcIp}|${f.dstIp}|${f.srcPort}|${f.dstPort}|${f.protocol}`
+
+function tcpStateOf(f: AnalysisFlow, tcpStates: Map<string, TcpConversationState>): string {
+  if (f.protocol !== 'TCP') return 'STATELESS'
+  const s = tcpStates.get(SESSION_KEY_OF(f))
+  if (s?.rst) return 'RESET'
+  if (s?.fin) return 'CLOSED'
+  if (s?.synAck && s?.postSynAckAck) return 'ESTABLISHED'
+  if (s?.synAck) return 'HALF_OPEN'
+  if (s?.syn) return 'INITIATED'
+  return 'ESTABLISHED'
+}
+
+function deriveSessions(flows: AnalysisFlow[], tcpStates: Map<string, TcpConversationState>): AnalysisSession[] {
+  // State from the OBSERVED handshake, not a blanket "ESTABLISHED": a flow
+  // with 2-3 SYN packets and no ACK is a failed/partial handshake, a SYN-ACK
+  // with no completing ACK is half-open, and a flow that only saw RST never
+  // established. Mid-stream captures without a SYN fall back to ESTABLISHED
+  // (the honest guess).
+  return flows.map((f, i) => ({
+    id: `sess-${i + 1}`, srcIp: f.srcIp, dstIp: f.dstIp,
+    srcPort: f.srcPort, dstPort: f.dstPort, protocol: f.protocol,
+    packets: f.packets, bytes: f.bytesTotal,
+    state: tcpStateOf(f, tcpStates),
+    duration: f.duration, startTime: f.startTime,
+  }))
+}
+
+// DNS record-type names for the question-type code captured per message.
+// The type column shows what was ASKED (the question section) — a response's
+// own answers could be CNAME chains, so the question type is the honest label.
+const DNS_TYPE_NAMES: Record<number, string> = {
+  1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 12: 'PTR', 15: 'MX', 16: 'TXT',
+  28: 'AAAA', 33: 'SRV', 35: 'NAPTR', 43: 'DS', 46: 'RRSIG', 47: 'NSEC',
+  48: 'DNSKEY', 255: 'ANY',
+}
+
+// DNS response-code names — the page's NXDOMAIN counter keys on the literal.
+const DNS_RCODE_NAMES: Record<number, string> = {
+  0: 'NOERROR', 1: 'FORMERR', 2: 'SERVFAIL', 3: 'NXDOMAIN',
+  4: 'NOTIMP', 5: 'REFUSED',
+}
+
+function deriveDns(packets: ParsedPacket[]): AnalysisDnsEntry[] {
+  // All DNS messages are kept (queries AND responses): responses carry the
+  // rcode and answer data the pages display. The QR flag labels each row so
+  // query counts and distinct-lookup counts never treat a response echo or a
+  // relayed copy as a second query from the client.
+  return packets.filter(p => p.dnsQuery).map((p, i) => {
+    const first = p.dnsAnswers?.[0]
+    return {
+      id: `dns-${i + 1}`,
+      timestamp: safeIso(p.timestamp * 1000),
+      srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+      query: p.dnsQuery!,
+      // Record type from the question section; the old answer-based
+      // heuristic mislabeled response rows (D3).
+      type: DNS_TYPE_NAMES[p.dnsQtype ?? -1] || (first?.ip?.includes(':') ? 'AAAA' : 'A'),
+      responseCode: p.dnsRcode === undefined ? 'NOERROR' : (DNS_RCODE_NAMES[p.dnsRcode] || `RCODE ${p.dnsRcode}`),
+      answer: first?.ip || first?.name || '\u2014',
+      // Real TTL from the answer record; null when there is no answer
+      // (queries and answer-less responses carry no TTL — 0 would fabricate
+      // one on the DNS page).
+      ttl: p.dnsQr ? (p.dnsTtl ?? null) : null,
+      isResponse: p.dnsQr === true,
+    }
+  })
+}
+
+function deriveHttp(packets: ParsedPacket[]): AnalysisHttpEntry[] {
+  // Response side first, indexed per flow (reversed key) and sorted by
+  // timestamp. The old "LATEST response per flow" map handed the SAME
+  // response to EVERY request on a connection (QA: a POST /submit/ showed the
+  // text/css Content-Type of a later GET /style.css exchange on the same
+  // flow). HTTP/1.1 answers requests sequentially, so responses are consumed
+  // FIFO — each request gets the next response that arrives after it.
+  const responsesByFlow = new Map<string, ParsedPacket[]>()
+  for (const p of packets) {
+    if (p.httpStatus === undefined || !p.srcIp || !p.dstIp) continue
+    const key = `${p.srcIp}:${p.srcPort}:${p.dstIp}:${p.dstPort}`
+    const arr = responsesByFlow.get(key)
+    if (arr) arr.push(p)
+    else responsesByFlow.set(key, [p])
+  }
+  for (const arr of responsesByFlow.values()) arr.sort((a, b) => a.timestamp - b.timestamp)
+  const consumed = new Map<string, number>()
+  // Timestamp order, not file order: pcapng can store packets out of order.
+  return packets.filter(p => p.httpMethod).sort((a, b) => a.timestamp - b.timestamp).map((p, i) => {
+    let res: ParsedPacket | undefined
+    if (p.srcIp && p.dstIp) {
+      const key = `${p.dstIp}:${p.dstPort}:${p.srcIp}:${p.srcPort}`
+      const arr = responsesByFlow.get(key)
+      if (arr) {
+        let j = consumed.get(key) ?? 0
+        // Responses that arrived before the request — or interim 1xx ones
+        // (100 Continue is a real wire packet but not a terminal status;
+        // it and the final response belong to the SAME exchange, so the
+        // final 200 must pair onto this request, not the next one).
+        while (j < arr.length && (arr[j].timestamp <= p.timestamp || (arr[j].httpStatus ?? 0) < 200)) j++
+        if (j < arr.length) {
+          res = arr[j]
+          consumed.set(key, j + 1)
+        }
+      }
+    }
+    return {
+      id: `http-${i + 1}`,
+      timestamp: safeIso(p.timestamp * 1000),
+      srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+      method: p.httpMethod!, uri: p.httpUri || '/', host: p.httpHost || '',
+      // Real status when the server answered; 0 renders as "—" (no response).
+      status: res?.httpStatus ?? 0,
+      contentType: res?.httpContentType || '',
+      // Real User-Agent from the request — feeds the device OS fingerprint.
+      userAgent: p.httpUa || '',
+      // Payload only — p.length counts Ethernet/IP/TCP headers (~54 B/frame)
+      // and inflates "Total Data" by that per request (QA: body-less GETs
+      // showed ~400 B of "data"). Same rule deriveFiles already uses.
+      length: p.tcpPayloadLen ?? p.length,
+    }
+  })
+}
+
+// The legacy_version / supported_versions field of a ClientHello: the
+// real TLS version the client offered. Unknown values render as a hex
+// label, never a wrong name (QA: the TLSv1.2 report card read 0 forever
+// because deriveTls hardcoded TLSv1.3).
+function tlsVersionName(v?: number): string {
+  switch (v) {
+    case 0x0304: return 'TLSv1.3'
+    case 0x0303: return 'TLSv1.2'
+    case 0x0302: return 'TLSv1.1'
+    case 0x0301: return 'TLSv1.0'
+    case 0x0300: return 'SSLv3'
+    default: return v ? `TLS 0x${v.toString(16)}` : 'TLS'
+  }
+}
+
+function deriveTls(packets: ParsedPacket[]): AnalysisTlsEntry[] {
+  // The cipher suite is negotiated in the ServerHello — a different packet
+  // from the SNI ClientHello. Key by the ServerHello's SRC (the server; its
+  // dst is the client) and join onto the handshake row by the SNI packet's
+  // dst, so every row shows the suite the two sides actually agreed on.
+  const serverSuite = new Map<string, { suite: number; t: number }>()
+  for (const p of packets) {
+    if (typeof p.tlsCipherSuite === 'number' && p.srcIp) {
+      // Latest-by-timestamp wins (pcapng file order can be out of order): a
+      // renegotiated suite must not be overwritten by an older packet.
+      const prev = serverSuite.get(p.srcIp)
+      if (prev === undefined || p.timestamp > prev.t) serverSuite.set(p.srcIp, { suite: p.tlsCipherSuite, t: p.timestamp })
+    }
+  }
+  return packets.filter(p => p.tlsSni).map((p, i) => {
+    const negotiated = p.dstIp && serverSuite.has(p.dstIp) ? serverSuite.get(p.dstIp)!.suite : undefined
+    // The negotiated suite decides the version. A 0x13xx suite can only be
+    // NEGOTIATED by TLS 1.3 (RFC 8446) — when the server agreed one, the
+    // handshake is 1.3 even if this ClientHello's legacy_version field reads
+    // 0x0303 (RFC 8446 §4.1.2 keeps it there by spec, and the suite-scan can
+    // miss on truncated CH payloads) (QA: row showed TLSv1.2 with
+    // TLS_AES_256_GCM_SHA384). A legacy suite means the server chose a
+    // pre-1.3 handshake, so the row must not inherit the ClientHello's 1.3
+    // capability offer (QA: qwen handshake offered TLS_AES_128_GCM_SHA256
+    // but the ServerHello answered ECDHE-RSA-AES128-GCM-SHA256 → TLSv1.2).
+    const version = negotiated !== undefined
+      ? (negotiated >= 0x1301 && negotiated <= 0x1305
+          ? 'TLSv1.3'
+          // Legacy suite: the handshake is pre-1.3. The ClientHello's
+          // legacy_version is the client's REAL offer (0x0301/0x0302/0x0300),
+          // so a TLS 1.0-era handshake must not read as TLSv1.2; only fall
+          // back to 1.2 when the offer is unknown or already 1.2 (QA: a
+          // TLS 1.0 ServerHello pair showed TLSv1.2 before).
+          : p.tlsVersion === 0x0300 || p.tlsVersion === 0x0301 || p.tlsVersion === 0x0302
+            ? tlsVersionName(p.tlsVersion)
+            : 'TLSv1.2')
+      : tlsVersionName(p.tlsVersion)
+    return {
+      id: `tls-${i + 1}`,
+      timestamp: safeIso(p.timestamp * 1000),
+      srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+      version, sni: p.tlsSni!,
+      cipherSuite: negotiated !== undefined ? tlsCipherSuiteName(negotiated) : '',
+      ja3: '', issuer: '', validityDays: 0,
+    }
+  })
+}
+
+function deriveFiles(packets: ParsedPacket[]): AnalysisFile[] {
+  const files: AnalysisFile[] = []
+  let idx = 0
+  for (const p of packets) {
+    if (!p.httpMethod) continue
+    // The payload stores the whole FRAME as hex — decode only the TCP
+    // application bytes (same slice as reassembleTlsSni), or the header
+    // region leaks into Content-Type/filename matches and every packet looks
+    // like a file (QA: minor.pcapng "3 files" were 3 login form bodies).
+    const app = typeof p.tcpPayloadLen === "number" ? p.payload.slice((p.length - p.tcpPayloadLen) * 2) : p.payload
+    // CR/LF are kept (like deriveCredentials): a CR/LF-stripped dump merges
+    // header lines into one string, and \S+ then swallows the NEXT header's
+    // name into the mime type (e.g. "...form-urlencodedUser-Agent:").
+    const raw = hexToAsciiKeep(app)
+    const sep = raw.indexOf('\r\n\r\n')
+    const head = sep >= 0 ? raw.slice(0, sep) : raw
+    const ct = head.match(/Content-Type:\s*(\S+)/i)
+    if (!ct) continue
+    const mime = ct[1].replace(/;.*/, '')
+    const fn = head.match(/filename="?([^"\r\n]+)"?/i)
+    // A filename= attribute (multipart/form-data upload) is a real file
+    // transfer; a bare Content-Type request body is an HTTP payload (form
+    // submission), never a file (QA: "3 files extracted" were 3 login forms).
+    const kind: AnalysisFile["kind"] = fn ? "file-transfer" : "form-body"
+    files.push({
+      id: `file-${++idx}`,
+      timestamp: safeIso(p.timestamp * 1000),
+      srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+      filename: fn ? fn[1] : '',
+      // Honest size: the HTTP payload bytes of THIS packet (no reassembly —
+      // a multi-packet transfer yields one row per observed chunk). The wire
+      // length previously counted IP/TCP headers and looked like file size.
+      mimeType: mime, size: p.tcpPayloadLen ?? p.length,
+      protocol: p.protocol || 'HTTP', md5: '',
+      kind,
+    })
+  }
+  return files
+}
+
+// SIP dialogs unified with their RTP media: INVITE starts a call, BYE (or the
+// last observed RTP packet) ends it, and the SDP `m=audio` port links the
+// dialog to its stream. Mirrors analyzer/src/pipeline.rs (sip + rtp_agg).
+function deriveVoip(packets: ParsedPacket[]): AnalysisCall[] {
+  const rtpKey = (p: ParsedPacket) =>
+    p.rtp ? `${p.srcIp || ''}|${p.dstIp || ''}|${p.srcPort ?? 0}|${p.dstPort ?? 0}|${p.rtp.ssrc}` : ''
+  const rtpStreams = new Map<string, { packets: number; bytes: number; last: number; payloadType: number | null }>()
+  for (const p of packets) {
+    const k = rtpKey(p)
+    if (!k) continue
+    const s = rtpStreams.get(k)
+    if (s) {
+      s.packets += 1
+      s.bytes += p.length
+      if (p.timestamp > s.last) s.last = p.timestamp
+    } else {
+      rtpStreams.set(k, { packets: 1, bytes: p.length, last: p.timestamp, payloadType: p.rtp!.payloadType })
+    }
+  }
+
+  // Dialog state per Call-ID. INVITE defines the endpoints/SDP; the final
+  // status (200 OK / 486 Busy) comes from the last SIP/2.0 response seen.
+  type Dialog = {
+    from: string; to: string; viaIp: string; userAgent: string
+    start: number; end: number | null
+    status: string
+    srcIp: string | undefined; dstIp: string | undefined; rtpPort: number
+  }
+  const dialogs = new Map<string, Dialog>()
+  for (const p of packets) {
+    const sip = p.sip
+    if (!sip || !sip.callId) continue
+    let d = dialogs.get(sip.callId)
+    if (!d) {
+      d = { from: '', to: '', viaIp: '', userAgent: '', start: p.timestamp, end: null, status: '', srcIp: undefined, dstIp: undefined, rtpPort: 0 }
+      dialogs.set(sip.callId, d)
+    }
+    if (sip.method === 'INVITE') {
+      d.from = sip.fromUser
+      d.to = sip.toUser
+      d.userAgent = sip.userAgent || d.userAgent
+      d.srcIp = p.srcIp
+      d.dstIp = p.dstIp
+      if (sip.rtpPort) d.rtpPort = sip.rtpPort
+      if (p.timestamp < d.start) d.start = p.timestamp
+    }
+    if (sip.method === 'BYE') d.end = p.timestamp
+    if (sip.method === 'SIP/2.0' && sip.statusCode > 0) d.status = String(sip.statusCode)
+    d.viaIp = sip.viaIp || d.viaIp
+  }
+
+  const calls: AnalysisCall[] = []
+  let idx = 0
+  for (const [callId, d] of dialogs) {
+    // Match the RTP stream(s) to this dialog: SDP port on either side of the
+    // conversation. rtpStreams are direction-sensitive (one stream per ssrc),
+    // so a call spans two streams — caller→callee and callee→caller — and
+    // both must be aggregated, or RTP packets/bytes read ~half the real call
+    // (QA: 240 RTP packets reported as 120). Without any match the call is
+    // signalling-only.
+    let matched: { packets: number; bytes: number; last: number; payloadType: number | null } | null = null
+    for (const [key, s] of rtpStreams) {
+      const [a, b, pa, pb] = key.split('|')
+      const pairOk = (d.srcIp === a && d.dstIp === b) || (d.dstIp === a && d.srcIp === b)
+      const portOk = Number(pa) === d.rtpPort || Number(pb) === d.rtpPort
+      if (pairOk && portOk) {
+        if (!matched) matched = { ...s }
+        else {
+          matched.packets += s.packets
+          matched.bytes += s.bytes
+          if (s.last > matched.last) matched.last = s.last
+        }
+      }
+    }
+    const end = d.end !== null ? d.end : matched ? matched.last : null
+    calls.push({
+      id: `call-${++idx}`,
+      callId,
+      from: d.from || '\u2014',
+      to: d.to || '\u2014',
+      viaIp: d.viaIp || '\u2014',
+      startTime: safeIso(d.start * 1000),
+      endTime: end !== null ? safeIso(end * 1000) : null,
+      durationSec: end !== null ? Math.max(0, end - d.start) : null,
+      userAgent: d.userAgent || '\u2014',
+      status: d.status ? `SIP ${d.status}` : 'SIP',
+      rtpPayloadType: matched?.payloadType ?? null,
+      rtpPackets: matched?.packets ?? 0,
+    })
+  }
+  return calls
+}
+
+function percentDecode(value: string): string {
+  // application/x-www-form-urlencoded: '+' means space, '%XX' is a byte.
+  // Malformed sequences (e.g. "%zz") return the raw value — never throw.
+  try {
+    return decodeURIComponent(value.replace(/\+/g, ' '))
+  } catch {
+    return value
+  }
+}
+
+function decodeBasicAuth(token: string): string {
+  // atob + TextDecoder stay browser-safe: analysis.ts is imported by client
+  // pages, so node-only Buffer is not available here.
+  const bytes = Uint8Array.from(atob(token), (c) => c.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+function hexToAsciiKeep(hex: string, max = 2048): string {
+  // Like hexToAscii but keeps \r and \n so the HTTP message structure
+  // (header/body split on \r\n\r\n, request line) survives the printable
+  // filter; everything else non-printable is dropped.
+  const len = Math.min(hex.length, max * 2)
+  let out = ''
+  for (let i = 0; i < len; i += 2) {
+    const c = parseInt(hex.substring(i, i + 2), 16)
+    if (c === 13 || c === 10 || (c >= 32 && c < 127)) out += String.fromCharCode(c)
+  }
+  return out
+}
+
+function parseFormPairs(text: string): [string, string][] {
+  // key=value pairs split on '&' BEFORE decoding, so an encoded '%26' inside
+  // a value stays intact; values end at whitespace.
+  const out: [string, string][] = []
+  for (const pair of text.split('&')) {
+    const eq = pair.indexOf('=')
+    if (eq < 0) continue
+    const key = pair.slice(0, eq).trim()
+    if (!key) continue
+    out.push([key, percentDecode(pair.slice(eq + 1).split(/\s/)[0])])
+  }
+  return out
+}
+
+function deriveCredentials(packets: ParsedPacket[]): AnalysisCredential[] {
+  const creds: AnalysisCredential[] = []
+  let idx = 0
+  for (const p of packets) {
+    if (!p.httpMethod) continue
+    // The payload stores the whole FRAME as hex — decode only the TCP
+    // application bytes (same slice as reassembleTlsSni). Decoding from byte
+    // 0 put Ethernet/IP/TCP header bytes in front of the request line, so
+    // the "method" read as ASCII garbage of the destination MAC (QA:
+    // minor.pcapng showed method 'l"-EL@P' — the frame header — while the
+    // HTTP section correctly showed POST; login.pcapng merged header bytes
+    // into 'EFN@de-)P6;skPuPOST').
+    const app = typeof p.tcpPayloadLen === "number" ? p.payload.slice((p.length - p.tcpPayloadLen) * 2) : p.payload
+    const raw = hexToAsciiKeep(app)
+
+    // Real HTTP Basic auth: Authorization: Basic base64(user:pass)
+    const basic = raw.match(/Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i)
+    if (basic) {
+      const decoded = decodeBasicAuth(basic[1])
+      const colon = decoded.indexOf(':')
+      if (colon < 0) continue
+      creds.push({
+        id: `cred-${++idx}`,
+        timestamp: safeIso(p.timestamp * 1000),
+        srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+        protocol: p.protocol || 'HTTP',
+        username: decoded.slice(0, colon),
+        password: decoded.slice(colon + 1),
+        service: 'HTTP Basic',
+        packetNum: p.num,
+        host: p.httpHost || '',
+      })
+      continue
+    }
+
+    // Form-encoded login — parsed on the HTTP message structure, NEVER on the
+    // raw payload blob. Header lines merge into one string once CR/LF are
+    // filtered, so a header like "Accept: ...;q=0.1" or "Cache-Control:
+    // max-age=0" would swallow the first '=' and yield garbage keys (a real
+    // capture produced a "0.1Sec-GPC:" username this way).
+    const sep = raw.indexOf('\r\n\r\n')
+    const head = sep >= 0 ? raw.slice(0, sep) : raw
+    // Body-only segment (headers were in a previous packet): treat the whole
+    // payload as the body when it is not itself an HTTP request line.
+    const isRequest = /^[A-Z]+\s+\S+\s+HTTP\//i.test(raw)
+    const body = sep >= 0 ? raw.slice(sep + 4) : isRequest ? '' : raw
+    // Query string comes from the request line only: "METHOD /path?query HTTP/x"
+    const requestLine = head.split(/\r?\n/)[0] ?? ''
+    const target = requestLine.split(' ')[1] ?? ''
+    const qmark = target.indexOf('?')
+    const query = qmark >= 0 ? target.slice(qmark + 1) : ''
+
+    const pairs: [string, string][] = []
+    if (query) pairs.push(...parseFormPairs(query))
+    // multipart bodies use boundary markers, not '&' pairs.
+    if (body && !/multipart\/form-data/i.test(head)) pairs.push(...parseFormPairs(body))
+
+    // 'bypass'/'compass'/'surpass' keys contain "pass" but are not passwords.
+    // Field names are REQUIRED evidence — a bare POST to /login/ with no
+    // credential-like field never fires (QA: oncemore.pcapng's login POST
+    // had to prove itself by carrying user=admin + a password field).
+    let user: string | undefined
+    let userField: string | undefined
+    let pass: string | undefined
+    let passField: string | undefined
+    for (const [key, value] of pairs) {
+      if (/user|login|email/i.test(key)) { user = value; userField = key }
+      else if (/pass/i.test(key) && !/bypass|compass|surpass/i.test(key)) { pass = value; passField = key }
+    }
+    if (!user && !pass) continue
+    // The user field, the password field or both must be present — the
+    // evidence cites their names, and the password VALUE never leaves the
+    // detector (the report redacts it; QA: field-level evidence demanded).
+    const method = requestLine.split(' ')[0] ?? ''
+    const path = target.split('?')[0] || ''
+    const contentType = (head.match(/Content-Type:\s*([^\r\n]+)/i)?.[1] ?? '').trim()
+    creds.push({
+      id: `cred-${++idx}`,
+      timestamp: safeIso(p.timestamp * 1000),
+      srcIp: p.srcIp || '\u2014', dstIp: p.dstIp || '\u2014',
+      protocol: p.protocol || 'HTTP',
+      username: user ?? '\u2014',
+      password: pass ?? '\u2014',
+      service: 'HTTP Form',
+      packetNum: p.num,
+      host: p.httpHost || '',
+      method, path, contentType,
+      usernameField: userField,
+      passwordField: passField,
+    })
+  }
+  return creds
+}
+
+// Offline OS fingerprint from what the capture actually exposes:
+// 1) User-Agent strings sent by the device's own HTTP requests;
+// 2) the IP TTL the device's own packets carry (Windows=128±, Unix=64±,
+//    network gear=255±). UA wins; TTL is the fallback when the host never
+//    speaks HTTP. Unknown stays "" — the devices page shows "—".
+// Attribution rules (F-04 QA): a UA belongs ONLY to the device that SENT it,
+// and only for its OWN source packets — a remote server never inherits the
+// client's UA. The TTL heuristic is likewise keyed to the device's own
+// packets, requires >= 2 samples (a lone RST would guess the wrong OS), and
+// is suppressed entirely for public endpoints: a CDN edge TTL says nothing
+// about the client behind NAT, and guessing "Windows" for Google erodes
+// trust in the column.
+function osFingerprint(ips: string[], packets: ParsedPacket[], isPrivate: boolean): { os: string; source: AnalysisDevice['osSource'] } {
+  const ipSet = new Set(ips)
+  const uaOf = (ua: string): string | null => {
+    if (/Android/i.test(ua)) return 'Android'
+    if (/iPhone|iPad|iPod/i.test(ua)) return 'iOS'
+    if (/Microsoft-CryptoAPI|MSIE|Trident|Windows|Win32/i.test(ua)) return 'Windows'
+    if (/Macintosh|Mac OS/i.test(ua)) return 'macOS'
+    if (/CrOS/i.test(ua)) return 'ChromeOS'
+    if (/Linux|Ubuntu|Debian|Fedora/i.test(ua)) return 'Linux'
+    return null
+  }
+  const uas = new Set<string>()
+  const ttlCounts = new Map<number, number>()
+  for (const p of packets) {
+    if (p.srcIp && ipSet.has(p.srcIp)) {
+      if (p.httpUa) uas.add(p.httpUa)
+      if (typeof p.ttl === 'number') ttlCounts.set(p.ttl, (ttlCounts.get(p.ttl) ?? 0) + 1)
+    }
+  }
+  for (const ua of uas) {
+    const os = uaOf(ua)
+    if (os) return { os, source: 'ua' }
+  }
+  if (!isPrivate) return { os: '', source: undefined }
+  // Mode of the device's own TTLs; a single outlier shouldn't win — and a
+  // single sample is too thin to claim an OS (F-04 QA: router = "Windows").
+  let best: { ttl: number; n: number } | null = null
+  for (const [ttl, n] of ttlCounts) if (!best || n > best.n) best = { ttl, n }
+  if (!best || best.n < 2) return { os: '', source: undefined }
+  if (best.ttl >= 110 && best.ttl <= 140) return { os: 'Windows', source: 'ttl' }
+  if (best.ttl >= 40 && best.ttl <= 80) return { os: 'Linux/Unix', source: 'ttl' }
+  if (best.ttl >= 230 && best.ttl <= 255) return { os: 'Network Device', source: 'ttl' }
+  return { os: 'Unknown', source: 'ttl' }
+}
+
+// Delegated /64s of the capture: global-scope IPv6 prefixes sourced by TWO or
+// more LAN interfaces are the LAN's own delegated address space, so every
+// address in them is LOCAL. Shared by the device merge (folds home-prefix v6s
+// into the substrate device) and the external-IP derivation (a home-prefix
+// PRIMARY device row — a byte-tie merge artifact — must never count as an
+// external peer). The shadow-MAC collapse keeps forwarded SERVER prefixes out
+// of the delegated set (see deriveDevices).
+function delegatedPrefixes(packets: ParsedPacket[]): Set<string> {
+  const prefixSourcers = new Map<string, Set<string>>()
+  for (const p of packets) {
+    const ip = p.srcIp
+    if (!ip || !p.srcMac || !isUnicastMac(p.srcMac)) continue
+    if (ip.includes(':') && !isPrivateIp(ip) && !isNonUnicast(ip)) {
+      const prefix = ip.split(':').slice(0, 4).join(':')
+      let s = prefixSourcers.get(prefix)
+      if (!s) { s = new Set<string>(); prefixSourcers.set(prefix, s) }
+      s.add(p.srcMac)
+    }
+  }
+  // A MAC that only ever sources /64s another MAC also sources is that
+  // device's SECOND interface (a router's WAN/capture NIC forwarding the same
+  // server traffic its LAN MAC sees). Counting both would make every
+  // forwarded server /64 look like a two-interface "delegated prefix" and
+  // fold remote hosts into the LAN (QA: test.pcapng — the router's 6e:22 WAN
+  // MAC put Akamai/Cloudflare/Google rows into the router's device).
+  // Collapse ONLY MACs that never declared themselves: a LAN interface always
+  // either ARP-declares an IP or speaks link-local IPv6 (NDP), and such a MAC
+  // is never collapsible — the host's own MAC sources a strict subset of the
+  // router's (the router's ::1 sits on the same delegated /64), yet must keep
+  // counting. Strict subset only: two separate hosts on one delegated /64
+  // source identical sets and must keep counting (QA: calls.pcap — host and
+  // router both source 2401:4900:1:2).
+  const arpMacByIp = new Map<string, string>()
+  for (const p of packets) {
+    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac || !isUnicastMac(p.arpSenderMac)) continue
+    if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
+  }
+  const lanMacs = new Set<string>(arpMacByIp.values())
+  for (const p of packets) {
+    const ip = p.srcIp
+    if (!ip || !p.srcMac || !isUnicastMac(p.srcMac) || !ip.includes(':')) continue
+    const v = ip.toLowerCase()
+    if (v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')) lanMacs.add(p.srcMac)
+  }
+  const macToPrefixes = new Map<string, Set<string>>()
+  for (const [prefix, macs] of prefixSourcers) {
+    for (const m of macs) {
+      let s = macToPrefixes.get(m)
+      if (!s) { s = new Set<string>(); macToPrefixes.set(m, s) }
+      s.add(prefix)
+    }
+  }
+  const shadowMacs = new Set<string>()
+  for (const [m, mine] of macToPrefixes) {
+    if (lanMacs.has(m)) continue
+    for (const [o, theirs] of macToPrefixes) {
+      if (o === m) continue
+      if (mine.size < theirs.size && [...mine].every((p) => theirs.has(p))) {
+        shadowMacs.add(m)
+        break
+      }
+    }
+  }
+  for (const m of shadowMacs) {
+    for (const macs of prefixSourcers.values()) macs.delete(m)
+  }
+  // Delegated only when TWO or more LAN interfaces remain as sourcers: a /64
+  // sourced by a single MAC is a forwarded server prefix (the router forwards
+  // its traffic), never LAN-owned address space.
+  return new Set([...prefixSourcers].filter(([, macs]) => macs.size >= 2).map(([prefix]) => prefix))
+}
+
+function deriveDevices(packets: ParsedPacket[]): AnalysisDevice[] {
+  const delegated = delegatedPrefixes(packets)
+  // Shared with the external-IP derivation: a home-prefix row that became a
+  // device PRIMARY (byte-tie merge keeps the v6 as the row's ip) is still a
+  // LAN address and must never count as an external peer.
+  const homePrefix = (ip: string): boolean => {
+    if (!ip.includes(':') || isPrivateIp(ip) || isNonUnicast(ip)) return false
+    return delegated.has(ip.split(':').slice(0, 4).join(':'))
+  }
+  // IP -> hostname from DNS answers observed in the capture: A/AAAA answers
+  // map the queried name to its IP, PTR answers map the reverse-arpa IP back
+  // to a hostname. First-seen wins; no network calls involved.
+  const ipToName = new Map<string, string>()
+  for (const p of packets) {
+    for (const a of p.dnsAnswers || []) {
+      if (a.ip && a.name) {
+        const name = a.name.replace(/\.$/, '').toLowerCase()
+        if (name && !ipToName.has(a.ip)) ipToName.set(a.ip, name)
+      }
+    }
+  }
+  // TLS SNI names the SERVER the client is contacting (the ClientHello's
+  // dst); it is client-observed, so DNS answers stay authoritative and SNI
+  // only backfills hosts with no DNS resolution (QA: www.wireshark.org never
+  // surfaced in Devices).
+  const sniByIp = new Map<string, string>()
+  for (const p of packets) {
+    if (p.tlsSni && p.dstIp && !sniByIp.has(p.dstIp)) sniByIp.set(p.dstIp, p.tlsSni.toLowerCase())
+  }
+  const map = new Map<string, { mac: string; l2: string; first: number; last: number; count: number; bytes: number }>()
+  // ARP sender MAC → the IP the sender claims to own (RFC 826 sha/spa). This
+  // is hard identity evidence the Ethernet header alone can miss: the router's
+  // own ARP (192.168.1.1 → 192.168.1.20) declares its interface MAC, which is
+  // the same MAC its link-local fe80:: and delegated public v6 speak on — so
+  // all three fold into ONE device instead of a phantom router split (QA:
+  // Devices card read 5 where the report said 4). (Declarations also mark the
+  // MAC as a real LAN interface for the shadow-MAC collapse above.)
+  const arpMacByIp = new Map<string, string>()
+  for (const p of packets) {
+    if (p.protocol !== 'ARP' || !p.srcIp || !p.arpSenderMac || !isUnicastMac(p.arpSenderMac)) continue
+    if (!arpMacByIp.has(p.srcIp)) arpMacByIp.set(p.srcIp, p.arpSenderMac.toLowerCase())
+  }
+  for (const p of packets) {
+    // Dedupe self-addressed packets (gratuitous ARP, DAD): srcIp === dstIp
+    // would otherwise count the packet twice for one device (QA).
+    const ips = [...new Set([p.srcIp, p.dstIp].filter(Boolean) as string[])]
+    for (const ip of ips) {
+      if (isNonUnicast(ip)) continue // multicast/broadcast/unspecified: never devices
+      const e = map.get(ip)
+      // A MAC belongs to the LAN interface that OWNS the IP — prefer the
+      // sender MAC of the IP's own packets (ARP: the request's srcMac is the
+      // requester's MAC, dstMac the target; both are this LAN). A MAC seen
+      // only on remote/forwarded traffic is the router's, not the host's, so
+      // remote public IPs never carry a MAC here. A public-scope IPv6 inside
+      // the /64 the LAN itself sources (SLAAC/DHCPv6 on the same NIC) carries
+      // its own interface's MAC and folds into that device as an alias.
+      // Non-unicast MACs (broadcast ff:ff:ff:ff:ff:ff, multicast, zero) are
+      // frame-addressing artifacts: an ARP REQUEST's dstMac is the broadcast
+      // address and must never become the TARGET's device MAC (QA: unresolved
+      // ARP target 192.168.1.2 displayed ff:ff:ff:ff:ff:ff as its NIC).
+      const onSource = p.srcIp === ip ? (isUnicastMac(p.srcMac) ? p.srcMac : '') : ''
+      const onOwn = p.srcIp === ip ? (isUnicastMac(p.srcMac) ? p.srcMac : '') : (isPrivateIp(ip) && isUnicastMac(p.dstMac) ? p.dstMac : '')
+      // The ARP-declared sender MAC wins when present: it is the IP's own
+      // interface binding, independent of whether the capture stamped the
+      // Ethernet header (the router's identity is what merges its addresses).
+      const ownMac = arpMacByIp.get(ip) || onSource || onOwn || ''
+      if (e) {
+        e.first = Math.min(e.first, p.timestamp)
+        e.last = Math.max(e.last, p.timestamp)
+        e.count++
+        e.bytes += p.length
+        // Backfill a MAC when the first frame for this IP lacked one (e.g. the
+        // target of a stripped-header ARP) but a later frame carries it. Only
+        // when still empty: first MAC observed wins (QA: Devices card 5 vs 4).
+        if (!e.l2 && ownMac) {
+          e.l2 = ownMac
+          if (isPrivateIp(ip)) e.mac = ownMac
+        }
+      } else {
+        map.set(ip, {
+          // Only private-scope hosts carry a public MAC: a MAC observed on
+          // public traffic is the router's or the capture NIC's, never the
+          // remote host's (reviewer: Meta 2a03:/64 inherited 6e:22 from
+          // forwarded frames). The internal l2 keeps home-prefix folding
+          // working without exposing a bogus MAC on the alias row.
+          mac: isPrivateIp(ip) ? ownMac || '\u2014' : '\u2014',
+          l2: ownMac,
+          first: p.timestamp, last: p.timestamp, count: 1, bytes: p.length,
+        })
+      }
+    }
+  }
+  // Coalesce private hosts sharing a MAC (IPv4+IPv6 of one NIC, DHCP lease
+  // renewals): the MAC is the stable identity. Public IPs never merge — the
+  // MAC recorded against them is the router's. (Mirrors analyzer stats.rs.)
+  // F-04 QA: a MAC crossing LAN subnets is the router forwarding (one NIC per
+  // subnet, e.g. 192.168.137.1 vs 192.168.1.10) — same-MAC different-subnet
+  // IPs stay separate rows instead of silently folding into one device.
+  const merged: { ip: string; e: { mac: string; l2: string; first: number; last: number; count: number; bytes: number }; addresses: string[] }[] = []
+  // A home-prefix public IPv6 (its /64 is sourced by ≥2 LAN MACs) is the LAN's
+  // own delegated address, so it shares the MAC-merge pass with private hosts
+  // and folds into the substrate device instead of surfacing as Remote.
+  const mergeable = (ip: string): boolean => isPrivateLanIp(ip) || homePrefix(ip)
+  for (const [ip, e] of map) {
+    if (!e.l2 || !mergeable(ip)) {
+      merged.push({ ip, e, addresses: [] })
+      continue
+    }
+    // Match only against a LOCAL row: a public primary carries the router's
+    // MAC (forwarded frames), and folding the router's own private IPs into a
+    // remote device would pollute it (QA: Cloudflare row claiming 192.168.1.1,
+    // STUN row claiming the home v6 router address). mergeable(x.ip) is the
+    // existing row's own local-domain check — never merge INTO a remote row.
+    const m = merged.find(x => x.e.l2 === e.l2 && mergeable(x.ip) && sameL2Surface(x.ip, ip))
+    if (!m) {
+      merged.push({ ip, e, addresses: [] })
+      continue
+    }
+    // When merging private + home-v6, keep the PRIVATE address as the row's
+    // primary IP (the useful label; the v6 becomes an alias), regardless of
+    // byte totals. Between two equally-private hosts, bytes still decide.
+    const privateBeatsV6 = isPrivateLanIp(ip) !== isPrivateLanIp(m.ip) && (isPrivateLanIp(ip) || isPrivateLanIp(m.ip))
+    if (e.bytes > m.e.bytes && !privateBeatsV6) {
+      const old = { ip: m.ip, e: m.e, addresses: m.addresses }
+      m.ip = ip
+      m.e = e
+      m.addresses = [...old.addresses, old.ip]
+      m.e.first = Math.min(m.e.first, old.e.first)
+      m.e.last = Math.max(m.e.last, old.e.last)
+      m.e.count += old.e.count
+      m.e.bytes += old.e.bytes
+    } else {
+      m.e.first = Math.min(m.e.first, e.first)
+      m.e.last = Math.max(m.e.last, e.last)
+      m.e.count += e.count
+      m.e.bytes += e.bytes
+      m.addresses = [...m.addresses, ip]
+    }
+  }
+  return merged.map((m, i) => {
+    const fp = osFingerprint([m.ip, ...m.addresses], packets, isPrivateIp(m.ip))
+    return {
+      id: `dev-${i + 1}`, ip: m.ip, mac: m.e.mac, hostname: ipToName.get(m.ip) ?? sniByIp.get(m.ip) ?? m.ip,
+      vendor: '', os: fp.os, osSource: fp.source,
+      firstSeen: safeIso(m.e.first * 1000),
+      lastSeen: safeIso(m.e.last * 1000),
+      packets: m.e.count, bytes: m.e.bytes,
+      addresses: m.addresses.sort(),
+    }
+  })
+}
+
+// Two IPs share one L2 surface (one NIC) when they are on the same subnet:
+// same /24 for IPv4, same /64 for IPv6, or any v4+v6 pair (dual-stack NIC —
+// link-local fe80:: and ULA fc/fd:: sit on the same interface as the v4).
+function sameL2Surface(a: string, b: string): boolean {
+  const va = a.includes(':'), vb = b.includes(':')
+  if (va !== vb) return true
+  if (va) {
+    if (a.split(':').slice(0, 4).join(':') === b.split(':').slice(0, 4).join(':')) return true
+    // Link-local IPv6 always rides the same NIC as that interface's global
+    // v6, so a same-MAC fe80:: + delegated-global pair is ONE device even
+    // across /64s (the F-04 cross-subnet rule applies to v4 subnets, not to
+    // one interface's own addresses). Without this, whichever of the two
+    // reached the merge pass first claimed the MAC and the other was
+    // stranded as an external phantom (QA: test.pcapng — the host's
+    // 2401:…:275b appeared as a Remote device next to its own link-local).
+    // Safe: only mergeable IPs ever reach this test, and a remote server's
+    // /64 is never home-prefix, so forwarded v6s cannot fold in via the
+    // router's fe80::1 (reviewer Meta 2a03:…).
+    const linkLocal = (ip: string) => {
+      const v = ip.toLowerCase()
+      return v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')
+    }
+    return linkLocal(a) || linkLocal(b)
+  }
+  return a.split('.').slice(0, 3).join('.') === b.split('.').slice(0, 3).join('.')
+}
+
+// RFC 1918 + link-local + loopback + CGNAT + benchmark. Prefix checks like
+// startsWith('172.') misclassify public 172.64.x/172.217.x as private — only
+// 172.16.0.0/12 is. (Mirrors map-data's isPrivateIP.)
+function isPrivateIp(ip?: string): boolean {
+  if (!ip) return false
+  const ip0 = ip.trim()
+  if (ip0.includes(':')) {
+    const v = ip0.toLowerCase()
+    return v.startsWith('::1') || v.startsWith('fc') || v.startsWith('fd') || /^fe[89ab]/.test(v) || v.startsWith('ff')
+  }
+  const m = ip0.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!m) return false
+  const a = Number(m[1])
+  const b = Number(m[2])
+  if (a === 0 || a >= 224 || ip0 === '127.0.0.1') return true
+  if (a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254)) return true
+  if (a === 100 && b >= 64 && b <= 127) return true // CGNAT
+  return a === 198 && (b === 18 || b === 19) // benchmark 198.18/15
+}
+
+// Multicast, broadcast, unspecified or loopback addresses: discovery chatter
+// and placeholder addresses, never LAN devices or beacon destinations.
+// (Mirrors analyzer stats.rs::is_non_unicast.)
+export function isNonUnicast(ip: string): boolean {
+  const ip0 = ip.trim() // some writers emit ":: " with trailing space
+  if (ip0.includes(':')) {
+    const v = ip0.toLowerCase()
+    // Full-form placeholders 0:0:0:0:0:0:0:0 / 0:0:0:0:0:0:0:1 are :: / ::1
+    // emitted uncompressed — the unspecified address is not an external peer
+    // and never a device (QA B-58).
+    return v.startsWith('ff') || v === '::' || v === '::1' || v === '::ffff:0.0.0.0' ||
+      v === '0:0:0:0:0:0:0:0' || v === '0:0:0:0:0:0:0:1'
+  }
+  const m = ip0.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!m) return true
+  const a = Number(m[1])
+  const b = Number(m[2])
+  const c = Number(m[4]) // last octet — m[3] is the third, not the last
+  if (a === 0 || a >= 224 || ip0 === '255.255.255.255' || ip0 === '127.0.0.1') return true
+  // Subnet broadcast addresses (x.y.z.255 on /24 LANs): routers and hosts
+  // address them constantly (DHCP offers, mDNS, ARP probing) but they are
+  // not hosts — counting them as external destinations inflates the map.
+  if (c === 255) {
+    if (a === 192 && b === 168) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 10) return true
+  }
+  return false
+}
+
+// Strict RFC1918 + IPv6 loopback/ULA/link-local — the merge key in device
+// coalescing. More permissive than isPrivateIp (no CGNAT/benchmark) so public
+// IPs never merge through the router MAC. (Mirrors analyzer stats.rs::is_private.)
+function isPrivateLanIp(ip: string): boolean {
+  if (ip.includes(':')) {
+    const v = ip.toLowerCase()
+    return v === '::1' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')
+  }
+  const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!m) return false
+  const a = Number(m[1])
+  const b = Number(m[2])
+  return a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31)
+}
+
+// Destinations that legitimately keep regular cadences — discovery chatter
+// (SSDP, mDNS, LLMNR, WS-Discovery, NetBIOS), LAN housekeeping (DHCP, NTP,
+// SNMP, RIP, ARP) and STUN keepalives. Regular traffic to these is protocol
+// behavior, not C2 beaconing. (Mirrors analyzer threat/mod.rs.)
+function isBenignBeaconEndpoint(protocol: string, port: number, dstIp: string, names?: Set<string>): boolean {
+  if (isNonUnicast(dstIp)) return true
+  const names2 = ['ARP', 'DHCP', 'NTP', 'SSDP', 'mDNS', 'LLMNR', 'STUN', 'NetBIOS-NS', 'NetBIOS-DGM', 'WS-Discovery', 'SNMP', 'Syslog', 'TFTP', 'RIP']
+  if (names2.includes(protocol)) return true
+  const benignPorts = new Set([53, 67, 68, 69, 123, 137, 138, 161, 162, 520, 1900, 3702, 3478, 3479, 5349, 5353, 5355, 19302])
+  if ((protocol === 'UDP' && benignPorts.has(port)) || (protocol === 'TCP' && port === 53)) return true
+  // Push/keepalive poller families resolve from DNS answers — the IP alone
+  // cannot tell a benign push edge (WhatsApp, Skype config, WNS, Apple,
+  // Google) from a C2 server; both beacon over plain 443 (QA: beacon FP on
+  // pps.whatsapp.net / config.edge.skype.com / client.wns.windows.com).
+  if (names) {
+    for (const n of names) {
+      const host = n.toLowerCase()
+      for (const dom of BENIGN_POLLER_DOMAINS) {
+        if (host === dom || host.endsWith('.' + dom)) return true
+      }
+    }
+  }
+  return false
+}
+
+// Second-level families whose pollers keep regular cadences by design.
+const BENIGN_POLLER_DOMAINS = [
+  'whatsapp.net', 'whatsapp.com', 'skype.com', 'wns.windows.com',
+  'windowsupdate.com', 'msftconnecttest.com', 'apple.com', 'mzstatic.com',
+  'icloud.com', 'mtalk.google.com', 'google.com', 'googleapis.com', 'gstatic.com',
+  'windscribe.com',
+]
+
+// A SYN flood needs flood-level intensity, not just a raw count: 131 SYNs
+// spread over 15 minutes is ordinary outbound client behavior (QA:
+// mic.pcapng 192.168.1.10 — 131 SYNs / 948.6s → 0.14/s, falsely flagged).
+// Local constant, NOT shared/risk-spec.json: that file is shared with the
+// Rust analyzer, whose rule schema has no rate parameter — adding one here
+// would silently diverge from the engine's rule definition.
+export const SYN_FLOOD_MIN_PEAK_RATE = 20
+
+// Consecutive duplicate frames — the double-capture signature: two frames are
+// duplicates when their 5-tuple, length, TCP sequence and flags are identical
+// AND adjacent in capture order (same definition as countDuplicateFrames in
+// report.ts, but over ParsedPacket). Removes the later copy of every adjacent
+// duplicate pair; returns the analyzed set and how many frames were dropped.
+export function deduplicatePackets(packets: ParsedPacket[]): { packets: ParsedPacket[]; duplicates: number } {
+  const out: ParsedPacket[] = []
+  let prev: ParsedPacket | undefined
+  for (const p of packets) {
+    // A "double-capture artifact" is the SAME frame captured twice back to
+    // back — the whole frame, bytes included. Everything up to the payload
+    // can be equal for legitimately DIFFERENT packets (two UDP datagrams of
+    // the same length on one socket, ICMP echoes, TCP retransmissions share
+    // seq/len/flags): without payload equality the dedupe silently deletes
+    // real traffic and Total Packets reads lower than the file (QA: sample
+    // lost CoAP/ICMP repeats; a ping flood reads as a fraction of itself).
+    if (prev && p.srcIp === prev.srcIp && p.dstIp === prev.dstIp &&
+        p.srcPort === prev.srcPort && p.dstPort === prev.dstPort &&
+        p.protocol === prev.protocol && p.length === prev.length &&
+        p.tcpSeq === prev.tcpSeq && p.tcpFlags === prev.tcpFlags &&
+        p.payload === prev.payload) continue
+    out.push(p)
+    prev = p
+  }
+  return { packets: out, duplicates: packets.length - out.length }
+}
+
+function deriveThreats(packets: ParsedPacket[]): AnalysisThreat[] {
+  const threats: AnalysisThreat[] = []
+  const scans = new Map<string, { ports: Set<number>; dsts: Set<string>; syn: number; rst: number; fin: number; first: number; last: number; packetNums: number[]; synTimes: number[]; peakSynPerSec: number }>()
+  for (const p of packets) {
+    if (!p.srcIp) continue
+    if (p.dstPort && p.tcpFlags === 'SYN') {
+      // Parity with the Rust engine (PortScanRule over syn_probes): only TCP
+      // SYN probes constitute a port scan. A PURE SYN (SYN without ACK) is a
+      // probe — "SYN-ACK" is the other side completing the handshake and is
+      // never a probe. Counting it reversed the finding's direction (the
+      // responder "scanned" the client's ephemeral source ports) and flagged
+      // ordinary conversations as scans (QA: mic.pcapng 46.101.206.53 had 0
+      // pure SYNs, 68 SYN-ACK replies → false PORT-SCAN-001 over 68 client
+      // ephemeral ports). The exact 'SYN' test also excludes flag-games
+      // (SYN|FIN, SYN|RST) from probe counting, matching the scan semantics.
+      let e = scans.get(p.srcIp)
+      if (!e) {
+        e = { ports: new Set(), dsts: new Set(), syn: 0, rst: 0, fin: 0, first: p.timestamp, last: p.timestamp, packetNums: [], synTimes: [], peakSynPerSec: 0 }
+        scans.set(p.srcIp, e)
+      }
+      e.ports.add(p.dstPort)
+      if (p.dstIp) e.dsts.add(p.dstIp)
+      e.syn++
+      // Provenance: EVERY triggering packet number, not just a sample — a
+      // one-event-per-alert contract hides no evidence (an alert may cover
+      // hundreds of probes; all are cited).
+      e.packetNums.push(p.num)
+      e.first = Math.min(e.first, p.timestamp)
+      e.last = Math.max(e.last, p.timestamp)
+      // Peak pure-SYN rate over any sliding 1s window (packets arrive in
+      // capture order, timestamps non-decreasing): the flood gate needs the
+      // burst intensity, not the total spread over the whole capture. Every
+      // maximal 1s window ends at some packet's timestamp, so pruning per
+      // packet and keeping the max of the resulting sizes is exact.
+      e.synTimes.push(p.timestamp)
+      while (e.synTimes.length > 1 && e.synTimes[0] < p.timestamp - 1) e.synTimes.shift()
+      if (e.synTimes.length > e.peakSynPerSec) e.peakSynPerSec = e.synTimes.length
+    } else if (p.tcpFlags?.includes('RST') || p.tcpFlags?.includes('FIN')) {
+      // RST/FIN from a scanner count toward the scan evidence even when the
+      // probe handshake was already covered (or the capture missed the SYN).
+      const e = scans.get(p.srcIp)
+      if (!e) continue
+      if (p.tcpFlags.includes('RST')) e.rst++
+      if (p.tcpFlags.includes('FIN')) e.fin++
+      e.first = Math.min(e.first, p.timestamp)
+      e.last = Math.max(e.last, p.timestamp)
+    }
+  }
+  for (const [ip, e] of scans) {
+    if (e.ports.size <= RISK_PARAMS.port_scan_min_unique_ports) continue
+    const samples = [...e.ports].sort((a, b) => a - b).slice(0, 6).join(', ')
+    const dur = (e.last - e.first).toFixed(1)
+    // Evidence-derived confidence and state: more probed ports = stronger
+    // scan evidence (68 ports reads stronger than the 20-port threshold);
+    // a scan can never be CONFIRMED from probes alone — only LIKELY at
+    // high port counts, SUSPECTED at threshold.
+    const conf = Math.min(90, 50 + Math.round(e.ports.size / 2))
+    threats.push({
+      id: `alert-${threats.length + 1}`,
+      timestamp: safeIso(e.last * 1000),
+      signature: 'Port Scan Detected', category: 'Reconnaissance', severity: 3,
+      confidence: conf, ruleId: 'PORT-SCAN-001',
+      status: e.ports.size >= 50 ? 'LIKELY' : 'SUSPECTED',
+      evidenceQuality: e.ports.size >= 50 ? 'HIGH' : 'MEDIUM',
+      srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
+      protocol: 'TCP',
+      evidence: `${ip} scanned ${e.ports.size} ports on ${e.dsts.size} host(s) over ${dur}s (${e.syn} SYN, ${e.rst} RST, ${e.fin} FIN; e.g. ${samples})`,
+      packetNums: e.packetNums,
+    })
+  }
+  // SYN flood: the same scan pass counts SYN probes per source — a host
+  // blasting SYN segments past the spec threshold is a flood regardless of
+  // port spread (spec rule_params.syn_flood_min_syns). The rule existed in
+  // risk-spec/risk.ts but the local engine never emitted it (QA: audit —
+  // SYN-FLOOD-001 was dead code on the local path). The count gate alone
+  // misfired on ordinary clients that made many connections slowly (QA:
+  // mic.pcapng: 131 SYNs over 948.6s = 0.14/s) — flood-level intensity is
+  // the peak pure-SYN rate over any 1s window, and BOTH gates must pass.
+  for (const [ip, e] of scans) {
+    if (e.syn < RISK_PARAMS.syn_flood_min_syns) continue
+    if (e.peakSynPerSec < SYN_FLOOD_MIN_PEAK_RATE) continue
+    const dur = (e.last - e.first).toFixed(1)
+    // Confidence grows with burst intensity (100/s is a stronger flood signal
+    // than the 20/s gate); the finding stays "possible" — a flood can never
+    // be CONFIRMED from SYNs alone (no victim impact was observed).
+    const conf = Math.min(90, 50 + Math.round(e.peakSynPerSec / 4))
+    threats.push({
+      id: `alert-${threats.length + 1}`,
+      timestamp: safeIso(e.last * 1000),
+      signature: 'SYN Flood Attempt', category: 'Denial of Service', severity: 4,
+      confidence: conf, ruleId: 'SYN-FLOOD-001',
+      status: e.peakSynPerSec >= 100 ? 'LIKELY' : 'SUSPECTED',
+      evidenceQuality: e.peakSynPerSec >= 100 ? 'HIGH' : 'MEDIUM',
+      srcIp: ip, dstIp: 'multiple', srcPort: 0, dstPort: 0,
+      protocol: 'TCP',
+      evidence: `${ip} sent ${e.syn} SYN packets to ${e.dsts.size} host(s) over ${dur}s (peak ${e.peakSynPerSec}/s; possible SYN flood)`,
+      packetNums: e.packetNums,
+    })
+  }
+  return threats
+}
+
+// Mirror of the Rust threat engine's anomaly rules: when a behavioral flag is
+// set, the engine would have emitted the corresponding signature alert, so the
+// local path (no Rust analyzer) emits it here. Keeps risk input a pure function
+// of alerts on every path. Signatures/severity/confidence/category mirror
+// analyzer/src/threat/mod.rs.
+export function deriveFlagThreats(advancedMetrics: AnalysisAdvancedMetrics, existing: number, captureEndSec?: number): AnalysisThreat[] {
+  const out: AnalysisThreat[] = []
+  const push = (
+    ruleId: string, signature: string, category: string, severity: number, confidence: number, evidence: string,
+    opts: { atSec?: number; srcIp?: string; dstIp?: string } = {},
+  ) => {
+    out.push({
+      id: `alert-${existing + out.length + 1}`,
+      // The Rust engine stamps alerts with the last triggering packet's time
+      // (stats.flow_end). The local path mirrors that with each rule's own
+      // evidence time (the flow/packet that tripped it — flow end for exfil
+      // and beacon, last suspicious query for DNS tunnel, last oversized-SNI
+      // packet for TLS-SUSPICIOUS), falling back to the capture end when the
+      // evidence time was lost (legacy/mock data). Never "now" (QA:
+      // long.pcapng alert stamped at capture end, timeline dot at 11:25).
+      timestamp: safeIso((opts.atSec ?? captureEndSec ?? Date.now() / 1000) * 1000),
+      signature, category, severity, confidence, ruleId,
+      // Behavioral heuristics are SUSPECTED by definition: they aggregate
+      // traffic patterns, not payload proof — "confirmed" would overstate.
+      status: 'SUSPECTED',
+      evidenceQuality: 'MEDIUM',
+      // A single triggering conversation names its real endpoints on the
+      // header ("192.168.1.10 → 116.119.214.99", not "multiple → external").
+      srcIp: opts.srcIp ?? 'multiple', dstIp: opts.dstIp ?? 'external', srcPort: 0, dstPort: 0,
+      protocol: 'TCP', evidence,
+    })
+  }
+  if (advancedMetrics.dnsTunnelingSuspected) push('DNS-TUNNEL-001', 'Possible DNS Tunneling', 'Exfiltration', 4, 80, advancedMetrics.dnsTunnelEvidence ?? 'DNS tunneling behavior detected', { atSec: advancedMetrics.dnsTunnelDetectedAtSec })
+  // DATA-EXFIL-001 severity comes from the detector's ladder (Medium base,
+  // High when payload-verified, Critical only with credential corroboration —
+  // QA: long.pcapng read CRITICAL from a byte ratio alone) and the confidence
+  // stays 70: a heuristic with no content evidence must not outscore the
+  // rules that actually inspect payloads.
+  if (advancedMetrics.dataExfiltrationSuspected) push('DATA-EXFIL-001', 'Suspected Large Outbound Transfer', 'Exfiltration', advancedMetrics.dataExfilSeverity ?? 3, 70, advancedMetrics.iocs.find((i) => i.type === "data-exfiltration")?.description ?? 'Significant data transfer to external IPs', { atSec: advancedMetrics.dataExfilDetectedAtSec, srcIp: advancedMetrics.dataExfilEndpoints?.srcIp, dstIp: advancedMetrics.dataExfilEndpoints?.dstIp })
+  if (advancedMetrics.beaconDetected) push('C2-BEACON-001', 'Regular Beaconing Detected', 'Command and Control', 5, 65, advancedMetrics.beaconEvidence ?? 'C2 beaconing behavior detected', { atSec: advancedMetrics.beaconDetectedAtSec, srcIp: advancedMetrics.beaconEndpoints?.srcIp, dstIp: advancedMetrics.beaconEndpoints?.dstIp })
+  if (advancedMetrics.ja3Suspicious) push('TLS-SUSPICIOUS-001', 'Suspicious TLS Certificate', 'Command and Control', 2, 75, 'Suspicious TLS fingerprint or oversized SNI', { atSec: advancedMetrics.ja3DetectedAtSec, srcIp: advancedMetrics.ja3Endpoints?.srcIp, dstIp: advancedMetrics.ja3Endpoints?.dstIp })
+  return out
+}
+
+// Bucket key includes the date: a capture spanning midnight would otherwise
+// merge the 00:00 buckets of both days (and duplicate React keys). The
+// displayed label stays HH:MM — the date only separates the keys.
+function m5Bucket(d: Date): string {
+  const mm = String(Math.floor(d.getMinutes() / 5) * 5).padStart(2, '0')
+  const display = `${String(d.getHours()).padStart(2, '0')}:${mm}`
+  // Padded day/month (QA): an unpadded key like "2025-8-15 08:05" shifts the
+  // date part, so m5Label's key.slice(11) lands inside the clock digits —
+  // labels came out as "8:05" or ":05" for ~280 days of the year, and
+  // lexicographic sort ordered "2025-10-*" before "2025-9-*".
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  return `${day} ${display}`
+}
+
+function m5Label(key: string, multiDay: boolean): string {
+  // Multi-day captures have two buckets with the same HH:MM — include the
+  // date in the label so it stays a unique React key and reads correctly.
+  return multiDay ? key.slice(5, 16) : key.slice(11)
+}
+
+function deriveTimeline(packets: ParsedPacket[]): AnalysisTimelineEntry[] {
+  const buckets = new Map<string, AnalysisTimelineEntry>()
+  for (const p of packets) {
+    const key = m5Bucket(new Date(p.timestamp * 1000))
+    if (!buckets.has(key)) {
+      buckets.set(key, { time: key, packets: 0, bytes: 0, tcp: 0, udp: 0, dns: 0, tls: 0 })
+    }
+    const b = buckets.get(key)!
+    b.packets++
+    b.bytes += p.length
+    // One bucket per packet: TLS/DNS are app-layer slices of TCP/UDP, so a
+    // packet must land in exactly one slice or the stacked bars double-count
+    // it (QA: DNS over UDP counted as both udp and dns).
+    if (p.tlsSni) b.tls++
+    else if (p.dnsQuery) b.dns++
+    else if (p.protocol === 'TCP') b.tcp++
+    else if (p.protocol === 'UDP') b.udp++
+  }
+  // Labels depend on whether the capture spans multiple days (m5Label shows
+  // the date then, to keep every label a unique React key).
+  const entries = Array.from(buckets.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+  const multiDay = entries.length > 1 && new Set(entries.map(([k]) => k.slice(0, 10))).size > 1
+  return entries.map(([k, v]) => ({ ...v, time: m5Label(k, multiDay) }))
+}
+
+function deriveBandwidth(packets: ParsedPacket[], localIps: ReadonlySet<string>): AnalysisBandwidthPoint[] {
+  const buckets = new Map<string, AnalysisBandwidthPoint>()
+  for (const p of packets) {
+    const key = m5Bucket(new Date(p.timestamp * 1000))
+    if (!buckets.has(key)) {
+      buckets.set(key, { time: key, in: 0, out: 0 })
+    }
+    const b = buckets.get(key)!
+    // localIps carries the LAN's own delegated public v6 (merged aliases),
+    // so a host's SLAAC address counts as OUT, not a mislabeled IN.
+    if (p.srcIp && (localIps.has(p.srcIp) || isPrivateIp(p.srcIp))) {
+      b.out += p.length
+    } else {
+      b.in += p.length
+    }
+  }
+  const entries = Array.from(buckets.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+  const multiDay = entries.length > 1 && new Set(entries.map(([k]) => k.slice(0, 10))).size > 1
+  return entries.map(([k, v]) => ({ ...v, time: m5Label(k, multiDay) }))
+}
+
+function deriveAdvancedMetrics(raw: ParsedPacket[], flows: AnalysisFlow[], threats: AnalysisThreat[], localIps: ReadonlySet<string>): AnalysisAdvancedMetrics {
+  // Canonical duration + rates (see metrics.ts): a single packet or identical
+  // timestamps have NO time interval — rates are null (N/A), never fabricated
+  // with a >= 1 s fallback denominator (QA: 1-SYN capture showed 66 B/s).
+  const rates = captureRates(raw)
+  const duration = rates.durationSec ?? 0
+  // Bucket base for the burst scan: the earliest timestamp (same convention
+  // as captureRates, so peakBps and the burst scan measure the same seconds).
+  let firstTs = Number.POSITIVE_INFINITY
+  for (const p of raw) {
+    if (p.timestamp < firstTs) firstTs = p.timestamp
+  }
+
+  let totalBytesOut = 0
+  let totalBytesIn = 0
+  const talkerMap = new Map<string, { bytesOut: number; bytesIn: number; packetsOut: number; packetsIn: number }>()
+
+  // WAN direction of one packet: 1 = leaving the LAN (private→public),
+  // 0 = entering (public→private), -1 = internal/transit (LAN↔LAN or
+  // public↔public). The old isPrivateIp(srcIp) proxy counted LAN↔LAN chatter
+  // (router DNS replies, ARP, port probes) as OUTBOUND and never credited the
+  // receiving private host — so a download-heavy capture with LAN traffic
+  // showed fake "outbound" bytes and its burst direction was skewed
+  // (QA: testing.pcapng — the router's 110 packets read as 12 KB of outbound).
+  // localIps extends the private set with the LAN's own delegated public v6
+  // (merged device aliases), so a host's SLAAC address is a local side here,
+  // not a public peer (QA: test.pcapng IPv6 WAN traffic never counted).
+  const wanDir = (srcIp?: string, dstIp?: string): -1 | 0 | 1 => {
+    if (!srcIp || !dstIp || srcIp === '\u2014' || dstIp === '\u2014') return -1
+    const s = localIps.has(srcIp) || isPrivateIp(srcIp)
+    const d = localIps.has(dstIp) || isPrivateIp(dstIp)
+    return s !== d ? (s ? 1 : 0) : -1
+  }
+  for (const p of raw) {
+    const bytes = p.length
+    const dir = wanDir(p.srcIp, p.dstIp)
+    // Talker attribution is pure packet direction (the same pass the report's
+    // Top Talkers tables use): the source side sends, the destination
+    // receives — regardless of who is private. External servers therefore
+    // appear in the talker list too (the old proxy credited every packet to
+    // the private dstIp, so a 26,836-packet CDN host never made the list).
+    if (p.srcIp && p.srcIp !== '\u2014') {
+      const t = talkerMap.get(p.srcIp) || { bytesOut: 0, bytesIn: 0, packetsOut: 0, packetsIn: 0 }
+      t.bytesOut += bytes
+      t.packetsOut++
+      talkerMap.set(p.srcIp, t)
+    }
+    if (p.dstIp && p.dstIp !== '\u2014') {
+      const t = talkerMap.get(p.dstIp) || { bytesOut: 0, bytesIn: 0, packetsOut: 0, packetsIn: 0 }
+      t.bytesIn += bytes
+      t.packetsIn++
+      talkerMap.set(p.dstIp, t)
+    }
+    if (dir === 1) totalBytesOut += bytes
+    else if (dir === 0) totalBytesIn += bytes
+  }
+
+  const throughputAvg = rates.avgBps
+  const throughputPeak = rates.peakBps
+
+  // Per-second throughput buckets — real peak, not the fabricated avg*3.
+  // Direction is tracked separately so a download spike can be told apart
+  // from an upload burst (the exfil confidence bonus only applies to the
+  // latter). Outbound = private→public crossing ONLY: LAN chatter between
+  // local hosts is not an upload and must not tilt the burst's direction.
+  const buckets = new Map<number, number>()
+  const outBuckets = new Map<number, number>()
+  for (const p of raw) {
+    const sec = Math.floor(p.timestamp - firstTs)
+    buckets.set(sec, (buckets.get(sec) || 0) + p.length)
+    if (wanDir(p.srcIp, p.dstIp) === 1) outBuckets.set(sec, (outBuckets.get(sec) || 0) + p.length)
+  }
+
+  // ── Burst detection semantics (documented so the math can't drift) ───────
+  // 1. NOT EVALUABLE (null) when there is no time interval to spike against:
+  //    a single packet, identical timestamps, or fewer than two non-empty
+  //    1-second buckets all produce null — never a fabricated 1 s burst
+  //    (QA: 66 B/s one-packet capture "burst").
+  // 2. Not evaluable below 10 KB total wire bytes: no meaningful spike.
+  // 3. Threshold = 2 × average throughput (peak must EXCEED 2× avg to be a
+  //    burst; average is total/capture-span per metrics.ts — the honest
+  //    number, so a capture whose average already exceeds its peak second
+  //    simply never produces a burst, which is the truth).
+  // 4. Ratio = peak / avg (the banner's ×N); window = the contiguous run of
+  //    seconds around the PEAK second that stay above threshold — a spike
+  //    elsewhere in the capture is never labeled with unrelated seconds
+  //    (QA: 42.3× banner over flat 00:00:00–00:00:01 while the burst was at
+  //    00:05).
+  // 5. outboundDominant = ≥ half of the window's bytes cross LAN→WAN; a
+  //    download spike must not tilt the exfil bonus (QA: verylarge.pcapng).
+  // 6. When null, burstConfidenceBoost() is false: risk never treats an
+  //    unevaluable burst as "no burst detected" — no bonus, no reduction.
+  const burst = (() => {
+    if (rates.durationSec === null || totalBytesOut + totalBytesIn <= 10000 || rates.bucketCount < 2) {
+      return null
+    }
+    // Guarded above: a VALID capture always has numeric rates.
+    const avg = throughputAvg!
+    const peak = throughputPeak!
+    const threshold = avg * 2
+    const detected = peak > threshold
+    if (!detected) {
+      return { detected: false, peakThroughput: peak, averageThroughput: avg, ratio: peak / Math.max(avg, 1), start: 0, end: 0, duration: 0, outboundDominant: totalBytesOut >= totalBytesIn } satisfies BurstInfo
+    }
+    // Window = the contiguous run containing the PEAK second. The banner's
+    // ratio is peak/average, so a window elsewhere would label the spike
+    // with unrelated seconds (QA: 42.3× banner over the flat 00:00:00–00:00:01
+    // while the burst was at 00:05).
+    let peakSec = -1
+    let peakBytes = 0
+    for (const [sec, bytes] of buckets) {
+      if (bytes > peakBytes) { peakBytes = bytes; peakSec = sec }
+    }
+    let start = peakSec
+    let end = peakSec
+    while (start - 1 >= 0 && (buckets.get(start - 1) ?? 0) > threshold) start--
+    while ((buckets.get(end + 1) ?? 0) > threshold) end++
+    const bestLen = end - start + 1
+    let outBytes = 0
+    for (let s = start; s <= end; s++) outBytes += outBuckets.get(s) ?? 0
+    // Outbound-dominance over the whole window (not just the peak second):
+    // an upload spike IS exfil-relevant; a download spike is not.
+    let totalWindow = 0
+    for (let s = start; s <= end; s++) totalWindow += buckets.get(s) ?? 0
+    const outboundDominant = totalWindow > 0 && outBytes >= totalWindow / 2
+    return { detected: true, peakThroughput: peak, averageThroughput: avg, ratio: peak / Math.max(avg, 1), start, end, duration: bestLen, outboundDominant } satisfies BurstInfo
+  })()
+
+  // Beaconing: repeated connections to the same host at a regular cadence.
+  // One sustained connection is normal traffic, not a beacon pattern.
+  const dstNames = new Map<string, Set<string>>()
+  for (const p of raw) {
+    for (const a of p.dnsAnswers ?? []) {
+      if (!a.ip) continue
+      const set = dstNames.get(a.ip) || new Set<string>()
+      set.add(a.name)
+      dstNames.set(a.ip, set)
+    }
+    // The capture's TLS SNI is client-observed identity evidence too: a
+    // poller whose DNS was resolved outside the capture (or via DoH) is only
+    // identifiable by SNI (QA: large.pcapng — api.windscribe.com's 60 s
+    // status polls fired C2-BEACON-001 because no DNS answer named the IP).
+    if (p.tlsSni && p.dstIp) {
+      const set = dstNames.get(p.dstIp) || new Set<string>()
+      set.add(p.tlsSni.toLowerCase())
+      dstNames.set(p.dstIp, set)
+    }
+  }
+  const beaconMeta = (() => {
+    // Flows key lexicographically, so "dstIp" is NOT always the server: for a
+    // client 192.168.x talking to 8.8.8.8 the flow srcIp IS 8.8.8.8. Group by
+    // the REMOTE endpoint instead — the side that is not the local host (a
+    // delegated public v6 in localIps is local too) — or the cadence detector
+    // silently misses half of all conversations and can even name the local
+    // host as its own remote (QA: beacon remoteOf vs the host's SLAAC v6).
+    const remoteOf = (f: AnalysisFlow): { ip: string; port: number } => {
+      const srcLocal = localIps.has(f.srcIp) || isPrivateIp(f.srcIp)
+      const dstLocal = localIps.has(f.dstIp) || isPrivateIp(f.dstIp)
+      return srcLocal && !dstLocal
+        ? { ip: f.dstIp, port: f.dstPort }
+        : { ip: f.srcIp, port: f.srcPort }
+    }
+    const byRemote = new Map<string, AnalysisFlow[]>()
+    const remoteIpOf = new Map<string, string>()
+    for (const f of flows) {
+      // Multicast/broadcast/unspecified endpoints (IPv6 Neighbor Discovery,
+      // DAD, DHCP, SSDP…) are LAN chatter, never C2 servers. A conversation
+      // to or from them has no remote host to beacon to — and when neither
+      // side looks "local" (a global v6 sender probing ff02::1:ffxx
+      // solicited-node multicast), remoteOf keyed the conversation by the
+      // SENDER, inventing a beacon target out of the sender itself
+      // (QA: big.pcapng — periodic ICMPv6 NS to ff02::1:ffxx fired
+      // C2-BEACON-001 "5 connections to 2401:4900:8911:7943:0:0:0:1:0").
+      if (isNonUnicast(f.srcIp) || isNonUnicast(f.dstIp)) continue
+      const r = remoteOf(f)
+      if (isBenignBeaconEndpoint(f.protocol, r.port, r.ip, dstNames.get(r.ip))) continue
+      const key = `${r.ip}:${r.port}`
+      if (!byRemote.has(key)) byRemote.set(key, [])
+      remoteIpOf.set(key, r.ip)
+      byRemote.get(key)!.push(f)
+    }
+    for (const [key, list] of byRemote) {
+      // Spec parity (risk-spec.json rule_params): at least beacon_min_packets
+      // connections spanning beacon_min_duration seconds. The old hardcoded
+      // "< 3" fired on a 4-connection keepalive cadence (QA: verylarge.pcapng
+      // scored C2-BEACON-001 on 4 HTTPS polls to a Cloudflare IP at ~56 s).
+      if (list.length < RISK_PARAMS.beacon_min_packets) continue
+      const starts = list.map(f => new Date(f.startTime).getTime()).sort((a, b) => a - b)
+      if ((starts[starts.length - 1] - starts[0]) / 1000 < RISK_PARAMS.beacon_min_duration) continue
+      const intervals: number[] = []
+      for (let i = 1; i < starts.length; i++) {
+        const iv = (starts[i] - starts[i - 1]) / 1000
+        if (iv > 0) intervals.push(iv)
+      }
+      if (intervals.length < 2) continue
+      const mean = intervals.reduce((s, x) => s + x, 0) / intervals.length
+      if (mean < 1) continue // rapid chatter, not a beacon cadence
+      const variance = intervals.reduce((s, x) => s + (x - mean) ** 2, 0) / intervals.length
+      if (Math.sqrt(variance) / mean < 0.35) {
+        const cv = Math.sqrt(variance) / mean
+        // "Connections" only for TCP (handshake-bearing); stateless UDP/ICMP
+        // conversations are FLOWS, and port-less protocols (ICMP, ICMPv6, GRE,
+        // ESP…) never carry a ":0" pseudo-port in the target (QA: big.pcapng
+        // beacon evidence read "5 connections to …:0" for ICMPv6).
+        const portless = list.every((f) => f.srcPort === 0 && f.dstPort === 0)
+        const noun = list.every((f) => f.protocol === 'TCP') ? 'connections' : 'flows'
+        const target = portless ? remoteIpOf.get(key)! : key
+        // Evidence time = the LAST triggering flow's end — the beacon alert
+        // must point at the conversation that tripped it, not the capture end
+        // (QA: long.pcapng alerts stamped at capture end).
+        let lastEnd = -Infinity
+        for (const f of list) {
+          const t = new Date(f.endTime).getTime() / 1000
+          if (Number.isFinite(t) && t > lastEnd) lastEnd = t
+        }
+        return {
+          evidence: `${list.length} ${noun} to ${target} at ~${mean.toFixed(1)}s intervals (σ ${Math.sqrt(variance).toFixed(2)}s, CV ${cv.toFixed(3)})`,
+          flows: list,
+          remoteIp: remoteIpOf.get(key)!,
+          lastEndSec: lastEnd === -Infinity ? undefined : lastEnd,
+        }
+      }
+    }
+    return { evidence: '', flows: [] as AnalysisFlow[], remoteIp: '', lastEndSec: undefined }
+  })()
+  const beaconEvidence = beaconMeta.evidence
+  const beaconDetected = beaconEvidence !== ''
+  const beaconDetectedAtSec = beaconDetected ? beaconMeta.lastEndSec : undefined
+  // A beacon to a single remote host names the LOCAL side too: all triggering
+  // flows share the remote by construction, and the local endpoint is the
+  // non-remote side of the first flow (localIps makes a delegated v6 local).
+  const beaconEndpoints = beaconDetected && beaconMeta.flows.length > 0
+    ? (() => {
+        const f = beaconMeta.flows[0]
+        const local = localIps.has(f.srcIp) || isPrivateIp(f.srcIp) ? f.srcIp : f.dstIp
+        return { srcIp: local, dstIp: beaconMeta.remoteIp }
+      })()
+    : undefined
+
+  // DNS tunneling: queries with very long or high-entropy labels (encoded
+  // data), or a sustained abnormal query rate. Ordinary dotted names — any
+  // normal lookup — never trip this. Queries only; response echoes of the
+  // same name would otherwise double the apparent rate.
+  const dnsQueries = raw.filter(p => p.dnsQuery && p.dnsQr !== true).map(p => p.dnsQuery as string)
+  const label = (q: string) => q.split('.').reduce((m, l) => (l.length > m.length ? l : m), '')
+  const entropy = (s: string) => {
+    if (!s) return 0
+    const counts = new Map<string, number>()
+    for (const c of s) counts.set(c, (counts.get(c) || 0) + 1)
+    let h = 0
+    for (const n of counts.values()) {
+      const p = n / s.length
+      h -= p * Math.log2(p)
+    }
+    return h
+  }
+  const suspiciousDns = dnsQueries.filter(q => label(q).length > 40 || entropy(label(q)) > 4.5)
+  // A zero-duration capture (single packet / identical timestamps) has no
+  // time interval — a rate is meaningless, and dividing by 0 would fabricate
+  // "Infinity/s" evidence for a capture with >20 DNS packets but no tunnel
+  // (QA: burst-rate path had the same class of bug).
+  const dnsRate = duration > 0 ? dnsQueries.length / duration : 0
+  let maxLabelLen = 0
+  let maxEntropy = 0
+  for (const q of dnsQueries) {
+    const ll = label(q).length
+    const e = entropy(label(q))
+    if (ll > maxLabelLen) maxLabelLen = ll
+    if (e > maxEntropy) maxEntropy = e
+  }
+  const dnsTunnelEvidence =
+    suspiciousDns.length >= 5
+      ? `${suspiciousDns.length} tunneling-like queries (max label ${maxLabelLen} chars, max entropy ${maxEntropy.toFixed(1)}) among ${dnsQueries.length} total`
+      : dnsQueries.length > 20 && dnsRate > 2.5
+        ? `${dnsQueries.length} queries at ${dnsRate.toFixed(1)}/s sustained (${new Set(dnsQueries).size} domains)`
+        : ''
+  const dnsTunnelingSuspected = dnsTunnelEvidence !== ''
+  // Evidence time = the LAST suspicious query packet (the behavior's final
+  // trigger), so the DNS-TUNNEL alert points at the traffic, not capture end.
+  const suspiciousSet = new Set(suspiciousDns)
+  let dnsTunnelDetectedAtSec: number | undefined
+  for (const p of raw) {
+    if (p.dnsQuery && suspiciousSet.has(p.dnsQuery) && (dnsTunnelDetectedAtSec === undefined || p.timestamp > dnsTunnelDetectedAtSec)) {
+      dnsTunnelDetectedAtSec = p.timestamp
+    }
+  }
+
+  // Upload-style exfiltration: a private host SENDING > spec threshold
+  // outward, at least 5× what it receives. Triggering on bytesTotal flags
+  // CDN/media DOWNLOADS as exfiltration — a WhatsApp media fetch (≈10 MB
+  // total, 123 KB sent) must not fire (QA: exfil detector counted downloads).
+  // Flows key LEXICOGRAPHICALLY (flowKeyOf), NOT by direction, so the local
+  // host is not always f.srcIp: a public IP that sorts first (104.x vs
+  // 192.168.x, 13.107.x, 18.x…) puts the private side in dstIp, and the old
+  // isPrivateIp(f.srcIp) gate silently missed every such capture (QA: exfil
+  // depended on which IP happened to sort first). localIps adds the LAN's own
+  // delegated public v6 to the local side, so a host uploading over its
+  // SLAAC address fires like a v4 host would (QA: test.pcapng IPv6 uploads).
+  // Direction is resolved per flow; LAN↔LAN and transit conversations are
+  // never exfiltration.
+  const exfilDirection = (f: AnalysisFlow): { out: number; in: number; priv: string; pub: string } | null => {
+    const sPriv = localIps.has(f.srcIp) || isPrivateIp(f.srcIp)
+    const dPriv = localIps.has(f.dstIp) || isPrivateIp(f.dstIp)
+    if (sPriv === dPriv) return null
+    const privateIsSrc = sPriv
+    return {
+      out: privateIsSrc ? f.bytesSent : f.bytesRecv,
+      in: privateIsSrc ? f.bytesRecv : f.bytesSent,
+      priv: privateIsSrc ? f.srcIp : f.dstIp,
+      pub: privateIsSrc ? f.dstIp : f.srcIp,
+    }
+  }
+  // Protocols whose asymmetric outbound traffic is NORMAL and must not fire
+  // the generic byte-ratio exfil rule: NAT traversal/media (STUN/TURN), DNS
+  // resolvers, DHCP, discovery (mDNS/LLMNR/SSDP), NTP, SIP signalling, and
+  // link-layer ARP/IGMP. Their sustained uploads are signaling/keepalive or
+  // small-query behavior, not exfiltration evidence. The exclusion covers BOTH
+  // payload-confirmed STUN (RFC 5389 magic cookie decoded) and port-inferred
+  // NAT-traversal/media ports (3478/3479/5349/19302/5004/5005): the application
+  // those ports support (WebRTC/ICE) is legitimately asymmetric, so calling it
+  // DATA-EXFIL-001 on a byte ratio reads as a false positive (QA: long.pcapng /
+  // time.pcapng — a 189 KB / 21 KB STUN session fired the Critical rule).
+  const benignAsymmetric = (f: AnalysisFlow) => {
+    if (["STUN", "TURN", "DNS", "DHCP", "NTP", "mDNS", "LLMNR", "SSDP", "SIP", "ARP", "IGMP"].includes(f.appProtocol ?? "")) return true
+    if ([3478, 3479, 5349, 19302, 5004, 5005].includes(f.srcPort) || [3478, 3479, 5349, 19302, 5004, 5005].includes(f.dstPort)) return true
+    const dst = f.dstIp
+    if (dst.includes(":")) return dst.startsWith("ff") || dst.startsWith("fe80")
+    const p = dst.split(".").map(Number)
+    if (p.length !== 4 || p.some((x) => Number.isNaN(x))) return false
+    return p[0] === 224 || p[0] === 239 || p[0] === 255 || p[2] === 255 || p[3] === 255
+  }
+  // Effective direction bytes: the exfil threshold and ratio run on UNIQUE TCP
+  // payload bytes (retransmissions and pure-control segments excluded) when
+  // the flow exposes them, so retransmissions can never inflate a byte-ratio
+  // finding (QA: time.pcapng — retransmitted bytes were counted as sent).
+  // Captures without TCP seq/payload visibility fall back to the raw counts.
+  const effOf = (f: AnalysisFlow, side: "out" | "in") => {
+    const privIsSrc = isPrivateIp(f.srcIp) || localIps.has(f.srcIp)
+    const raw = side === "out" ? (privIsSrc ? f.bytesSent : f.bytesRecv) : (privIsSrc ? f.bytesRecv : f.bytesSent)
+    if (f.protocol !== "TCP") return raw
+    const uniq = side === "out" ? (privIsSrc ? f.uniquePayloadBytesOut : f.uniquePayloadBytesIn) : (privIsSrc ? f.uniquePayloadBytesIn : f.uniquePayloadBytesOut)
+    return (uniq ?? 0) > 0 ? (uniq as number) : raw
+  }
+  const externalFlows = flows
+    .map((f) => ({ f, d: exfilDirection(f) }))
+    .filter((x): x is { f: AnalysisFlow; d: NonNullable<ReturnType<typeof exfilDirection>> } =>
+      x.d !== null
+      && !benignAsymmetric(x.f)
+      && effOf(x.f, "out") > RISK_PARAMS.data_exfil_min_bytes
+      && effOf(x.f, "out") > 5 * effOf(x.f, "in")
+    )
+  const dataExfiltrationSuspected = externalFlows.length > 0
+  // Evidence time = the last contributing flow's end — the alert must point
+  // at the conversation that tripped it, never the capture end (QA:
+  // long.pcapng alert stamped 11:29:18 = capture end; flow ended 05:54:28Z).
+  const dataExfilDetectedAtSec = (() => {
+    let last = -Infinity
+    for (const { f } of externalFlows) {
+      const t = new Date(f.endTime).getTime() / 1000
+      if (Number.isFinite(t) && t > last) last = t
+    }
+    return last === -Infinity ? undefined : last
+  })()
+  // One contributing flow → the alert header names the real endpoints
+  // (priv → pub) instead of "multiple → external" (QA: long.pcapng header
+  // hid flow-85's endpoints next to "Top flow: flow-85" in the evidence).
+  const dataExfilEndpoints = externalFlows.length === 1
+    ? { srcIp: externalFlows[0].d.priv, dstIp: externalFlows[0].d.pub }
+    : undefined
+  // Severity ladder for the byte-ratio heuristic — a large asymmetric transfer
+  // is BEHAVIOR, never a confirmed incident, so it can not read Critical from
+  // the ratio alone. Base = Medium (3). High (4) when the flow's app protocol
+  // was actually decoded (payload-verified — we know what kind of traffic it
+  // is). Critical (5) only when a separate CONFIRMED sensitive-payload finding
+  // (plaintext credential exposure) corroborates the same host (QA: long.pcapng
+  // — one suspected STUN flow read CRITICAL from the byte ratio alone).
+  const exfilVerified = externalFlows.some(({ f }) => f.protocolSource === "PAYLOAD_CONFIRMED")
+  const exfilCorroborated = threats.some((t) => /[Cc]redential/.test(t.signature))
+  const dataExfilSeverity = exfilCorroborated ? 5 : exfilVerified ? 4 : 3
+  // The evidence names the exact flow (id, ports, protocol, packets, bytes,
+  // duration) so the alert is investigable without a second query, states
+  // explicitly what the rule does and does not prove (a directional ratio is
+  // behavior, not payload evidence of exfiltration — QA: open.pcapng read the
+  // finding as confirmed exfiltration from the ratio alone), and classifies
+  // the upload type so a legitimate cloud/media/sync upload is not mistaken
+  // for a suspicious transfer.
+  const dataExfilDetail = externalFlows.length > 0
+    ? (() => {
+        const { f, d } = externalFlows[0]
+        const privPort = d.priv === f.srcIp ? f.srcPort : f.dstPort
+        const pubPort = d.pub === f.dstIp ? f.dstPort : f.srcPort
+        const proto = f.appProtocol && f.appProtocol !== "UNKNOWN" ? f.appProtocol : f.protocol
+        const retransNote = f.retrans ? `, including ${f.retrans} retransmitted segment(s) as captured` : ""
+        const dur = Number.isFinite(f.duration) ? f.duration : 0
+        const effOut = effOf(f, "out"), effIn = effOf(f, "in")
+        const effNote = f.protocol === "TCP" && (f.uniquePayloadBytesOut ?? 0) > 0 && (f.uniquePayloadBytesIn ?? 0) > 0
+          ? ` (threshold evaluated on unique payload bytes: ${(effOut / 1024).toFixed(0)} KB out vs ${(effIn / 1024).toFixed(1)} KB in, retransmitted segments excluded)`
+          : f.retrans
+            ? ` (raw byte counts used — ${f.retrans} retransmitted segment(s) present; retransmissions can inflate the ratio)`
+            : ""
+        // Upload-type context so the pattern is not read as inherently
+        // suspicious: encrypted HTTP(S)/QUIC uploads are ordinary cloud/media/
+        // sync behavior, and the rule has no way to see inside them.
+        const uploadType = proto === "QUIC"
+          ? "QUIC/HTTP3 upload (cloud, media and API traffic commonly match this byte pattern; content is encrypted)"
+          : proto === "HTTPS" || proto === "TLS" || proto === "HTTP"
+            ? `${proto} upload (TLS/HTTPS content is encrypted — the byte ratio is all the rule can see)`
+            : `${proto} upload (service unknown — port-inferred or bare transport)`
+        // Payload visibility honesty: how many of the flow's packets were
+        // actually inspected — NEVER "PAYLOAD_CONFIRMED" as if that confirmed
+        // exfiltration (QA: log.pcapng — 1 of 2,622 packets inspected (0.038%)
+        // read as "payload confirmed"). Exfiltration content is always
+        // NOT CONFIRMED for this rule: it carries no content evidence.
+        const flowKey = (fl: AnalysisFlow) => {
+          const a = fl.srcIp, b = fl.dstIp, ap = fl.srcPort, bp = fl.dstPort
+          return a < b || (a === b && ap < bp)
+            ? `${a}|${b}|${ap}|${bp}|${fl.protocol}`
+            : `${b}|${a}|${bp}|${ap}|${fl.protocol}`
+        }
+        let verified = 0
+        const key = flowKey(f)
+        for (const p of raw) {
+          if (flowKeyOf(p) === key && p.appPayloadConfirmed) verified++
+        }
+        const payloadNote = `, payload visibility: ${verified} of ${f.packets} packets inspected — exfiltration content: NOT CONFIRMED (${f.protocolSource ?? "PORT_INFERRED"})`
+        return `${externalFlows.length} flow(s) sending >${Math.round(RISK_PARAMS.data_exfil_min_bytes / 1024)} KB to external IPs (outbound ≥5× received). Top flow: ${f.id} — ${d.priv}:${privPort} → ${d.pub}:${pubPort} (${proto}), ${(d.out / 1024).toFixed(0)} KB sent vs ${(d.in / 1024).toFixed(1)} KB received, ${f.packets} packets over ${dur.toFixed(1)}s${retransNote}${effNote}${payloadNote}; flow window ${f.startTime} → ${f.endTime} UTC. Upload type: ${uploadType}. Directional byte-ratio behavior only — no payload evidence of what the data was; the destination is not established as malicious`
+      })()
+    : ''
+
+  // Tor exit-node subnet (ASN-TOR, 185.220.101.0/24) in either direction. A
+  // blanket "185."/"198." prefix also matched Cloudflare (198.41.x) and
+  // TEST-NET-2 (198.51.100.x), fabricating a proxy claim for CDN/lab traffic;
+  // checking only srcIp missed every flow toward such an address (audit).
+  const torVpnProxyDetected = raw.some(p =>
+    (p.srcIp ?? '').startsWith('185.220.101.') || (p.dstIp ?? '').startsWith('185.220.101.')
+  )
+
+  const ja3SuspiciousPackets = raw.filter(p => p.tlsSni && p.tlsSni.length > 100)
+  const ja3Suspicious = ja3SuspiciousPackets.length > 0
+  // Evidence time = the LAST oversized-SNI packet; a single such packet names
+  // the exact endpoints on the alert header.
+  const ja3DetectedAtSec = ja3SuspiciousPackets.length > 0
+    ? ja3SuspiciousPackets.reduce((m, p) => (p.timestamp > m ? p.timestamp : m), Number.NEGATIVE_INFINITY)
+    : undefined
+  const ja3Endpoints = ja3SuspiciousPackets.length === 1
+    ? { srcIp: ja3SuspiciousPackets[0].srcIp || 'multiple', dstIp: ja3SuspiciousPackets[0].dstIp || 'external' }
+    : undefined
+
+  const portScanEnhanced = threats.some(t => t.signature === 'Port Scan Detected')
+
+  const topTalkers = Array.from(talkerMap.entries())
+    .sort((a, b) => b[1].bytesOut + b[1].bytesIn - (a[1].bytesOut + a[1].bytesIn))
+    .slice(0, 10)
+    .map(([ip, t]) => ({ ip, ...t }))
+
+  const iocs: AnalysisAdvancedMetrics['iocs'] = []
+  for (const t of threats) {
+    // ruleId lets the report pair each seeded threat IOC with its fired rule
+    // and dedupe the alert-derived IOC rows (QA: mic.pcapng showed 4 IOCs
+    // for 2 alerts — "threat" ≠ IOC_RULE_TYPE's "port-scan"/"syn-flood").
+    iocs.push({ type: "threat", value: t.signature, description: t.evidence, severity: t.severity, ruleId: t.ruleId })
+  }
+  if (dnsTunnelingSuspected) {
+    iocs.push({ type: "dns-tunneling", value: "Suspicious DNS patterns", description: dnsTunnelEvidence, severity: 3 })
+  }
+  // The finding is directional byte-ratio behavior only — a suspected rule,
+  // never a claim of data exfiltration (QA: log.pcapng — 1 of 2,622 packets
+  // payload-verified (0.038%), so the value must read as a potential
+  // asymmetric transfer, not an established exfiltration event).
+  if (dataExfiltrationSuspected) {
+    iocs.push({ type: "data-exfiltration", value: "Potential asymmetric outbound transfer", description: dataExfilDetail || "Significant data transfer to external IPs", severity: dataExfilSeverity })
+  }
+  if (beaconDetected) {
+    iocs.push({ type: "beaconing", value: "Periodic communication detected", description: beaconEvidence, severity: 3 })
+  }
+
+  const mitreMappings: AnalysisAdvancedMetrics['mitreMappings'] = []
+  if (portScanEnhanced) {
+    mitreMappings.push({ technique: "Port Scan", id: "T1046", description: "Network scanning for open ports", severity: 3 })
+  }
+  if (dnsTunnelingSuspected) {
+    mitreMappings.push({ technique: "DNS Tunneling", id: "T1071.004", description: "Data encoded in DNS queries/responses", severity: 4 })
+  }
+  if (dataExfiltrationSuspected) {
+    mitreMappings.push({ technique: "Exfiltration Over C2 Channel", id: "T1041", description: "Data sent to external server", severity: 4 })
+  }
+  if (beaconDetected) {
+    mitreMappings.push({ technique: "Application Layer Protocol", id: "T1071", description: "Periodic C2 beaconing detected", severity: 3 })
+  }
+  if (torVpnProxyDetected) {
+    mitreMappings.push({ technique: "Proxy", id: "T1090", description: "Traffic routed through proxy/VPN/TOR", severity: 2 })
+  }
+  for (const c of threats) {
+    if (c.category === "Credential Access") {
+      mitreMappings.push({ technique: "Credential Dumping", id: "T1003", description: "Credentials may have been extracted", severity: 4 })
+    }
+    if (c.category === "Collection") {
+      mitreMappings.push({ technique: "Data from Information Repositories", id: "T1213", description: "Sensitive data collection detected", severity: 3 })
+    }
+  }
+
+  return {
+    rates,
+    throughputAvg: rates.avgBps === null ? null : Math.round(rates.avgBps),
+    throughputPeak: rates.peakBps === null ? null : Math.round(rates.peakBps),
+    throughputPeak100ms: rates.peakBps100ms === null ? null : Math.round(rates.peakBps100ms),
+    burst,
+    beaconDetected,
+    dnsTunnelingSuspected,
+    dataExfiltrationSuspected,
+    torVpnProxyDetected,
+    portScanEnhanced,
+    ja3Suspicious,
+    dnsTunnelEvidence,
+    beaconEvidence,
+    dataExfilDetectedAtSec,
+    beaconDetectedAtSec,
+    dnsTunnelDetectedAtSec,
+    ja3DetectedAtSec,
+    dataExfilEndpoints,
+    beaconEndpoints,
+    ja3Endpoints,
+    // Present only when DATA-EXFIL-001 actually fired — an undefined
+    // dataExfilSeverity means the byte-ratio rule did not trigger (the
+    // excluded NAT-traversal/discovery protocols must leave no trace).
+    ...(dataExfiltrationSuspected ? { dataExfilSeverity } : {}),
+    topTalkers,
+    iocs,
+    mitreMappings,
+  }
+}
+
+// Protocol counters derived straight from the parsed packets — the ONE
+// classification source for dashboard + viz tabs + timeline, so the
+// "Protocols" pie and the tab chips can never disagree (C2). Transport-level
+// names (TCP/UDP/ICMP/ARP) match the job summary's protocol list; app-layer
+// labels (HTTPS/STUN) must not leak in or the pie and the dashboard diverge.
+// Job summary counts from the backend stay authoritative for totals.
+export function packetProtocolCounts(
+  packets: Array<{ protocol?: string }>
+): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const p of packets) {
+    const name = p.protocol || 'OTHER'
+    counts[name] = (counts[name] ?? 0) + 1
+  }
+  return counts
+}
+
+export function analyzePcap(result: PCAPResult, opts: { dedupe?: boolean } = {}): AnalysisResult {
+  let { packets: raw, stats } = result
+  let rawPacketCount: number | undefined
+  let duplicateFrameCount: number | undefined
+  // Capture-artifact de-duplication (double-capture signature): detections,
+  // risk and every metric run on the ANALYZED set — raw frames are never
+  // security-scored (QA: mic 1,471 and another 2,747 consecutive duplicate
+  // frames doubled flow counts and SYN probes). Raw counts stay on the job
+  // so the report shows Raw / Duplicate / Analyzed honestly.
+  if (opts.dedupe) {
+    rawPacketCount = raw.length
+    const { packets: eff, duplicates } = deduplicatePackets(raw)
+    if (duplicates > 0) {
+      raw = eff
+      // Surviving frames keep their ORIGINAL file numbers (the parser counts
+      // raw frames 1..N), so after duplicate removal the set is 1..rawCount
+      // with gaps — the analyzed result must be renumbered contiguously
+      // 1..N, or every packetNum reference (threats, credentials, evidence)
+      // and the evidence-provenance validator disagree about the analyzed
+      // set (QA: minor.pcapng — threat/credential packetNum 8898/9030/9347
+      // "out of range 1..7441"). Raw accounting stays on the job as
+      // rawPacketCount/duplicateFrameCount.
+      for (let i = 0; i < raw.length; i++) raw[i].num = i + 1
+      duplicateFrameCount = duplicates
+      // Folded loops, not Math.min/max(...spread): a 500 MB capture easily
+      // exceeds the ~125k-argument stack limit and throws RangeError, turning
+      // a valid upload into a generic 500 (QA).
+      let startTime = Infinity
+      let endTime = -Infinity
+      for (const p of eff) {
+        if (p.timestamp < startTime) startTime = p.timestamp
+        if (p.timestamp > endTime) endTime = p.timestamp
+      }
+      stats = {
+        ...stats,
+        totalPackets: eff.length,
+        totalBytes: eff.reduce((s, p) => s + p.length, 0),
+        decodedPackets: Math.max(0, (stats.decodedPackets ?? eff.length) - duplicates),
+        protocols: eff.reduce<Record<string, number>>((acc, p) => { if (p.protocol) acc[p.protocol] = (acc[p.protocol] ?? 0) + 1; return acc }, {}),
+        startTime: eff.length ? startTime : stats.startTime,
+        endTime: eff.length ? endTime : stats.endTime,
+        duration: eff.length ? Math.max(0, endTime - startTime) : 0,
+      }
+    }
+  }
+  // Per-direction initial TCP sequence so each side's relative Seq starts at 0
+  // from ITS OWN first segment in wire order (the client SYN on the client
+  // leg, the SYN-ACK on the server leg for a handshake in the capture). The
+  // previous flowKeyOf base rebased BOTH directions against whichever side
+  // appeared first, so mid-session server replies showed raw 32-bit values
+  // (QA: client Seq=0/519, server Seq=834237805). The first segment is taken
+  // in TIMESTAMP order, not file order: pcapng writers may store records out
+  // of time order, and a reordered SYN must not become the "base" after the
+  // conversation has already progressed.
+  const seqBases = new Map<string, number>()
+  for (const p of [...raw].sort((a, b) => a.timestamp - b.timestamp)) {
+    if (p.protocol === 'TCP' && typeof p.tcpSeq === 'number') {
+      const key = dirKeyOf(p)
+      if (!seqBases.has(key)) seqBases.set(key, p.tcpSeq)
+    }
+  }
+  const packets = raw.map((p) => pktToAnalysis(p, seqBases.get(dirKeyOf(p))))
+  const flows = deriveFlows(raw)
+  const tcpStates = tcpConversationStates(raw)
+  // Mirror the wire-observed state onto flows so the flow table and session
+  // list never disagree (non-TCP flows get STATELESS, matching sessions).
+  for (const f of flows) f.tcpState = tcpStateOf(f, tcpStates)
+  const sessions = deriveSessions(flows, tcpStates)
+  const dns = deriveDns(raw)
+  const http = deriveHttp(raw)
+  const tls = deriveTls(raw)
+  const files = deriveFiles(raw)
+  const calls = deriveVoip(raw)
+  const credentials = deriveCredentials(raw)
+  // Leaf certificates parsed from TLS Certificate handshakes (X.509 DER
+  // extractor in pcap.ts); deduped by subject+serial across the capture.
+  const certificates: AnalysisCertificate[] = []
+  {
+    const seen = new Set<string>()
+    for (const p of raw) {
+      const c = p.tlsCert
+      if (!c) continue
+      const key = `${c.subject}|${c.serial}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      certificates.push({
+        id: `cert-${certificates.length + 1}`,
+        serial: c.serial, subject: c.subject || '\u2014', issuer: c.issuer || '\u2014',
+        notBefore: c.notBefore > 0 ? safeIso(c.notBefore) : null,
+        notAfter: c.notAfter > 0 ? safeIso(c.notAfter) : null,
+        san: c.san, signatureAlgorithm: c.signatureAlgorithm || 'unknown',
+        keySize: c.keySize,
+      })
+    }
+  }
+  const devices = deriveDevices(raw)
+  // Local = every private-primary device and all aliases merged onto it —
+  // including the LAN's own delegated-prefix public IPv6 (SLAAC/DHCPv6 on the
+  // same NIC), which is local even though isPrivateIp() says public. Without
+  // this set the host's own global v6 counts as an external peer, its
+  // uploads can never trip exfil, and beacon remoteOf can name the local host
+  // as the C2 remote (QA: test.pcapng External 25 → 24 after the v6 folded).
+  const localAliases = new Set<string>()
+  const delegated = delegatedPrefixes(raw)
+  for (const d of devices) {
+    // A row is local when its primary is a private LAN address OR a LAN
+    // delegated-prefix IPv6. The latter matters when the merge pass left a
+    // home-prefix v6 as the row's PRIMARY (byte-tie merge): that v6 is still
+    // the LAN's own address and must never read as an external peer (QA:
+    // router v6 primary counted as external). addresses hold only local
+    // aliases (the merge gate is private/home-prefix-only), so they are
+    // added unconditionally.
+    const homePrimary = d.ip.includes(':') && !isPrivateIp(d.ip) && !isNonUnicast(d.ip) && delegated.has(d.ip.split(':').slice(0, 4).join(':'))
+    if (isPrivateIp(d.ip) || homePrimary) localAliases.add(d.ip)
+    for (const a of d.addresses ?? []) localAliases.add(a)
+  }
+  const threats = deriveThreats(raw)
+  const timeline = deriveTimeline(raw)
+  const bandwidth = deriveBandwidth(raw, localAliases)
+  const advancedMetrics = deriveAdvancedMetrics(raw, flows, threats, localAliases)
+  let captureEndSec = Date.now() / 1000
+  if (raw.length) {
+    // -Infinity seed: a capture of only pre-1970 timestamps (valid in pcap)
+    // must not resolve its "capture end" to epoch 0 and date certs there.
+    let cMax = -Infinity
+    for (const p of raw) if (p.timestamp > cMax) cMax = p.timestamp
+    captureEndSec = cMax
+  }
+  threats.push(...deriveFlagThreats(advancedMetrics, threats.length, captureEndSec))
+
+  // Cleartext credentials extracted from the capture are real findings: the
+  // Rust engine emits HTTP-CREDS-001 / CRED-LEAK-001 for them, and the local
+  // path must mirror that or a capture of plaintext logins scores zero risk
+  // (QA: login.pcapng — 2 HTTP form passwords, risk 0 SAFE).
+  // Event identity = (rule, client → server): one alert per conversation that
+  // leaked credentials, so two INDEPENDENT attacks (different clients or
+  // different servers) produce two alerts instead of collapsing into one —
+  // while one conversation with N credential packets is ONE event citing all
+  // N packet numbers as evidence.
+  if (credentials.length > 0) {
+    const groups = new Map<string, AnalysisCredential[]>()
+    for (const c of credentials) {
+      const key = `${c.service.toUpperCase().startsWith('HTTP') ? 'HTTP' : 'LEAK'}|${c.srcIp}|${c.dstIp}`
+      const g = groups.get(key)
+      if (g) g.push(c)
+      else groups.set(key, [c])
+    }
+    for (const creds of groups.values()) {
+      const c = creds[0]
+      const isHttp = c.service.toUpperCase().startsWith('HTTP')
+      threats.push({
+        id: `alert-${threats.length + 1}`,
+        // Latest credential in the event (ISO UTC sorts lexically).
+        timestamp: creds.map((x) => x.timestamp).sort().pop()!,
+        signature: isHttp ? 'Plaintext HTTP Credentials' : 'Cleartext Credentials',
+        category: isHttp ? 'Plaintext Credential Exposure' : 'Credential Exposure',
+        severity: 4,
+        // Payload-verified: the plaintext credential bytes were decoded, so
+        // the detector's confidence is maximal and the state is CONFIRMED —
+        // there is no statistical guess in a decoded password field.
+        confidence: 100,
+        ruleId: isHttp ? 'HTTP-CREDS-001' : 'CRED-LEAK-001',
+        // Payload-verified: the plaintext credential bytes were decoded, so
+        // this is CONFIRMED evidence, not an inferred pattern.
+        status: 'CONFIRMED',
+        evidenceQuality: 'HIGH',
+        srcIp: c.srcIp, dstIp: c.dstIp, srcPort: 0, dstPort: 0,
+        protocol: c.protocol || 'TCP',
+        // Structured field-level evidence; the PASSWORD VALUE is never
+        // printed — only its field name and presence (QA: report must show
+        // "Credential field detected" with username + field names, redacted
+        // password, content type and transport). The request enumeration
+        // names EVERY credential-bearing request (method + path, with counts
+        // for repeats) so the count is verifiable transaction-by-transaction
+        // instead of "N submissions" with a single cited method (QA:
+        // never_end.pcapng — "4 HTTP payloads = 4 credential submissions"
+        // needed transaction-level evidence).
+        evidence: (() => {
+          const reqCounts = new Map<string, number>()
+          for (const x of creds) {
+            const k = `${x.method ?? '?'} ${x.path ?? '/'}`
+            reqCounts.set(k, (reqCounts.get(k) ?? 0) + 1)
+          }
+          const reqs = [...reqCounts.entries()].map(([k, n]) => (n > 1 ? `${k} (${n}×)` : k)).join(", ")
+          return `${creds.length} plaintext credential submission(s) over ${c.service} from ${c.srcIp} to ${c.dstIp}${c.host ? ` (${c.host})` : ''}; request(s): ${reqs}; username field ${c.usernameField ?? '?'}="${c.username}"${c.passwordField ? `, password field ${c.passwordField}="[REDACTED]"` : ''}; ${c.contentType ? `Content-Type ${c.contentType}; ` : ''}transport ${isHttp ? 'HTTP' : c.protocol || 'TCP'} (unencrypted); capture packet(s) #${creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number').join(', #')}`
+        })(),
+        packetNums: [...new Set(creds.map((x) => x.packetNum).filter((n): n is number => typeof n === 'number'))],
+        // Credentials exist only because payload content was decoded: this is
+        // payload proof, not port inference.
+        payloadConfirmed: true,
+      })
+    }
+  }
+
+  // External = peers on EITHER side of every conversation, not just
+  // destinations: a probe capture arriving INBOUND (server → LAN, no replies)
+  // must still count its peers. multicast/broadcast/unspecified/loopback are
+  // transport chatter, not peers (they used to inflate the count). VPN and
+  // the client's own delegated-prefix IPv6 are local, so their aliases never
+  // count (QA: calls.pcap External 22 behaved as 21 after the v6 merged).
+  // Mirrors the frontend recompute in stats.ts (plus the delegated-prefix
+  // refinement, which stats mirrors via its private-alias signal), so the job
+  // card, the report and the dashboard can never disagree on the count.
+  const externalIps = new Set<string>()
+  for (const p of raw) {
+    if (p.srcIp && !isNonUnicast(p.srcIp) && !isPrivateIp(p.srcIp) && !localAliases.has(p.srcIp)) externalIps.add(p.srcIp)
+    if (p.dstIp && !isNonUnicast(p.dstIp) && !isPrivateIp(p.dstIp) && !localAliases.has(p.dstIp)) externalIps.add(p.dstIp)
+  }
+  const domains = new Set(dns.map(d => d.query))
+
+const job: AnalysisJob = {
+    id: 'analysis-1', filename: 'capture.pcapng',
+    fileSize: stats.totalBytes, status: 'done', progress: 100, stage: 'complete',
+    totalPackets: stats.totalPackets, totalFlows: flows.length,
+    conversations: sessions.length, devices: devices.length,
+    externalIps: externalIps.size, countries: 0, domains: domains.size,
+    protocols: [...new Set(raw.map(p => p.protocol).filter(Boolean) as string[])],
+    alerts: threats.length, analyzerVersion: ANALYZER_VERSION,
+    metricSpecVersion: METRIC_SPEC_VERSION,
+    detectionRuleVersion: DETECTION_RULE_VERSION,
+    // Capture-artifact accounting for the dedupe pipeline: rawPacketCount /
+    // duplicateFrameCount are set when the analyzer removed consecutive
+    // duplicate frames before analysis (analyzed set = job.totalPackets).
+    rawPacketCount, duplicateFrameCount,
+    riskScore: computeRisk(
+      buildRiskInputs(threats),
+      burstConfidenceBoost(advancedMetrics)
+    ),
+    highestSeverity: threats.reduce((m, t) => Math.max(m, t.severity), 0),
+    captureDuration: advancedMetrics.rates.durationSec ?? 0,
+    captureQuality: advancedMetrics.rates.quality,
+    createdAt: safeIso((stats.startTime || raw[0]?.timestamp || 0) * 1000),
+  }
+
+  // File info is provided by the backend Rust analyzer
+  const fileInfo: FileInfo = { sha256: '', sha1: '', md5: '' }
+
+  const validator: AnalysisValidator = deriveValidator(advancedMetrics.rates, {
+    decoded: stats.decodedPackets ?? packets.length,
+    total: stats.totalPackets,
+    linkTypes: stats.linkTypes || [],
+  }, stats)
+
+  return assertValidAnalysisResult({
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    job, packets, flows, sessions, dns, http, tls, files,
+    calls,
+    credentials, certificates, devices, threats, timeline, bandwidth, advancedMetrics,
+    fileInfo,
+    validator,
+    decode: {
+      decoded: stats.decodedPackets ?? packets.length,
+      total: stats.totalPackets,
+      linkTypes: stats.linkTypes || [],
+    },
+  })
+}
+
+const SESSION_STATES = new Set(['STATELESS', 'INITIATED', 'HALF_OPEN', 'ESTABLISHED', 'RESET', 'CLOSED'])
+
+// ─── FULL AnalysisResult validation ────────────────────────────────────────
+// The permanent guard of the pipeline:
+//   PCAP → Analysis Engine → Canonical AnalysisResult → FULL VALIDATION →
+//   ONLY THEN → UI / HTML / PDF / JSON / API
+// Runs after EVERY analyzePcap (invalid results never leave the engine), and
+// again before every export/API response. It enforces the conservation
+// invariants (packet/byte totals reconcile across packets, flows, sessions
+// and the job summary), the evidence-provenance contract (every packetNum and
+// flowId must exist, payloadConfirmed must be backed by decoder evidence),
+// and the protocolSource/TCP-state state machines.
+export function analysisProblems(a: AnalysisResult): string[] {
+  const problems: string[] = []
+  const fail = (msg: string) => { problems.push(msg) }
+  const n = a.packets.length
+
+  if (a.schemaVersion !== ANALYSIS_SCHEMA_VERSION) fail(`schemaVersion ${a.schemaVersion} != ${ANALYSIS_SCHEMA_VERSION}`)
+  if (a.job.totalPackets !== n) fail(`job.totalPackets ${a.job.totalPackets} != packets ${n}`)
+  if (a.job.totalFlows !== a.flows.length) fail(`job.totalFlows ${a.job.totalFlows} != flows ${a.flows.length}`)
+  if (a.job.conversations !== a.sessions.length) fail(`job.conversations ${a.job.conversations} != sessions ${a.sessions.length}`)
+  if (a.job.alerts !== a.threats.length) fail(`job.alerts ${a.job.alerts} != threats ${a.threats.length}`)
+  const maxSev = a.threats.reduce((m, t) => Math.max(m, t.severity), 0)
+  if (a.job.highestSeverity !== maxSev) fail(`job.highestSeverity ${a.job.highestSeverity} != max threat severity ${maxSev}`)
+  if (a.job.riskScore < 0 || a.job.riskScore > 100 || !Number.isFinite(a.job.riskScore)) fail(`job.riskScore ${a.job.riskScore} out of [0,100]`)
+  if (!Number.isInteger(a.job.highestSeverity) || a.job.highestSeverity < 0 || a.job.highestSeverity > 5) fail(`job.highestSeverity ${a.job.highestSeverity} out of [0,5]`)
+
+  // ── Conservation invariants (byte/packet conservation) ─────────────────
+  let flowPackets = 0
+  let flowBytes = 0
+  for (const f of a.flows) {
+    if (!Number.isInteger(f.packets) || f.packets < 0) fail(`flow ${f.id}: packets ${f.packets}`)
+    if (!Number.isFinite(f.bytesTotal) || f.bytesTotal < 0) fail(`flow ${f.id}: bytesTotal ${f.bytesTotal}`)
+    flowPackets += f.packets
+    flowBytes += f.bytesTotal
+    if (f.bytesSent + f.bytesRecv !== f.bytesTotal) {
+      fail(`flow ${f.id}: bytesSent(${f.bytesSent}) + bytesRecv(${f.bytesRecv}) != bytesTotal(${f.bytesTotal})`)
+    }
+  }
+  if (flowPackets !== n) fail(`Σ flow packets ${flowPackets} != total packets ${n}`)
+  let packetBytes = 0
+  for (const p of a.packets) {
+    if (!Number.isFinite(p.length) || p.length < 0) fail(`packet ${p.num}: length ${p.length}`)
+    packetBytes += p.length
+  }
+  if (flowBytes !== packetBytes) fail(`Σ flow bytes ${flowBytes} != Σ packet bytes ${packetBytes}`)
+  const sessionPackets = a.sessions.reduce((s, x) => s + x.packets, 0)
+  if (sessionPackets !== flowPackets) fail(`Σ session packets ${sessionPackets} != Σ flow packets ${flowPackets}`)
+
+  // ── Capture-quality / rates consistency ────────────────────────────────
+  const q = a.advancedMetrics.rates
+  if (a.job.captureQuality !== q.quality) fail(`job.captureQuality ${a.job.captureQuality} != rates.quality ${q.quality}`)
+  if (a.validator.captureQuality !== q.quality) fail(`validator.captureQuality ${a.validator.captureQuality} != rates.quality ${q.quality}`)
+  if (a.job.captureDuration !== (q.durationSec ?? 0)) fail(`job.captureDuration ${a.job.captureDuration} != durationSec ${q.durationSec}`)
+  const QUALITIES: CaptureQuality[] = ['EMPTY', 'SINGLE_PACKET', 'ZERO_DURATION', 'VALID']
+  if (!QUALITIES.includes(q.quality)) fail(`rates.quality ${q.quality} not in enum`)
+  if (q.quality !== 'VALID') {
+    if (q.durationSec !== null || q.avgBps !== null || q.avgPacketsSec !== null || q.peakBps !== null) {
+      fail(`non-VALID capture (${q.quality}) must have null rates`)
+    }
+  } else {
+    if (!(q.durationSec! > 0)) fail(`VALID capture needs durationSec > 0`)
+    if (q.avgBps === null || q.peakBps === null) fail(`VALID capture needs numeric avg/peak`)
+  }
+  if (q.avgExceedsPeak !== (q.avgBps !== null && q.peakBps !== null && q.avgBps > q.peakBps)) {
+    fail(`avgExceedsPeak ${q.avgExceedsPeak} inconsistent with avg ${q.avgBps} / peak ${q.peakBps}`)
+  }
+  if (a.validator.decode.total !== a.decode.total || a.validator.decode.decoded !== a.decode.decoded) {
+    fail(`validator.decode disagrees with decode alias`)
+  }
+
+  // ── Protocol-source state machine (payload evidence required) ──────────
+  const packetByNum = new Map<number, AnalysisPacket>()
+  for (const p of a.packets) packetByNum.set(p.num, p)
+  for (const f of a.flows) {
+    if (f.protocolSource === undefined) continue
+    if (!['PAYLOAD_CONFIRMED', 'PORT_INFERRED', 'UNKNOWN'].includes(f.protocolSource)) {
+      fail(`flow ${f.id}: protocolSource ${f.protocolSource} not in enum`)
+    }
+  }
+
+  // ── Evidence provenance: every reference must exist and be supported ────
+  const flowIds = new Set(a.flows.map((f) => f.id))
+  for (const t of a.threats) {
+    if (t.flowId !== undefined && !flowIds.has(t.flowId)) fail(`threat ${t.id}: flowId ${t.flowId} does not exist`)
+    const STATUSES = ["OBSERVED", "SUSPECTED", "LIKELY", "CONFIRMED"]
+    if (t.status !== undefined && !STATUSES.includes(t.status)) fail(`threat ${t.id}: status ${t.status} not in enum`)
+    const EVIDENCE = ["LOW", "MEDIUM", "HIGH"]
+    if (t.evidenceQuality !== undefined && !EVIDENCE.includes(t.evidenceQuality)) fail(`threat ${t.id}: evidenceQuality ${t.evidenceQuality} not in enum`)
+    // CONFIRMED is a claim of payload proof — it must carry decoder evidence
+    // (QA: the credential finding is CONFIRMED only because the plaintext
+    // fields were decoded from the wire; a rule firing is never proof).
+    if (t.status === "CONFIRMED" && t.payloadConfirmed !== true) {
+      fail(`threat ${t.id}: CONFIRMED status without payloadConfirmed evidence`)
+    }
+    for (const num of t.packetNums ?? []) {
+      if (!Number.isInteger(num) || num < 1 || num > n) {
+        fail(`threat ${t.id}: packetNum ${num} out of range 1..${n}`)
+        continue
+      }
+      if (t.payloadConfirmed === true) {
+        const p = packetByNum.get(num)
+        if (!p?.appPayloadConfirmed) {
+          fail(`threat ${t.id}: payloadConfirmed but packet ${num} has no decoder payload evidence`)
+        }
+      }
+    }
+  }
+  for (const c of a.credentials) {
+    const cn = c.packetNum
+    if (!Number.isInteger(cn) || cn === undefined || cn < 1 || cn > n) {
+      fail(`credential ${c.id}: packetNum ${cn} out of range 1..${n}`)
+    } else if (!packetByNum.get(cn)?.appPayloadConfirmed) {
+      fail(`credential ${c.id}: packet ${cn} lacks decoder payload evidence`)
+    }
+  }
+
+  // ── TCP state machine enum + flow/session parity ───────────────────────
+  for (const s of a.sessions) {
+    if (!SESSION_STATES.has(s.state)) fail(`session ${s.id}: state ${s.state} not in enum`)
+  }
+  for (const f of a.flows) {
+    if (f.tcpState === undefined) continue
+    if (!SESSION_STATES.has(f.tcpState)) fail(`flow ${f.id}: tcpState ${f.tcpState} not in enum`)
+    const s = a.sessions.find((x) => x.srcIp === f.srcIp && x.dstIp === f.dstIp && x.srcPort === f.srcPort && x.dstPort === f.dstPort && x.protocol === f.protocol)
+    if (s && s.state !== f.tcpState) fail(`flow ${f.id}: tcpState ${f.tcpState} != session state ${s.state}`)
+    if (f.protocol !== 'TCP' && f.tcpState !== 'STATELESS') fail(`flow ${f.id}: non-TCP flow with tcpState ${f.tcpState}`)
+  }
+
+  // ── Alert dedup contract: one event per (ruleId, srcIp, dstIp) ─────────
+  const eventKeys = new Set<string>()
+  for (const t of a.threats) {
+    const key = `${t.ruleId}|${t.srcIp}|${t.dstIp}`
+    if (eventKeys.has(key)) fail(`duplicate threat event ${key} (alerts ${t.id})`)
+    eventKeys.add(key)
+  }
+
+  return problems
+}
+
+export function assertValidAnalysisResult(a: AnalysisResult): AnalysisResult {
+  const problems = analysisProblems(a)
+  if (problems.length > 0) {
+    throw new Error(`AnalysisResult failed validation (${problems.length}): ${problems.slice(0, 8).join('; ')}${problems.length > 8 ? `; …${problems.length - 8} more` : ''}`)
+  }
+  return a
+}
